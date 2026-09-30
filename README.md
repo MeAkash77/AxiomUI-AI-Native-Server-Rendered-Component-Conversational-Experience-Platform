@@ -24,13 +24,13 @@ into `~/.jclaw/jre` when none is found — extracts it to `~/.jclaw`, and starts
 **macOS & Linux**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/tsukhani/jclaw/main/install.sh | sh
+curl -fsSL https://github.com/MeAkash77/AxiomUI-AI-Native-Server-Rendered-Component-Conversational-Experience-Platform/main/install.sh | sh
 ```
 
 **Windows (PowerShell)**
 
 ```powershell
-irm https://raw.githubusercontent.com/tsukhani/jclaw/main/install.ps1 | iex
+irm https://github.com/MeAkash77/AxiomUI-AI-Native-Server-Rendered-Component-Conversational-Experience-Platform/main/install.ps1 | iex
 ```
 
 > On Windows the bundle runs through **Git Bash** or **WSL** (the launcher is a
@@ -55,7 +55,7 @@ does the same thing — it hands off to `jclaw upgrade` when an install already
 exists. Docker deployments upgrade the image instead
 (`docker compose pull && docker compose up -d`), and a git clone uses `git pull`.
 Release notes for every published version are on the
-[Releases page](https://github.com/tsukhani/jclaw/releases); the upgrade panel
+[Releases page](https://github.com/MeAkash77/AxiomUI-AI-Native-Server-Rendered-Component-Conversational-Experience-Platform/releases); the upgrade panel
 shows the newest release's notes too.
 
 **Requirements:** a Java 25+ runtime ([Zulu](https://www.azul.com/downloads/?version=java-25)
@@ -85,7 +85,7 @@ Node.js and provide Chromium under `PLAYWRIGHT_BROWSERS_PATH`.
 
 ```bash
 # Pin a version and install without auto-starting:
-curl -fsSL https://raw.githubusercontent.com/tsukhani/jclaw/main/install.sh \
+curl -fsSL https://github.com/MeAkash77/AxiomUI-AI-Native-Server-Rendered-Component-Conversational-Experience-Platform/main/install.sh \
   | JCLAW_VERSION=v0.14.7 JCLAW_NO_START=1 sh
 ```
 
@@ -93,11 +93,11 @@ curl -fsSL https://raw.githubusercontent.com/tsukhani/jclaw/main/install.sh \
 
 ## Overview
 
-AxiomUI is Abundent's AI-powered automation platform, built from scratch in **pure Java** on a customized [Play Framework 1.x](https://github.com/tsukhani/play1) foundation. It draws ideas and feature designs from three predecessor projects:
+AxiomUI is Abundent's AI-powered automation platform, built from scratch in **pure Java** on a customized [Play Framework 1.x](https://github.com/MeAkash77/AxiomUI-AI-Native-Server-Rendered-Component-Conversational-Experience-Platform) foundation. It draws ideas and feature designs from three predecessor projects:
 
-- **[OpenClaw](https://github.com/tsukhani/openclaw)** (Node.js/TypeScript) — agent orchestration, memory system, conversational AI patterns
-- **[JavaClaw](https://github.com/jobrunr/javaclaw)** (Spring Boot) — job scheduling, background task processing, browser automation
-- **[Hermes](https://github.com/NousResearch/hermes-agent)** (Python) — cron/task scheduling parity, subagent delegation patterns
+- **[OpenClaw](https://github.com/MeAkash77/AxiomUI-AI-Native-Server-Rendered-Component-Conversational-Experience-Platform)** (Node.js/TypeScript) — agent orchestration, memory system, conversational AI patterns
+- **[JavaClaw](https://github.com/MeAkash77/AxiomUI-AI-Native-Server-Rendered-Component-Conversational-Experience-Platform)** (Spring Boot) — job scheduling, background task processing, browser automation
+- **[Hermes](https://github.com/MeAkash77/AxiomUI-AI-Native-Server-Rendered-Component-Conversational-Experience-Platform)** (Python) — cron/task scheduling parity, subagent delegation patterns
 
 The implementation is entirely original — no code is shared with any of them. JClaw is built on lean library primitives (OkHttp 5, db-scheduler, ProcessBuilder, virtual threads, JPA) with no Spring, no heavy framework bloat, and no Node.js in the application itself — the one piece that runs on Node.js is the browser tool's Playwright driver, which a bundle or Docker install downloads on first use, and the only Python is in the optional local sidecars the JVM spawns (ASR, diarization, TTS, image, video, fetch, stealth). The result is a leaner, faster, more maintainable platform for building AI agents and automation workflows.
 
@@ -189,7 +189,7 @@ jclaw/
 
 - **JDK 25+** (Zulu recommended)
 
-That's the whole list. The [Abundent Play 1.x fork](https://github.com/tsukhani/play1),
+That's the whole list. The [Abundent Play 1.x fork](https://github.com/MeAkash77/AxiomUI-AI-Native-Server-Rendered-Component-Conversational-Experience-Platform/play1),
 app dependencies, precompiled classes, and the prebuilt SPA all ship **inside**
 `jclaw-bundle.zip`, so a Java 25 runtime is the only thing the host needs to run
 JClaw — see [Quick Install](#quick-install-one-line), which also covers the Node.js and
