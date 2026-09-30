@@ -1,0 +1,707 @@
+<h1 align="center">JClaw - Java-based Enterprise AI Assistant</h1>
+
+<p align="center">
+  <img src="combined-logo.png" width="650" alt="JClaw Logo">
+</p>
+
+<p align="center">
+  <strong>JAVA FIRST. NO BLOAT. PURE POWER.</strong>
+</p>
+
+<p align="center">
+  <a href="https://jenkins.abundent.com/job/JClaw/"><img src="https://jenkins.abundent.com/buildStatus/icon?job=JClaw&style=flat-square" alt="Build Status"></a>
+  <img src="https://img.shields.io/github/v/release/tsukhani/jclaw?style=flat-square&label=release&color=blue" alt="Release">
+  <img src="https://img.shields.io/github/repo-size/tsukhani/jclaw?style=flat-square&label=repo%20size&color=blue" alt="Repo Size">
+  <img src="https://img.shields.io/badge/license-PolyForm%20NC%201.0.0-blue?style=flat-square" alt="License: PolyForm Noncommercial 1.0.0">
+  <img src="https://img.shields.io/badge/source-available-orange?style=flat-square" alt="Source-available">
+  <img src="https://img.shields.io/badge/JDK-25%2B-orange?style=flat-square" alt="JDK: 25+">
+</p>
+
+> **Licensing at a glance.** JClaw is **source-available**, dual-licensed by
+> [Abundent Sdn Bhd](https://abundent.com): free for noncommercial use under the
+> [PolyForm Noncommercial License 1.0.0](LICENSE.md); **any commercial use requires a
+> [commercial license](COMMERCIAL-LICENSE.md)**. JClaw is not open-source software.
+> Versions through v0.15.4 remain available under their original MIT License.
+
+<br>
+
+## Quick Install (one-line)
+
+Get JClaw running in one command. The installer downloads the self-contained
+`jclaw-bundle.zip` from the latest GitHub Release, verifies Java 25+ (the bundle's
+**only** prerequisite) — offering to download a self-contained Zulu JRE 25
+into `~/.jclaw/jre` when none is found — extracts it to `~/.jclaw`, and starts JClaw on
+<http://localhost:9000>.
+
+**macOS & Linux**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/tsukhani/jclaw/main/install.sh | sh
+```
+
+**Windows (PowerShell)**
+
+```powershell
+irm https://raw.githubusercontent.com/tsukhani/jclaw/main/install.ps1 | iex
+```
+
+> On Windows the bundle runs through **Git Bash** or **WSL** (the launcher is a
+> POSIX shell script). The installer prefers Git Bash; if only WSL is present it
+> launches there; if neither is found it installs and prints how to run it.
+
+Once running, manage it with `jclaw status`, `jclaw stop`, `jclaw restart` from
+any new shell — the installer puts the `jclaw` command on your `PATH` (via
+`~/.local/bin`) and wires up `<TAB>` completion for bash and zsh. To remove JClaw
+entirely, run `jclaw uninstall`: it stops the app, undoes the PATH and completion
+wiring, and deletes `~/.jclaw`.
+
+**Updating:** `jclaw upgrade` (or **Settings → System → Maintenance** in the app) installs the
+newest release in place. Your database, workspace, credentials, installed apps and
+edited configuration are carried across; the database is backed up first; and a
+release that fails to start is rolled back automatically. The download runs while
+JClaw keeps serving, so only the swap itself is downtime. `jclaw upgrade --check`
+reports what's available without installing it; `--version <tag>` installs a
+specific release (including an earlier one), and `--yes` skips the confirmation
+prompt. Re-running the one-line installer
+does the same thing — it hands off to `jclaw upgrade` when an install already
+exists. Docker deployments upgrade the image instead
+(`docker compose pull && docker compose up -d`), and a git clone uses `git pull`.
+Release notes for every published version are on the
+[Releases page](https://github.com/tsukhani/jclaw/releases); the upgrade panel
+shows the newest release's notes too.
+
+**Requirements:** a Java 25+ runtime ([Zulu](https://www.azul.com/downloads/?version=java-25)
+or Temurin), or let the installer download one. Nothing else — the bundle bakes in
+the framework, app dependencies, precompiled classes, and the prebuilt SPA. The one
+exception is the browser tool: the bundle and the Docker image leave out the Node.js its
+Playwright driver runs on and Chromium (roughly 300 MB together), and JClaw downloads both
+the first time an agent uses the browser, or ahead of time from **Settings → Agents &
+Automation → Browser** (**Download now**). That needs access to nodejs.org and Playwright's
+download servers; on a machine without it, set `PLAYWRIGHT_NODEJS_PATH` to an installed
+Node.js and provide Chromium under `PLAYWRIGHT_BROWSERS_PATH`.
+
+**Configuration** (optional environment variables):
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `JCLAW_HOME` | `~/.jclaw` | Install directory |
+| `JCLAW_VERSION` | `latest` | Pin a release tag, e.g. `v0.14.7` |
+| `JCLAW_PORT` | `9000` | Port reported on launch |
+| `JCLAW_NO_START` | — | Set to `1` to install without starting |
+| `JCLAW_INSTALL_JRE` | — | Set to `1` to download the Zulu JRE without prompting when Java 25+ is missing |
+| `JCLAW_NO_JRE` | — | Set to `1` to never auto-install a JRE |
+| `JCLAW_NO_RC_EDIT` | — | Set to `1` to generate completion scripts without editing your shell rc |
+| `JCLAW_FORCE_REINSTALL` | — | Set to `1` to replace an existing install from scratch, **discarding** its database, workspace and credentials (otherwise an existing install is upgraded in place) |
+| `JCLAW_BIN_DIR` | `~/.local/bin` | Where the `jclaw` command goes (`install.sh` only) |
+| `JCLAW_BUNDLE_URL` | — | Install from a specific bundle URL (including `file://`) instead of GitHub Releases (`install.sh` only) |
+
+```bash
+# Pin a version and install without auto-starting:
+curl -fsSL https://raw.githubusercontent.com/tsukhani/jclaw/main/install.sh \
+  | JCLAW_VERSION=v0.14.7 JCLAW_NO_START=1 sh
+```
+
+---
+
+## Overview
+
+JClaw is Abundent's AI-powered automation platform, built from scratch in **pure Java** on a customized [Play Framework 1.x](https://github.com/tsukhani/play1) foundation. It draws ideas and feature designs from three predecessor projects:
+
+- **[OpenClaw](https://github.com/tsukhani/openclaw)** (Node.js/TypeScript) — agent orchestration, memory system, conversational AI patterns
+- **[JavaClaw](https://github.com/jobrunr/javaclaw)** (Spring Boot) — job scheduling, background task processing, browser automation
+- **[Hermes](https://github.com/NousResearch/hermes-agent)** (Python) — cron/task scheduling parity, subagent delegation patterns
+
+The implementation is entirely original — no code is shared with any of them. JClaw is built on lean library primitives (OkHttp 5, db-scheduler, ProcessBuilder, virtual threads, JPA) with no Spring, no heavy framework bloat, and no Node.js in the application itself — the one piece that runs on Node.js is the browser tool's Playwright driver, which a bundle or Docker install downloads on first use, and the only Python is in the optional local sidecars the JVM spawns (ASR, diarization, TTS, image, video, fetch, stealth). The result is a leaner, faster, more maintainable platform for building AI agents and automation workflows.
+
+---
+
+## Screenshot
+
+<p align="center">
+  <img src="jclaw-screenshot.png" width="900" alt="JClaw Chat Interface">
+</p>
+<p align="center"><em>Web chat with memory-aware agents, tool execution, and markdown rendering.</em></p>
+
+---
+
+## Features
+
+- 🤖 **Agent System** — Conversational AI agents with memory and context
+- 💬 **Channels** — Web chat plus per-agent Telegram, Slack and WhatsApp bindings (the official Cloud API or unofficial WhatsApp Web)
+- ⚡ **Job Scheduling** — Persistent cron & scheduled tasks via db-scheduler, with automatic retries and crash recovery
+- 🔧 **Pure Java** — The server is all Java; Python is needed only by the optional local sidecars, and Node.js only to build the SPA and to run the browser tool's Playwright driver
+- 📦 **Built-in Frontend** — Nuxt 4 SPA (Vue 3 + TypeScript); chat and the conversation viewer render Markdown, typeset math with KaTeX and draw Lewis electron-dot structures from SMILES
+- 🧭 **Model Router** — Choose `router/auto` wherever a model is picked: each prompt is classed as chat, summarize, agentic, reasoning or coding, sent to the first usable model on that class's list, and given a reasoning effort of its own; the lists live under **Settings → Agents & Automation → Model Router**
+- 🌐 **Browsing & Scraping** — A browser tool whose every Chromium connection is screened inside the JVM, so a page cannot reach loopback, private or other internal addresses, with TypeSafe AI's Jev as an optional operator-selected engine; large site crawls run as background scrape jobs you start, pause, resume and read from the Scrapes page
+- 🔌 **Plugin Architecture** — Modular, extensible design
+- 🧠 **Memory & Context** — Persistent conversations across sessions
+- ⏰ **Tasks & Reminders** — User-facing scheduled tasks and reminders, managed from the Tasks and Reminders pages
+- 🧩 **Skills, MCP & Subagents** — Reusable skills, MCP server tools, and subagent delegation including ACP coding harnesses
+- 📡 **OpenTelemetry** — Opt-in OTLP traces and metrics with GenAI spans per model call, reconfigurable live without a restart
+- 🎙️ **Voice, Image & Video** — Real-time voice mode, local ASR/TTS and image/video generation through the optional Python sidecars
+- 🗂️ **Apps** — Static mini-apps under `public/apps`, managed from the Apps page and installable as desktop PWAs
+- 📁 **Workspace Manager** — Browse each agent's workspace with sizes from the Agents page, download a file or a folder as a zip, back up the whole workspace, and delete entries, with Standing Orders files protected
+- 🔔 **Operator Alerts** — Name one channel under **Settings → System → Alerts** and JClaw messages you there when an LLM provider or MCP server circuit breaker opens or recovers, or a recurring task's occurrence fails for good
+- 🛡️ **Tool Approvals & Sandboxing** — Dangerous actions (shell commands, coding-harness launches) ask you for approval; opt-in OS sandboxing (`shell.sandbox`, `subagent.acp.sandbox`) confines what those processes can write and read
+- 🚀 **Lightweight** — Minimal resource footprint, fast startup
+
+---
+
+## Directory Structure
+
+```
+jclaw/
+├── app/                          # Application code
+│   ├── controllers/              # HTTP controllers (Play 1.x pattern)
+│   ├── models/                   # JPA domain entities
+│   ├── services/                 # Business logic (incl. db-scheduler bridge)
+│   ├── agents/                   # AI agent implementations
+│   ├── channels/                 # Messaging channels (web, Telegram, Slack, WhatsApp)
+│   ├── llm/                      # LLM provider drivers (OkHttp 5)
+│   ├── tools/                    # Agent tool implementations
+│   ├── memory/                   # Agent memory stores (JPA-backed)
+│   ├── mcp/                      # Model Context Protocol client
+│   ├── slash/                    # Slash-command handlers
+│   ├── jobs/                     # Play @Every jobs + db-scheduler handlers
+│   ├── views/                    # Groovy server templates
+│   └── utils/                    # Utility classes
+├── bin/                          # Dev tooling: diagnostics.mjs (+ tests), coverage-blend.mjs, JaCoCo jars
+├── certs/                        # Generated .env secret + optional TLS cert (gitignored)
+├── conf/                         # Play configuration
+│   ├── application.conf          # Main app config
+│   ├── routes                    # URL routing
+│   ├── play.plugins              # Play plugin registration
+│   └── log4j2.xml                # Logging configuration
+├── docs/                         # User guide + generated architecture docs (other subdirectories are gitignored, local to each clone)
+├── frontend/                     # Nuxt 4 SPA (SPA-only; ssr: false)
+│   ├── app.vue                   # Root component
+│   ├── layouts/                  # Page layouts
+│   ├── pages/                    # Nuxt file-based routes
+│   ├── components/               # Reusable Vue components
+│   ├── composables/              # Shared reactive state (useAuth, useEventBus, ...)
+│   ├── middleware/               # Global route middleware (auth guard)
+│   ├── public/                   # Static assets
+│   └── nuxt.config.ts            # Nuxt configuration
+├── evals/                        # Agent-behaviour eval datasets
+├── modules/                      # Play modules (auto-managed)
+├── public/                       # Static web assets
+├── sidecar/                      # Python sidecars (asr, diarize, fetch, image, stealth, tts, video)
+├── skills/                       # Skill definitions loaded by SkillLoader
+├── test/                         # Unit and integration tests
+├── tmp/                          # Play temp/runtime files
+├── logs/                         # Application logs
+└── README.md                     # This file
+```
+
+---
+
+## Getting Started
+
+### Runtime Prerequisites
+
+- **JDK 25+** (Zulu recommended)
+
+That's the whole list. The [Abundent Play 1.x fork](https://github.com/tsukhani/play1),
+app dependencies, precompiled classes, and the prebuilt SPA all ship **inside**
+`jclaw-bundle.zip`, so a Java 25 runtime is the only thing the host needs to run
+JClaw — see [Quick Install](#quick-install-one-line), which also covers the Node.js and
+Chromium the browser tool downloads on first use. (Building from source instead
+adds a dev toolchain — Node.js, pnpm, and the `play` CLI — which the
+[Dev Container](#dev-container-recommended) installs for you.)
+
+#### Optional system dependencies
+
+**Tesseract OCR** — required for text extraction from images, scanned PDFs,
+and image-only PDFs via the `documents` tool. Apache Tika invokes the
+`tesseract` binary as a subprocess; without it, image inputs return empty
+text. A startup probe logs a WARN line at boot if tesseract is missing so
+the missing capability is visible without trial and error.
+
+```bash
+# Debian / Ubuntu
+sudo apt-get install tesseract-ocr
+
+# macOS
+brew install tesseract
+
+# Windows
+choco install tesseract
+# or: winget install --id UB-Mannheim.TesseractOCR
+```
+
+On Windows, the UB Mannheim installer (the `winget` line) does not add
+Tesseract to `PATH`, and OCR then silently returns empty text. Set
+`ocr.tesseract.path` in `conf/application.conf` to the directory holding
+`tesseract.exe` (e.g. `C:\Program Files\Tesseract-OCR`), not to the `.exe`.
+
+Additional language packs install separately. The default is English
+(`eng`); install `tesseract-ocr-fra`, `tesseract-ocr-jpn`, etc. for other
+languages, then set them under **Settings → Image → OCR**
+(e.g. `eng+fra+jpn`).
+
+**Local Ollama** — required only if you want to bind agents to the
+`ollama-local` LLM provider for self-hosted inference. JClaw seeds
+`provider.ollama-local.baseUrl=http://localhost:11434/v1` at first boot,
+so the provider is already listed in Settings without further wiring —
+install Ollama on the host and pull a model to make it usable. A startup
+probe logs INFO with the model count when the local server is reachable,
+and WARN with an install hint when the server is reachable but broken;
+a fresh install with no Ollama running stays silent (no spurious WARN
+on every JVM start).
+
+```bash
+# Linux
+curl https://ollama.com/install.sh | sh
+
+# macOS
+brew install ollama
+
+# Windows — download the installer from https://ollama.com/download
+```
+
+After installing, pull a model:
+
+```bash
+ollama pull qwen2.5
+```
+
+Then open **Settings → Providers → LLM Providers**, open **Manage models**
+on the `ollama-local` row, and either run **Discover Models** against
+`http://localhost:11434/v1` or enter the model you pulled in the
+**Add model** form (ID, display name, context window, max tokens). Bind an agent
+to `ollama-local` from the Agent Edit page to start chatting against
+your local model.
+
+**LM Studio** — required only if you want to bind agents to the
+`lm-studio` LLM provider. JClaw seeds
+`provider.lm-studio.baseUrl=http://localhost:1234/v1` at first boot
+so the provider is already listed under "Local" in Settings. Same
+boot-time probe as ollama-local: INFO when reachable, WARN with a
+launch hint when reachable-but-broken, silent (DEBUG) when LM Studio
+isn't running.
+
+LM Studio is a desktop application — install it from
+[https://lmstudio.ai](https://lmstudio.ai) (macOS DMG, Windows
+installer, or Linux AppImage). After launching, load a model in the
+**My Models** tab, then switch to the **Server** tab and click
+**Start Server**. The default port is 1234.
+
+In **Settings → Providers → LLM Providers**, open **Manage models** on
+the `lm-studio` row and either run **Discover Models** against
+`http://localhost:1234/v1` or enter the model you loaded in the
+**Add model** form. Bind an agent to
+`lm-studio` from the Agent Edit page to use it.
+
+**uv** — required only by the optional local sidecars (ASR, diarization,
+TTS, image, video, fetch, stealth). JClaw launches each one with
+`uv run serve.py`, and [uv](https://docs.astral.sh/uv/) provisions the
+Python and packages it runs on, so no system Python is needed. The image
+and video generation checks look for `uv` once and remember the answer,
+so restart JClaw after installing it.
+
+**ffmpeg** — required for local Whisper transcription (it converts audio
+to the PCM Whisper reads), speaker diarization, shrinking large or
+lossless audio attachments before they are sent to a model, encoding
+spoken replies for the channel that plays them, and sampling frames for
+video interpretation. The Docker image already includes it.
+
+```bash
+# Debian / Ubuntu
+sudo apt-get install ffmpeg
+
+# macOS
+brew install ffmpeg
+```
+
+### Clone
+
+```bash
+git clone https://bitbucket.abundent.com/scm/jclaw/jclaw.git
+cd jclaw
+```
+
+Dependencies are automatically installed when you start with `jclaw.sh`.
+
+### Dev Container (Recommended)
+
+The fastest way to start coding without installing any of the [Prerequisites](#runtime-prerequisites) on your host machine is to use the included dev container. The `.devcontainer/Dockerfile` ships a pinned toolchain (Java 25, Python 3, Node 26, pnpm, the Play fork at the version recorded in `.play-version`, tesseract-ocr, ffmpeg, uv, Claude Code) on top of Ubuntu 26.04 LTS — all the prerequisites listed above, already installed.
+
+#### Host prerequisites
+
+Just two things on your machine:
+
+1. **Docker Desktop** (macOS/Windows) or **Docker Engine** (Linux) — the dev container runs in a Docker container, so the Docker daemon needs to be running.
+2. **An IDE that supports the [Dev Containers spec](https://containers.dev/)** — any of:
+   - [Cursor](https://cursor.com/) (built-in support)
+   - [VS Code](https://code.visualstudio.com/) with the **Dev Containers** extension
+   - [JetBrains Gateway](https://www.jetbrains.com/remote-development/gateway/) with the Dev Containers plugin
+   - [GitHub Codespaces](https://github.com/features/codespaces) (cloud, no local Docker needed)
+
+#### First-time launch
+
+After cloning, open the project in your IDE and trigger the "Reopen in Container" command:
+
+| IDE | How to launch |
+|---|---|
+| **Cursor** | <kbd>Cmd</kbd>/<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd> → `Dev Containers: Reopen in Container` |
+| **VS Code** | Click the blue corner icon (bottom-left) → `Reopen in Container`, or <kbd>Cmd</kbd>/<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd> → same command |
+| **GitHub Codespaces** | Push your branch to GitHub → click `Code` → `Codespaces` tab → `Create codespace on main` |
+| **JetBrains Gateway** | New Connection → Dev Containers → point at the local `jclaw` folder |
+
+What happens automatically once you click:
+
+1. Docker builds the image from `.devcontainer/Dockerfile` (~5–10 min the first time, cached on subsequent rebuilds).
+2. Your local jclaw directory is bind-mounted into the container at `/workspaces/jclaw`. **Edits you make inside the container persist on your host** — the container is an environment, not a copy.
+3. The IDE runs the `postCreateCommand` automatically — `./jclaw.sh setup`, then `./gradlew playClasspath` to resolve the Gradle dependency cache, then a Playwright Chromium install (`com.microsoft.playwright.CLI install chromium`). `setup` itself:
+   - Validates all prerequisites (every check passes — they're baked into the image)
+   - Wires git hooks (`.githooks/pre-commit`, `.githooks/pre-push`, `.githooks/post-checkout`)
+   - Resolves the pinned pnpm version, which pnpm verifies against the lockfile's signed package-manager record
+   - Runs `pnpm install` for the frontend
+   - Adds the canonical `github` remote (`https://github.com/tsukhani/jclaw.git`)
+4. Recommended VS Code/Cursor extensions install (Volar, Java Pack, ESLint, Stylelint, YAML).
+5. The IDE attaches to the container — your terminal, file explorer, and editor are now running inside it.
+
+#### Day-to-day inside the container
+
+Everything works the same as it would on a native host. The container *is* a Linux dev box with the pre-installed toolchain:
+
+```bash
+./jclaw.sh --dev start    # dev mode (Play autoreload + Nuxt HMR)
+./jclaw.sh test           # backend + frontend test suites
+./jclaw.sh status         # check what's running
+./jclaw.sh backup         # online backup of the database into data/backups/
+./jclaw.sh stop
+```
+
+Ports `9000` (backend) and `3000` (Nuxt) are forwarded to your host automatically. Open `http://localhost:9000` and `http://localhost:3000` in your **host's browser** while the dev server runs inside the container. The Nuxt port is configured to auto-open the browser when it boots; the backend port emits a notification.
+
+#### Commits and `/deploy`
+
+The pre-commit hook (frontend lint-staged) and pre-push hook (full test suite) work inside the container without any extra setup. Two nuances:
+
+- **Signed commits** — `/deploy` produces signed commits and signed tags (`commit -S`, `tag -s`). Your host's GPG/SSH keys aren't visible inside the container by default. Two recovery options:
+  1. **Easiest**: do `/deploy` from your host shell (open a host terminal, `cd` into the project, run the slash command). Code inside the container, deploy from outside.
+  2. **More setup**: add a `mounts` block to `.devcontainer/devcontainer.json` to bind-mount `~/.ssh` and `~/.gnupg` into the container. Same end result, more configuration.
+- **File ownership** — files written inside the container land on your host with UID 1000 (`ubuntu` user). On macOS this maps to your user automatically; on Linux you may see "owned by 1000" in `ls -l` if your host UID differs. Usually harmless.
+
+#### Rebuilding
+
+When the toolchain changes (e.g., a new Play version, a JDK bump, a base-image bump), you'll want a fresh build:
+
+| IDE | How to rebuild |
+|---|---|
+| **Cursor / VS Code** | <kbd>Cmd</kbd>/<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd> → `Dev Containers: Rebuild Container` |
+| **JetBrains Gateway** | Container settings → `Rebuild` |
+| **CLI fallback** | `docker build -f .devcontainer/Dockerfile -t jclaw-devcontainer:latest .` from the repo root — the build context is the repo, since the Dockerfile copies `.play-version` (manual, you'd then need to update the IDE config to use the rebuilt image) |
+
+Most rebuilds reuse cached apt + JDK + Node layers and only re-download what changed (e.g., the Play release zip if `PLAY_VERSION` was bumped). Full cold rebuilds run ~5–10 min.
+
+#### Troubleshooting
+
+- **"Docker not running"** — start Docker Desktop / `sudo systemctl start docker`.
+- **First build hangs on apt-get** — your network is slow or the Ubuntu mirror is rate-limiting. Retry; layers are cached so progress isn't lost.
+- **Postcreate fails on `./jclaw.sh setup`** — read the error; it'll point at the failing prereq. Open `.devcontainer/Dockerfile` to see what's installed; if a tool is missing, file an issue or patch the Dockerfile and rebuild.
+- **Edits in the IDE don't appear on host** — verify you opened the folder via "Reopen in Container," not by mounting a Docker volume. The bind-mount is what makes the edits round-trip.
+- **`docker rmi` to clean up** — `docker rmi jclaw-devcontainer:latest` (or the container image name your IDE assigns) removes the cached image. The next "Reopen in Container" rebuilds from scratch.
+
+### Development
+
+```bash
+# Start both backend and frontend in dev mode
+./jclaw.sh --dev start
+
+# Stop
+./jclaw.sh --dev stop
+
+# Check status
+./jclaw.sh --dev status
+
+# View logs (tails both backend and frontend logs)
+./jclaw.sh --dev logs
+
+# Restart only the Play backend, leaving the Nuxt dev server running
+./jclaw.sh --dev restart --backend-only
+```
+Default ports: backend on **:9000**, frontend on **:3000**.
+
+### Production Deployment
+
+For a turnkey production install, use the [Quick Install](#quick-install-one-line) (which downloads the self-contained `jclaw-bundle.zip`) or [Docker](#docker-production). To build that bundle yourself, run `./jclaw.sh bundle` — it produces a self-contained `dist/jclaw-bundle.zip` that runs with only a Java 25 JRE. (`./jclaw.sh dist` builds the lighter `dist/jclaw.zip`, which needs a local Java 25, Gradle and Play fork install to run.) Unzip it wherever you want to install JClaw, then start it in place:
+
+```bash
+# Start
+./jclaw.sh start
+
+# Stop
+./jclaw.sh stop
+
+# View logs
+./jclaw.sh logs
+
+# Database: backup (--list to show them), restore, H2 recovery, health
+./jclaw.sh backup
+./jclaw.sh restore <zip | backup id>   # validated first; a running instance restarts
+./jclaw.sh repair                      # rebuild a damaged database with H2's Recover tool
+./jclaw.sh db-clean                    # delete what the last successful repair left behind
+./jclaw.sh db-status                   # file size, health verdict, last backup
+
+# Admin
+./jclaw.sh secret                      # generate or rotate PLAY_SECRET in certs/.env
+./jclaw.sh reset                       # clear the admin password; the next launch asks for a new one
+./jclaw.sh completion install          # bash + zsh tab completion
+./jclaw.sh shim                        # re-link the `jclaw` command into ~/.local/bin
+```
+
+### Docker (Production)
+
+The simplest way to run JClaw in production is with Docker Compose. The shipped `docker-compose.yml` pulls the prebuilt image from GHCR, publishes the app on **:9000** (HTTP) and **:9443** (HTTPS, TCP and UDP), and persists `data/`, `logs/`, `workspace/`, `skills/`, and `certs/` (the generated secret and TLS material) to the host so config and conversations survive restarts.
+
+```bash
+# Start in the background
+docker compose up -d
+
+# Follow logs
+docker compose logs -f
+
+# Stop and remove the container
+docker compose down
+
+# Run on custom ports (defaults: 9000, and 9443 for HTTPS)
+JCLAW_PORT=8080 JCLAW_HTTPS_PORT=8443 docker compose up -d
+```
+
+That's it — no `.env` setup needed. On first boot the container's entrypoint generates a 64-character `PLAY_SECRET` (used to sign session cookies) and persists it to `./certs/.env`. Subsequent restarts read the same file, so existing user sessions survive across `docker compose down` / `up` cycles. To rotate the secret, delete `./certs/.env` and restart the container — all existing `PLAY_SESSION` cookies become invalid, which is the point.
+
+If you'd rather pin the secret yourself (e.g. for multi-host deployments that need a shared cookie key, or rotation managed by your secret-store), drop a `.env` file alongside `docker-compose.yml` with `PLAY_SECRET=<value>` — Compose will forward it into the container and the entrypoint will defer to it instead of generating one.
+
+You can also set `JCLAW_PORT` and `JCLAW_HTTPS_PORT` in `.env` alongside `docker-compose.yml` instead of passing them inline — Compose reads the same file for variable interpolation in the YAML and for the runtime environment of the `jclaw` service.
+
+The container runs in production mode — the Nuxt SPA is already built into the image, so no local Node.js, pnpm, or Play toolchain is required on the host. Open `http://localhost:9000` (or your custom port) once the container is healthy.
+
+### Telemetry (OpenTelemetry)
+
+JClaw exports traces and metrics over OTLP from inside the process: HTTP server spans named from the route, one `turn` span per agent turn with the model call (GenAI semantic conventions), its HTTP call and every JDBC statement beneath it, plus `gen_ai.client.*`, `jclaw.turn.segment.duration` and `jvm.*` metrics. Nothing leaves the process until you turn it on.
+
+1. Run a collector, e.g. `docker run --rm -p 4318:4318 otel/opentelemetry-collector-contrib` with an OTLP receiver.
+2. Settings → System → Telemetry: enable, set the endpoint (default `http://localhost:4318`), press **Send test span**. Endpoint, headers, protocol and sampling all change live; no restart.
+
+**Optional: the OpenTelemetry Java agent.** Attach it when you also want Hibernate, Lucene and every other library the agent knows:
+
+```bash
+# Host install: add to conf/application.conf and restart
+%prod.javaagent.path=/opt/otel/opentelemetry-javaagent.jar
+
+# Container: compose it into the JVM options
+docker run -e JAVA_TOOL_OPTIONS="-javaagent:/opt/otel/opentelemetry-javaagent.jar" \
+           -e OTEL_EXPORTER_OTLP_ENDPOINT=http://collector:4318 jclaw
+```
+
+With the agent attached its `OTEL_*` settings apply and are read at JVM start; the Telemetry panel says so and its keys become read-only. The app then yields HTTP server, OkHttp, JDBC and JVM telemetry to the agent — its request spans are named from the Play route — and keeps emitting the turn and GenAI spans the agent cannot produce. Verified with agent 2.31.1 beside the framework's own enhancer agent on Netty 4.2.
+
+### Running Behind a Reverse Proxy
+
+JClaw already sends the right cache headers, and a proxy that rewrites or ignores them is the one remaining way to serve a stale SPA. The app sends `Cache-Control: no-cache` on the HTML shell (so it always revalidates) and `public, max-age=31536000, immutable` on the content-hashed `_nuxt/` chunks (so they never do). That split only works end-to-end if your proxy leaves it alone.
+
+If you front JClaw with nginx, Caddy, Traefik, or a CDN:
+
+- **Don't cache HTML.** The shell must revalidate on every load, or the browser keeps an `index.html` pointing at chunk hashes that no longer exist.
+- **Pass origin `Cache-Control` through unmodified.** Don't add a blanket `expires` or `proxy_cache_valid` covering all responses.
+- **If you do enable proxy caching, exclude `/` and `/_nuxt/builds/`.** The build manifest under `builds/` advertises the current build id; caching it defeats new-deploy detection. Everything else under `_nuxt/` is content-hashed and safe to cache hard.
+
+Diagnosing a suspected stale SPA: `curl -s localhost:9000/api/status | jq .spaBuildId` reports the build id the server is actually serving. Compare it against the id the browser has (DevTools → Network → `builds/latest.json`). Matching ids mean the browser is current and the problem is elsewhere; differing ids mean a caching layer is holding an old shell.
+
+```nginx
+location / {
+    proxy_pass http://127.0.0.1:9000;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    # Let the app decide cacheability — it already differentiates the
+    # always-revalidate shell from the immutable hashed chunks.
+    proxy_cache off;
+}
+```
+
+#### Browser-trusted HTTPS
+
+The container also exposes HTTPS on **:9443** (with HTTP/3 over the same UDP port) using a self-signed TLS cert generated at `certs/host.cert` on first boot. HTTPS works as-is but browsers show a cert-warning interstitial, and Chrome refuses HTTP/3 entirely — QUIC requires the cert to be in the system trust store. To get browser-trusted HTTPS plus working HTTP/3, sign the cert with [mkcert](https://github.com/FiloSottile/mkcert)'s local CA from your host. Install mkcert via your platform's package manager:
+
+```bash
+# macOS
+brew install mkcert
+
+# Debian / Ubuntu (22.04+)
+sudo apt install mkcert libnss3-tools
+
+# Fedora / RHEL
+sudo dnf install mkcert nss-tools
+
+# Arch
+sudo pacman -S mkcert nss
+
+# Windows
+choco install mkcert
+# or: scoop bucket add extras && scoop install mkcert
+```
+
+For older distros that don't package mkcert, grab the prebuilt binary from [the mkcert releases page](https://github.com/FiloSottile/mkcert/releases) and install `libnss3-tools` (Debian/Ubuntu) or `nss-tools` (Fedora) separately so mkcert can register with Firefox.
+
+Then trust the local CA, regenerate the cert, and restart the container:
+
+```bash
+sudo mkcert -install             # adds mkcert's CA to the system trust store (and Firefox NSS if installed)
+./jclaw.sh https                 # regenerates certs/host.cert + host.key, signed by the CA
+docker compose restart jclaw     # JVM reloads the new cert at boot
+```
+
+Subsequent `docker compose up -d` calls reuse the existing cert — you only need to re-run `./jclaw.sh https` after rotating mkcert's CA or deleting the `certs/` directory. Run `./jclaw.sh no-https` to delete the cert+key (the next start boots HTTP/1.1 only). `conf/application.conf` is never modified by either command.
+
+### Custom Ports
+
+Use `--backend-port` with any `jclaw.sh` mode; `--frontend-port` applies to dev mode only (it sets the Nuxt dev server port). The frontend reads the backend port via the `JCLAW_BACKEND_PORT` environment variable at startup — no files are modified.
+
+```bash
+# Dev mode with custom ports
+./jclaw.sh --dev --backend-port 8080 --frontend-port 4000 start
+
+# Bare start with custom backend port
+./jclaw.sh --backend-port 8080 start
+```
+
+### Testing
+
+Run the backend and frontend test suites together and print a consolidated pass/fail summary:
+
+```bash
+./jclaw.sh test
+```
+
+This runs `play autotest` (backend JUnit + functional tests), `pnpm test` (frontend Vitest), and the three frontend quality gates — `stylelint`, `lint`, and `typecheck` — streaming each check's output live, and finishes with a five-line verdict like:
+
+```
+ backend  : PASSED  (47 classes, 26s)
+ frontend : PASSED  Tests  199 passed (199) (5s)
+ stylelint: PASSED  (3s)
+ lint     : PASSED  (4s)
+ typecheck: PASSED  (8s)
+```
+
+Each check writes its full output to `logs/test-<check>.log` (e.g. `logs/test-backend.log`, `logs/test-typecheck.log`) for post-mortem on failure. The command exits non-zero if any check failed, so it's safe to wire into git hooks or CI.
+
+When a Playwright headless Chromium is cached (under `PLAYWRIGHT_BROWSERS_PATH`, else Playwright's per-OS cache), the backend run also includes the live-browser tests; otherwise it prints one line saying they stay skipped. Set `JCLAW_PLAYWRIGHT_TEST=0` to skip them.
+
+A few more developer commands sit beside it:
+
+```bash
+./jclaw.sh diagnostics [--tests]   # compile errors (and test failures) as one JSON array
+./jclaw.sh e2e                     # Playwright UAT suite against an already-running server
+./jclaw.sh loadtest                # in-process load-test harness against /api/chat/stream
+./jclaw.sh scrapetest              # scrape-ladder access rates over the CF-100 corpus (needs the backend)
+```
+
+#### Evals
+
+Agent behaviour is measured against datasets in `evals/suites/` — tool selection, structured output, and grounding, each a set of cases with deterministic pass criteria:
+
+```bash
+./jclaw.sh evals                                              # validate the dataset
+./jclaw.sh evals --responses run.json --out reports/now.json  # score a recorded run
+./jclaw.sh evals --responses run.json --baseline reports/last.json  # catch regressions
+./jclaw.sh evals --capture run.json --agent __evaltest__ --suite tool-selection  # drive a live agent
+```
+
+Validating and scoring are offline — no backend, no model call, no database — and `play autotest` validates the dataset on every run, so a malformed suite fails the build. `--capture` is the exception: it drives real agent turns, so it needs the backend running and spends model calls. See [evals/README.md](evals/README.md) for the format and for why a suite is edited in place, with a content fingerprint guarding comparability between runs.
+
+#### Git hooks
+
+`./jclaw.sh setup` wires the three in-repo hooks from `.githooks/` once per clone. `pre-commit` runs lint-staged over staged `frontend/**` files; `pre-push` skips by itself when the push changes only documentation (`docs/`, `*.md`, `.github/`) or only the `application.version` line; otherwise it runs a wildcard-import check, `spotlessCheck` and `compileJava`, then `./jclaw.sh test`, before a push reaches the remote, and caches the tested SHA in `$GIT_DIR/jclaw-last-tested-sha`, so the second push in a two-remote deploy flow (origin + github) reuses the result instead of re-running the suite; `post-checkout` seeds a new worktree via `./jclaw.sh init-worktree`. To wire them by hand instead:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+A human can bypass it for a one-off push (e.g. urgent hotfix) with `JCLAW_SKIP_TESTS=1 git push origin HEAD`; an agent never does.
+
+---
+
+## Architecture
+
+### Backend (Play 1.x + Java)
+
+- **Models**: JPA entities with Play's model pattern
+- **Controllers**: RESTful API endpoints
+- **Services**: Business logic, without a dependency-injection container
+- **Agents**: Conversational AI with memory/context persistence
+- **Jobs**: Internal maintenance (cleanup, probes, boot checks) on Play's built-in `@Every` / `@OnApplicationStart` job system
+- **Scheduling**: User-facing Tasks — immediate, scheduled, interval, and cron — run on [db-scheduler](https://github.com/kagkarlsson/db-scheduler), persisted in a `scheduled_tasks` table with atomic row-claim, pluggable retries, and heartbeat-based dead-execution recovery
+
+### Frontend (Nuxt 4)
+
+- **Framework**: Vue 3 + TypeScript + Nuxt 4 (SPA mode, `ssr: false`)
+- **UI components**: [shadcn-nuxt](https://www.shadcn-vue.com/) on [Reka UI](https://reka-ui.com/) primitives, with `class-variance-authority` + `tailwind-merge` for variants
+- **Styling**: Tailwind CSS v4 (via `@tailwindcss/vite`), Lucide + Heroicons icons, Inter variable font
+- **State**: Composables backed by `useState` (no Pinia); `@vueuse/core` utilities
+- **Data & rendering**: `@tanstack/vue-table` for tables, `marked` + `dompurify` for safe Markdown, `katex` for math, `zod` for validation
+- **API**: Cookie-session authenticated `$fetch` to the Play backend, proxied via Nitro in dev
+- **Tooling**: Vitest + `@nuxt/test-utils` + jsdom, Playwright e2e, ESLint + Stylelint, `vue-tsc` typecheck, a11y via `vue-axe`/`axe-core`
+
+---
+
+## Key Principles
+
+1. **Java-First** — Server-side logic is Java, not Node; Python only in the optional local sidecars.
+2. **Minimal Dependencies** — Only bring in what we absolutely need.
+3. **Memory & Context** — Agents remember. Context persists. Conversations flow.
+4. **Async by Default** — Jobs run in background. APIs are non-blocking.
+5. **Modular Skills** — Agents can automatically create, share, and chain skills. Skill primitives are reusable across agents and shareable with other JClaw users.
+
+---
+
+## Documentation
+
+- [Play Framework 1.x](https://github.com/tsukhani/play1)
+- [OpenClaw Reference](https://docs.openclaw.ai)
+- [Nuxt 4 Docs](https://nuxt.com/docs)
+- [JavaClaw Concepts](https://github.com/jobrunr/javaclaw)
+
+---
+
+## Contributing
+
+JClaw is developed **exclusively by the internal Abundent team**. We do not
+accept external contributions: pull requests from outside the team will be
+closed without review, however good the code. This is a deliberate legal
+choice that keeps the project's chain of title unambiguous under its
+dual-licensing model — see [CONTRIBUTING.md](CONTRIBUTING.md).
+
+**Bug reports and questions are very welcome** via
+[GitHub issues](https://github.com/tsukhani/jclaw/issues) or
+[support@abundent.com](mailto:support@abundent.com).
+
+---
+
+## License
+
+JClaw is **source-available** and dual-licensed:
+
+- **Noncommercial use** — free under the
+  [PolyForm Noncommercial License 1.0.0](LICENSE.md). This covers personal,
+  academic, research, and evaluation use, and use by registered non-profits,
+  educational institutions, and government bodies.
+- **Commercial use of any kind** — requires a
+  [commercial license from Abundent Sdn Bhd](COMMERCIAL-LICENSE.md). Company
+  size affects pricing (small-business, mid-market, and enterprise tiers),
+  never the requirement itself.
+
+JClaw is **not open-source software** as defined by the Open Source
+Definition, because the noncommercial license restricts the field of use.
+The source is public and free to read, study, and use noncommercially.
+
+**Historical versions:** releases up to and including **v0.15.4** were
+published under the MIT License and remain available under that license from
+the corresponding git tags. The dual-licensing model applies from **v0.16.0**
+onward.
+
+---
+
+*Built with ☕ Java and ❤️ by the Abundent crew.*

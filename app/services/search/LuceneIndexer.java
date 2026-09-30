@@ -1,0 +1,729 @@
+package services.search;
+
+import org.apache.lucene.analysis.Analyzer;
+import org.apache.lucene.analysis.TokenStream;
+import org.apache.lucene.analysis.core.LowerCaseFilter;
+import org.apache.lucene.analysis.en.EnglishPossessiveFilter;
+import org.apache.lucene.analysis.en.KStemFilter;
+import org.apache.lucene.analysis.standard.StandardAnalyzer;
+import org.apache.lucene.analysis.standard.StandardTokenizer;
+import org.apache.lucene.codecs.KnnVectorsFormat;
+import org.apache.lucene.document.Document;
+import org.apache.lucene.document.Field;
+import org.apache.lucene.document.KnnFloatVectorField;
+import org.apache.lucene.document.StringField;
+import org.apache.lucene.document.TextField;
+import org.apache.lucene.index.IndexWriter;
+import org.apache.lucene.index.IndexWriterConfig;
+import org.apache.lucene.index.Term;
+import org.apache.lucene.index.VectorSimilarityFunction;
+import org.apache.lucene.search.SearcherFactory;
+import org.apache.lucene.search.SearcherManager;
+import org.apache.lucene.store.FSDirectory;
+import org.jspecify.annotations.Nullable;
+import play.Play;
+import services.EventLogger;
+import services.Tx;
+
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.EnumMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+
+/**
+ * JVM-wide owner of the Lucene 10 IndexWriter + SearcherManager instances
+ * for every on-disk full-text index JClaw maintains. Replaces H2's
+ * {@code FullTextLucene} as the keeper of the index files; sync is driven
+ * by JPA lifecycle hooks on each indexed entity rather than DB triggers.
+ *
+ * <h2>Multi-scope (JCLAW-304)</h2>
+ * One {@link Scope} per indexed entity. Each scope gets its own
+ * subdirectory under {@code data/jclaw-lucene/<scope>/}, its own
+ * {@link IndexWriter}, and its own {@link SearcherManager}. Callers pass
+ * the scope explicitly on every {@link #upsert}/{@link #remove}/
+ * {@link #searcherManager} call, so segments never cross-contaminate
+ * between e.g. TaskRunMessage transcripts and Task name/description
+ * documents.
+ *
+ * <h2>Lifecycle</h2>
+ * <ul>
+ *   <li>{@link #open()} — called once from {@code FullTextSearchInitJob}
+ *       at {@code @OnApplicationStart}. Opens an FSDirectory + writer +
+ *       SearcherManager per scope.</li>
+ *   <li>{@link #close()} — called from {@code ShutdownJob} as one of its
+ *       {@code @OnApplicationStop} fan-out components. Commits pending writes and
+ *       releases file locks for every scope so the next boot opens
+ *       cleanly.</li>
+ *   <li>{@link #upsert(Scope, long, String)} / {@link #remove(Scope, long)}
+ *       — called from each entity's lifecycle hooks. Failures are caught
+ *       and logged; the indexer never aborts the parent JPA transaction.</li>
+ * </ul>
+ *
+ * <h2>Why a SearcherManager</h2>
+ * Lucene's IndexReader is immutable per snapshot — writes are invisible
+ * until a fresh reader is opened. SearcherManager handles the
+ * reopen-on-search cadence (we call {@code maybeRefresh} on each query),
+ * so callers always see the latest commits with near-real-time freshness
+ * without managing reader lifecycles by hand.
+ */
+public final class LuceneIndexer {
+
+    /**
+     * The set of indexed entities JClaw maintains. Adding a new scope
+     * requires (a) the corresponding entity's {@code @PostPersist} /
+     * {@code @PostUpdate} / {@code @PostRemove} hooks and (b) a backfill
+     * branch in {@code DirectLuceneMessageSearchRepository.init}.
+     */
+    public enum Scope {
+        /** TaskRunMessage.content — per-fire transcript turns. */
+        TASK_RUN_MESSAGE("task_run_message"),
+        /** Message.content — every chat / conversation message. */
+        CONVERSATION_MESSAGE("conversation_message"),
+        /** Task virtual doc: name + description for the operator-facing
+         *  task catalog search. */
+        TASK("task"),
+        /** SubagentRun virtual doc: label + outcome for the admin
+         *  subagent-runs search. */
+        SUBAGENT_RUN("subagent_run"),
+        /** Memory.text — per-agent memories. The only scope that carries an
+         *  {@link #AGENT_FIELD} so search can be filtered to one agent
+         *  (memories never cross agents). */
+        MEMORY("memory"),
+        /**
+         * External importable-skills catalog (the skills.sh / mastra-ai
+         * GitHub-scraped snapshot) backing the Skills page's "browse &amp;
+         * import" search. UNLIKE every scope above, this one is NOT derived
+         * from a JPA entity: it has no {@code @PostPersist}/{@code @PostUpdate}/
+         * {@code @PostRemove} hooks and NO backfiller in
+         * {@code DirectLuceneMessageSearchRepository}. It is (re)populated
+         * lazily by {@code services.SkillCatalogService} on the first search —
+         * which downloads the upstream snapshot, {@link #clear(Scope)}s this
+         * scope, and re-upserts every row keyed by its position in the loaded
+         * list (so a Lucene hit's id is an index back into the in-memory
+         * snapshot). Do not add a startup backfiller for it. */
+        SKILLS_CATALOG("skills_catalog");
+
+        private final String dirName;
+
+        Scope(String dirName) {
+            this.dirName = dirName;
+        }
+
+        /** Subdirectory under {@code data/jclaw-lucene/} where this scope's
+         *  Lucene segments live. */
+        public String dirName() {
+            return dirName;
+        }
+    }
+
+    /** Field names exposed in indexed Documents. */
+    static final String ID_FIELD = "id";
+    static final String CONTENT_FIELD = "content";
+
+    /**
+     * The one analyzer, shared by index and query time (JCLAW-1052).
+     *
+     * <p>Was {@link StandardAnalyzer}, which does not stem. Recall wraps each query token in a
+     * {@code PrefixQuery}, so "school" already reached "schooling" — but prefixes run one way
+     * only, and UAT found the operator asking the other way and getting nothing. KStem makes
+     * inflections match in both directions.
+     *
+     * <p><b>KStem, not Porter.</b> Both were measured over the live 90-memory corpus under the
+     * real PrefixQuery logic. Porter conflates more, and pays for it in tokens that are not
+     * words:
+     *
+     * <pre>
+     *   word         standard     porter       kstem
+     *   evenings     evenings     even         evenings
+     *   eventually   eventually   eventu       eventually
+     *   businesses   businesses   busi         business
+     *   Wednesday    wednesday    wednesdai    wednesday
+     * </pre>
+     *
+     * Porter's {@code evenings -> even} then prefix-expands into "event" and "eventually" —
+     * two false hits on that corpus for one query. KStem emits real words, has no such
+     * collision, and still fixes plurals in both directions ("nicknames" 0→2, "businesses"
+     * 0→2). This analyzer is shared by message, task, subagent-run and skills search as well
+     * as memory, so the wrong trade here degrades every scope.
+     *
+     * <p>What KStem deliberately does <em>not</em> do is bridge {@code schooling -> school}.
+     * That is derivational rather than inflectional — schooling is education, not a form of
+     * school — and Porter only joins them by accident of suffix-stripping. Derivation and
+     * synonymy belong to the semantic leg; JCLAW-1053 owns that case.
+     *
+     * <p>Hand-built rather than {@code EnglishAnalyzer} so the change is stemming and nothing
+     * else: {@code EnglishAnalyzer} also drops stopwords, which the previous no-arg
+     * {@code StandardAnalyzer} did not, and that would have been an untested second change.
+     *
+     * <p>Both call sites must use this instance. A divergence returns nothing rather than
+     * failing, because query tokens simply stop matching indexed terms.
+     */
+    public static final Analyzer ANALYZER = new Analyzer() {
+        @Override
+        protected TokenStreamComponents createComponents(String fieldName) {
+            var source = new StandardTokenizer();
+            TokenStream tokens = new EnglishPossessiveFilter(new LowerCaseFilter(source));
+            return new TokenStreamComponents(source, new KStemFilter(tokens));
+        }
+    };
+
+    /**
+     * Bumped whenever {@link #ANALYZER} changes. Stored in config; a mismatch at boot forces
+     * a full re-index, because documents tokenized by the previous analyzer do not match
+     * queries tokenized by the new one and the row-count check cannot see the difference.
+     */
+    static final String ANALYZER_GENERATION = "kstem-1";
+    /** Exact-match filter field, set only on scopes that need per-owner
+     *  filtering (currently {@link Scope#MEMORY}, keyed by agent id). */
+    static final String AGENT_FIELD = "agent";
+    /** KNN embedding field (JCLAW-555), set only on {@link Scope#MEMORY} docs
+     *  whose owning row has an embedding. Cosine similarity to match the
+     *  pgvector {@code <=>} operator on the Postgres side. */
+    static final String VECTOR_FIELD = "vector";
+
+    /** EventLogger category for all messages emitted from this indexer. */
+    private static final String CATEGORY = "search";
+
+    // Writer and SearcherManager snapshots. open() builds a fresh EnumMap
+    // locally, populates it under the class monitor, then publishes an
+    // immutable view through these volatile references LAST — so any thread
+    // (search/indexer call, on any carrier) that reads a non-empty map sees,
+    // by the volatile write→read happens-before, every entry it holds.
+    // close()/closeQuietly() republish an empty map. EnumMap keyed by Scope
+    // keeps per-scope lookups O(1) array accesses without boxing or hash work.
+    private static volatile Map<Scope, IndexWriter> writers = Map.of();
+    private static volatile Map<Scope, SearcherManager> searchers = Map.of();
+
+    /**
+     * Seconds between periodic background commits. Search visibility comes
+     * from {@code maybeRefresh} on the writer-NRT SearcherManager (sees
+     * in-RAM uncommitted segments), so per-write commit only bought
+     * durability at the cost of an fsync on every entity hook. We relax
+     * that to a periodic fsync cadence; the index is DERIVED from DB rows
+     * (re-backfillable on a wiped/stale boot), so a small window of
+     * uncommitted segments lost in a crash is recoverable. Override via
+     * {@value #COMMIT_INTERVAL_PROPERTY}.
+     */
+    private static final String COMMIT_INTERVAL_PROPERTY = "jclaw.search.commitIntervalSeconds";
+    private static final long DEFAULT_COMMIT_INTERVAL_SECONDS = 30L;
+
+    /**
+     * Single daemon thread that fsyncs every scope's writer on the
+     * {@link #COMMIT_INTERVAL_PROPERTY} cadence. Created in {@link #open()},
+     * stopped in {@link #close()}. Guarded by the class monitor along with
+     * the writer/searcher maps.
+     */
+    private static @Nullable ScheduledExecutorService commitScheduler;
+
+    private LuceneIndexer() {}
+
+    /**
+     * Open every scope's index. Idempotent across boot retries; a second
+     * call while writers are alive is a no-op.
+     */
+    public static synchronized void open() throws IOException {
+        // JCLAW-737: while a closed-mode test holds the index shut for its
+        // LuceneTestSync window, refuse to open so a concurrent test lane can't
+        // flip the shared index open underneath it (the un-serialized lazy-open
+        // path). Only consulted in test mode; production never sets the flag.
+        if (heldClosedForTest && Play.runningInTestMode()) return;
+        if (!writers.isEmpty()) return;
+        var newWriters = new EnumMap<Scope, IndexWriter>(Scope.class);
+        var newSearchers = new EnumMap<Scope, SearcherManager>(Scope.class);
+        try {
+            for (var scope : Scope.values()) {
+                openScope(scope, newWriters, newSearchers);
+            }
+            // Publish the fully-populated maps LAST so a reader never sees a
+            // half-built snapshot (see the field declaration for the fence).
+            writers = Collections.unmodifiableMap(newWriters);
+            searchers = Collections.unmodifiableMap(newSearchers);
+            startCommitScheduler();
+        } catch (IOException | RuntimeException e) {
+            // Partial-open rollback: any scope opened before the failure
+            // is closed so the next retry starts clean. Without this, a
+            // mid-loop failure leaves writers holding FS locks and the
+            // next open() can't grab them. Closes the local maps directly —
+            // they may or may not have been published above.
+            stopCommitScheduler();
+            closeMaps(newSearchers, newWriters);
+            writers = Map.of();
+            searchers = Map.of();
+            throw e;
+        }
+    }
+
+    private static void startCommitScheduler() {
+        var interval = commitIntervalSeconds();
+        commitScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+            var t = new Thread(r, "jclaw-lucene-commit");
+            t.setDaemon(true);
+            return t;
+        });
+        commitScheduler.scheduleWithFixedDelay(
+                LuceneIndexer::commitAll, interval, interval, TimeUnit.SECONDS);
+    }
+
+    /**
+     * Stop the periodic-commit daemon, giving an in-flight {@link #commitAll} a
+     * bounded window to finish. {@code shutdownNow} alone interrupts it mid-fsync,
+     * and the JDK answers an interrupt during a blocked channel op by closing the
+     * channel — a tragic {@code IndexWriter} error. Forced only on timeout.
+     */
+    private static void stopCommitScheduler() {
+        if (commitScheduler == null) return;
+        commitScheduler.shutdown();
+        try {
+            if (!commitScheduler.awaitTermination(5, TimeUnit.SECONDS)) commitScheduler.shutdownNow();
+        } catch (InterruptedException _) {
+            commitScheduler.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
+        commitScheduler = null;
+    }
+
+    private static long commitIntervalSeconds() {
+        var raw = Play.configuration.getProperty(COMMIT_INTERVAL_PROPERTY);
+        if (raw == null || raw.isBlank()) return DEFAULT_COMMIT_INTERVAL_SECONDS;
+        try {
+            var v = Long.parseLong(raw.trim());
+            return v > 0 ? v : DEFAULT_COMMIT_INTERVAL_SECONDS;
+        } catch (NumberFormatException _) {
+            return DEFAULT_COMMIT_INTERVAL_SECONDS;
+        }
+    }
+
+    /**
+     * Fsync every open scope's writer. Runs on the commit-scheduler daemon
+     * thread and (synchronously) from {@link #closeQuietly()} before close.
+     * Per-scope failures are logged, never propagated, so one bad writer
+     * doesn't starve the others' cadence.
+     */
+    private static void commitAll() {
+        for (var entry : writers.entrySet()) {
+            try {
+                entry.getValue().commit();
+            } catch (IOException | RuntimeException e) {
+                EventLogger.warn(CATEGORY, null, null,
+                        "Lucene periodic commit failed: scope=%s: %s"
+                                .formatted(entry.getKey().name(), e.getMessage()));
+            }
+        }
+    }
+
+    private static void openScope(Scope scope, Map<Scope, IndexWriter> writerMap,
+                                  Map<Scope, SearcherManager> searcherMap) throws IOException {
+        var indexDir = indexPath(scope);
+        Files.createDirectories(indexDir);
+        // Pre-v1 codec note: if the directory contains segments from an
+        // older Lucene codec (e.g. data/jclaw-lucene/ left over from a
+        // pre-Lucene-10 install), they read fine via the
+        // lucene-backward-codecs path. We don't ship backward-codecs on
+        // the classpath, so segments older than Lucene99 fail to open —
+        // the only way that happens is if an operator drops in segments
+        // from another install. The cleanup story is "wipe the directory".
+        var dir = FSDirectory.open(indexDir);
+        IndexWriter writer;
+        try {
+            var iwc = new IndexWriterConfig(ANALYZER);
+            iwc.setOpenMode(IndexWriterConfig.OpenMode.CREATE_OR_APPEND);
+            // IndexWriter takes ownership of dir on success and closes it
+            // via its own close(); we only release dir if construction throws
+            // (e.g. lock contention, corrupt segment) — otherwise the FS lock
+            // leaks and blocks next-boot retry.
+            writer = new IndexWriter(dir, iwc);
+        } catch (IOException | RuntimeException e) {
+            try { dir.close(); } catch (IOException _) { /* surface original */ }
+            throw e;
+        }
+        writerMap.put(scope, writer);
+        searcherMap.put(scope, new SearcherManager(writer, new SearcherFactory()));
+        EventLogger.info(CATEGORY, null, null,
+                "Lucene index opened: scope=%s at %s (%d existing docs)"
+                        .formatted(scope.name(), indexDir, writer.getDocStats().numDocs));
+    }
+
+    /** Commit pending writes and close every scope. Idempotent. */
+    public static synchronized void close() {
+        closeQuietly();
+    }
+
+    private static void closeQuietly() {
+        // Stop the periodic-commit daemon before closing writers so it
+        // doesn't fire a commit into a half-closed writer. IndexWriter.close()
+        // below flushes and commits any segments buffered since the last
+        // cadence tick, so durability is preserved across the shutdown.
+        stopCommitScheduler();
+        closeMaps(searchers, writers);
+        // Republish empty snapshots so isOpen()/lookups observe the closed state.
+        searchers = Map.of();
+        writers = Map.of();
+    }
+
+    /**
+     * Close every searcher then every writer in the given maps. Shared by the
+     * {@link #closeQuietly()} shutdown path (operating on the published fields)
+     * and the {@link #open()} partial-open rollback (operating on the local,
+     * possibly-unpublished maps). Per-scope failures are logged, never thrown.
+     */
+    private static void closeMaps(Map<Scope, SearcherManager> searcherMap,
+                                  Map<Scope, IndexWriter> writerMap) {
+        for (var entry : searcherMap.entrySet()) {
+            try {
+                entry.getValue().close();
+            } catch (IOException e) {
+                EventLogger.warn(CATEGORY, null, null,
+                        "SearcherManager close (scope=%s): %s"
+                                .formatted(entry.getKey().name(), e.getMessage()));
+            }
+        }
+        for (var entry : writerMap.entrySet()) {
+            try {
+                entry.getValue().close();
+                EventLogger.info(CATEGORY, null, null,
+                        "Lucene index closed: scope=%s".formatted(entry.getKey().name()));
+            } catch (IOException e) {
+                EventLogger.warn(CATEGORY, null, null,
+                        "IndexWriter close (scope=%s): %s"
+                                .formatted(entry.getKey().name(), e.getMessage()));
+            }
+        }
+    }
+
+    /**
+     * Add or update the index entry for the given {@code (scope, id)}
+     * pair, storing {@code content} as the indexed text. Hibernate calls
+     * this from each entity's {@code @PostPersist}/{@code @PostUpdate}
+     * callback; failures must not propagate, or the calling Tx would
+     * roll back over a transient FS issue.
+     *
+     * <p>{@code null} or blank content writes an empty content field —
+     * the doc still exists so a subsequent {@link #remove} can target it
+     * by id, but it matches no full-text queries until content arrives
+     * via a later update.
+     */
+    public static void upsert(Scope scope, long id, String content) {
+        upsert(scope, id, content, null);
+    }
+
+    /**
+     * As {@link #upsert(Scope, long, String)} but also indexes an exact-match
+     * {@link #AGENT_FIELD} when {@code agentKey} is non-null, so the scope can
+     * be searched filtered to a single owner (the {@link Scope#MEMORY} scope
+     * keys this on the agent id). A null {@code agentKey} writes no agent field,
+     * matching every other scope.
+     */
+    public static void upsert(Scope scope, long id, String content, @Nullable String agentKey) {
+        upsert(scope, id, content, agentKey, null);
+    }
+
+    /**
+     * As {@link #upsert(Scope, long, String, String)} but also indexes a
+     * {@link #VECTOR_FIELD} KNN embedding when {@code vector} is non-null
+     * (JCLAW-555: the Lucene HNSW backend for non-Postgres dialects). Because
+     * {@code updateDocument} replaces the whole document, callers re-upserting
+     * with a vector must repeat {@code content} and {@code agentKey}.
+     *
+     * <p>Catches {@link RuntimeException} in addition to {@link IOException}:
+     * a malformed vector (zero magnitude under cosine, dimension mismatch
+     * against segments already written) throws {@code IllegalArgumentException}
+     * from Lucene, and the no-throw contract of the entity-hook path must hold
+     * for the vector path too — a bad embedding must never lose the FTS doc or
+     * abort the caller.
+     */
+    public static void upsert(Scope scope, long id, String content, @Nullable String agentKey, float @Nullable [] vector) {
+        var writer = writers.get(scope);
+        if (writer == null) return;
+        try {
+            var doc = new Document();
+            doc.add(new StringField(ID_FIELD, String.valueOf(id), Field.Store.YES));
+            doc.add(new TextField(CONTENT_FIELD, content != null ? content : "", Field.Store.NO));
+            if (agentKey != null) doc.add(new StringField(AGENT_FIELD, agentKey, Field.Store.NO));
+            if (vector != null) {
+                doc.add(new KnnFloatVectorField(VECTOR_FIELD, vector, VectorSimilarityFunction.COSINE));
+            }
+            writer.updateDocument(new Term(ID_FIELD, String.valueOf(id)), doc);
+            // No per-write commit: the write is searchable via the writer-NRT
+            // SearcherManager's maybeRefresh (called on every query). Durability
+            // comes from the periodic commit cadence plus close(), not an fsync
+            // on every entity hook — see the COMMIT_INTERVAL_PROPERTY rationale.
+        } catch (IOException | RuntimeException e) {
+            EventLogger.warn(CATEGORY, null, null,
+                    "Lucene upsert failed: scope=%s id=%d: %s"
+                            .formatted(scope.name(), id, e.getMessage()));
+        }
+    }
+
+    /**
+     * Drop the index entry for the row with the given id. Hibernate calls
+     * this from each entity's {@code @PostRemove}; same no-throw contract
+     * as {@link #upsert}.
+     *
+     * <p>Catches {@link RuntimeException} like {@link #upsert}: {@code deleteDocuments} throws
+     * {@code AlreadyClosedException} on a close race, and escaping a flush-time lifecycle
+     * callback rolls the caller's transaction back. A guard; JCLAW-962 is the cure.
+     */
+    public static void remove(Scope scope, long id) {
+        var writer = writers.get(scope);
+        if (writer == null) return;
+        try {
+            writer.deleteDocuments(new Term(ID_FIELD, String.valueOf(id)));
+            // No per-write commit — same cadence-based durability as upsert.
+        } catch (IOException | RuntimeException e) {
+            EventLogger.warn(CATEGORY, null, null,
+                    "Lucene remove failed: scope=%s id=%d: %s"
+                            .formatted(scope.name(), id, e.getMessage()));
+        }
+    }
+
+    /**
+     * Convenience overload for {@link Scope#TASK_RUN_MESSAGE} — preserves
+     * the pre-multi-scope call shape.
+     */
+    public static void remove(long id) {
+        remove(Scope.TASK_RUN_MESSAGE, id);
+    }
+
+    /**
+     * JCLAW-673/994: evict the documents for rows a bulk JPQL DELETE removed, then
+     * commit once. A bulk delete never fires the entity's {@code @PostRemove}, so a
+     * caller must collect the ids <em>before</em> deleting and hand them here, or the
+     * docs orphan. Lives on the indexer rather than beside any one delete path because
+     * five callers across four classes need it.
+     */
+    public static void removeAll(Scope scope, Collection<Long> ids) {
+        if (ids == null || ids.isEmpty()) return;
+        // Deferred to the caller's commit (JCLAW-1042). Unlike remove and upsert, this
+        // commits the index — durably — and every caller runs it inside the JPA transaction
+        // that deletes the rows. A throw after this point therefore left the documents gone
+        // while the rows survived: present in the database and on the UI, but unsearchable
+        // until a restart noticed docCount < rowCount and rebuilt the whole scope. Runs
+        // immediately when there is no transaction, so the backfill path is unaffected.
+        var snapshot = List.copyOf(ids);
+        Tx.afterCommit(() -> {
+            for (Long id : snapshot) {
+                remove(scope, id);
+            }
+            commit(scope);
+        });
+    }
+
+    /**
+     * JCLAW-820: evict every document owned by {@code agentKey} in one
+     * {@link IndexWriter#deleteDocuments(Term...)} against the exact-match
+     * {@link #AGENT_FIELD} — a single race-free delete, not a per-id loop
+     * (the JCLAW-673 evict pattern applied to a whole owner at once). Used by
+     * {@code JpaMemoryStore.deleteAll} whose bulk JPQL DELETE bypasses the
+     * {@code @PostRemove} hook, so the agent's {@link Scope#MEMORY} docs would
+     * otherwise orphan. Commits so the eviction is durable and immediately
+     * reflected (a rare service-path bulk op, not the per-write hot path).
+     * No-op for a null key or a closed scope; failures are logged, never
+     * propagated — same no-throw contract as {@link #remove}.
+     */
+    public static void removeByAgent(Scope scope, String agentKey) {
+        if (agentKey == null) return;
+        var writer = writers.get(scope);
+        if (writer == null) return;
+        try {
+            writer.deleteDocuments(new Term(AGENT_FIELD, agentKey));
+            writer.commit();
+        } catch (IOException | RuntimeException e) {
+            EventLogger.warn(CATEGORY, null, null,
+                    "Lucene removeByAgent failed: scope=%s agent=%s: %s"
+                            .formatted(scope.name(), agentKey, e.getMessage()));
+        }
+    }
+
+    /** Internal accessor for a scope's SearcherManager. */
+    static @Nullable SearcherManager searcherManager(Scope scope) {
+        return searchers.get(scope);
+    }
+
+    /**
+     * Fsync one scope's writer. Used by the backfill path to commit the
+     * whole row loop ONCE at the end instead of one fsync per row (the
+     * per-write {@link #upsert} no longer commits). No-op if the scope
+     * isn't open. Failures are logged, never propagated — same no-throw
+     * contract as {@link #upsert}.
+     */
+    public static void commit(Scope scope) {
+        var writer = writers.get(scope);
+        if (writer == null) return;
+        try {
+            writer.commit();
+        } catch (IOException | RuntimeException e) {
+            EventLogger.warn(CATEGORY, null, null,
+                    "Lucene commit failed: scope=%s: %s"
+                            .formatted(scope.name(), e.getMessage()));
+        }
+    }
+
+    /**
+     * Delete every document in one scope and commit, leaving the writer open.
+     * Used by externally-sourced scopes (currently {@link Scope#SKILLS_CATALOG})
+     * that fully reload from an upstream snapshot on each refresh rather than
+     * syncing row-by-row from JPA. The reload clears first so rows dropped
+     * upstream don't linger, and so position-keyed ids from a smaller new
+     * snapshot can't collide with stale higher-id docs. No-op if the scope
+     * isn't open; failures are logged, never propagated (same no-throw
+     * contract as {@link #upsert}).
+     */
+    public static void clear(Scope scope) {
+        var writer = writers.get(scope);
+        if (writer == null) return;
+        try {
+            writer.deleteAll();
+            writer.commit();
+        } catch (IOException | RuntimeException e) {
+            EventLogger.warn(CATEGORY, null, null,
+                    "Lucene clear failed: scope=%s: %s".formatted(scope.name(), e.getMessage()));
+        }
+    }
+
+    /**
+     * Largest KNN vector dimension this index will accept (JCLAW-935).
+     *
+     * <p>Read from the codec rather than hardcoded, so a later codec override or a
+     * Lucene upgrade that raises the cap is picked up without editing a constant.
+     * lucene-core 10.5.0 defaults to 1024, which is below several common embedding
+     * models — text-embedding-3-small is 1536 — so this is a limit operators hit
+     * with an ordinary choice, not an exotic one.
+     *
+     * <p>Callers must check before storing a model selection. {@link #upsert} cannot:
+     * its no-throw contract turns an oversized vector into a logged warning that
+     * discards the whole document, keyword text included, leaving the memory absent
+     * from every recall path with nothing surfaced to the operator.
+     */
+    public static int maxVectorDimensions() {
+        return KnnVectorsFormat.DEFAULT_MAX_DIMENSIONS;
+    }
+
+    /** Whether the indexes have been opened. */
+    public static boolean isOpen() {
+        return !writers.isEmpty();
+    }
+
+    /** Number of indexed documents in the given scope. Test/admin
+     *  introspection. */
+    public static int docCount(Scope scope) {
+        var writer = writers.get(scope);
+        if (writer == null) return 0;
+        return writer.getDocStats().numDocs;
+    }
+
+    /** System-property override for {@link #indexPath(Scope)}. Tests set
+     *  this in {@code @BeforeAll} to a freshly-created temp directory so
+     *  the autotest JVM doesn't fight a running production JVM for the
+     *  production index's {@code write.lock}. Unset (or blank) preserves
+     *  the production default at {@code data/jclaw-lucene/<scope>/}. Each
+     *  scope's subdirectory is created under whichever root resolves.
+     *
+     *  <p>Tests must {@link #close} before clearing the property, so the
+     *  next test's {@link #open} re-resolves against either a fresh
+     *  override or the production default. The companion
+     *  {@link #setIndexPathForTest} helper handles both halves and is
+     *  the documented test entrypoint. */
+    public static final String INDEX_PATH_PROPERTY = "jclaw.search.lucenePath";
+
+    /**
+     * Test-only seam: redirect {@link #indexPath(Scope)} to use {@code path}
+     * as the parent directory (each scope gets its own subdirectory under
+     * it) for the lifetime of the JVM, or until called again with
+     * {@code null} to clear. Tests that drive the real Lucene path must
+     * call this in {@code @BeforeAll} pointing at a per-class temp
+     * directory; without the redirect the index opens at
+     * {@code data/jclaw-lucene/...} and collides with any running
+     * production JVM holding the same lock.
+     *
+     * <p>Idempotent. Safe to call before any {@link #open}; the resolved
+     * path is read fresh on every {@code open}.
+     */
+    public static void setIndexPathForTest(Path path) {
+        if (path == null) {
+            System.clearProperty(INDEX_PATH_PROPERTY);
+        } else {
+            System.setProperty(INDEX_PATH_PROPERTY, path.toString());
+        }
+    }
+
+    /**
+     * When true, {@link #open()} is a no-op in test mode: the running
+     * closed-mode test is holding the shared index shut for its
+     * {@code LuceneTestSync} window and no concurrent lane may open it (JCLAW-737).
+     * Set only by {@link #holdClosedForTest}; production leaves it false and
+     * {@link #open()} additionally gates the check on {@link Play#runningInTestMode()}.
+     */
+    private static volatile boolean heldClosedForTest = false;
+
+    /**
+     * Test-only seam (JCLAW-737): while a closed-mode test holds the index shut,
+     * {@code LuceneTestSync.closedForTest} sets this true so a concurrent test
+     * lane's bare {@link #open()} can't flip the shared index open underneath it;
+     * {@code openForTest}/{@code release} clear it. The shared-index model is kept
+     * (play1 functional tests run their controllers on a single shared executor
+     * thread, so the seed and the search must see the same index) — this gate,
+     * not per-instance isolation, is what makes the closed window immune to other
+     * lanes. Never called in production.
+     */
+    public static void holdClosedForTest(boolean held) {
+        heldClosedForTest = held;
+    }
+
+    /**
+     * Test-only: clear every open scope's index in place (deleteAll + commit)
+     * and refresh the searchers, leaving the writers open at the current path.
+     * Callers serialize via {@code LuceneTestSync} (JCLAW-428) so a wipe never
+     * races a concurrent search test on a shared scope. No-op when closed.
+     */
+    public static synchronized void wipeForTest() {
+        for (var writer : writers.values()) {
+            try {
+                writer.deleteAll();
+                writer.commit();
+            } catch (IOException e) {
+                throw new UncheckedIOException("Lucene wipeForTest failed", e);
+            }
+        }
+        for (var searcher : searchers.values()) {
+            try {
+                searcher.maybeRefresh();
+            } catch (IOException e) {
+                throw new UncheckedIOException("Lucene wipeForTest refresh failed", e);
+            }
+        }
+    }
+
+    private static Path indexPath(Scope scope) {
+        // Resolution order:
+        //   1. explicit System-property override (setIndexPathForTest) — kept
+        //      for tests that drive the path directly (e.g. LuceneIndexerTest);
+        //   2. Play config jclaw.search.lucenePath, which honors the %test.
+        //      prefix so the autotest JVM lands in data/jclaw-lucene-test and
+        //      never the production index (JCLAW-428);
+        //   3. production default data/jclaw-lucene.
+        // Relative values resolve against the Play app root so the running JVM
+        // and any subprocess (cli admin, migration tool) agree regardless of cwd.
+        var override = System.getProperty(INDEX_PATH_PROPERTY);
+        var configured = Play.configuration.getProperty(INDEX_PATH_PROPERTY);
+        String chosen;
+        if (override != null && !override.isBlank()) {
+            chosen = override;
+        } else if (configured != null && !configured.isBlank()) {
+            chosen = configured;
+        } else {
+            chosen = "data/jclaw-lucene";
+        }
+        var rootPath = Path.of(chosen);
+        var root = rootPath.isAbsolute() ? rootPath
+                : Play.applicationPath.toPath().resolve(chosen);
+        return root.resolve(scope.dirName());
+    }
+}

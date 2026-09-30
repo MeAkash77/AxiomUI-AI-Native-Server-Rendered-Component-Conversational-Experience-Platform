@@ -1,0 +1,138 @@
+package channels;
+
+import org.jspecify.annotations.Nullable;
+import org.telegram.telegrambots.meta.api.objects.Update;
+
+import java.util.List;
+
+/**
+ * Generic inbound shape consumed by {@link controllers.WebhookTelegramController}
+ * and {@link TelegramPollingRunner}. Extracted from {@code TelegramChannel} in
+ * JCLAW-151; produced by {@link TelegramInboundParser#parseUpdate(Update)}.
+ *
+ * @param chatId       Telegram chat id (used as the conversation peer key)
+ * @param chatType     Telegram Bot API chat.type string ({@code "private"}
+ *                     / {@code "group"} / {@code "supergroup"} /
+ *                     {@code "channel"}), recorded for structured logging
+ *                     and possible future routing. Nullable when an
+ *                     update arrives without chat context.
+ * @param text         message body text; empty (never null) for media-only
+ *                     updates — {@code TelegramInboundParser} falls back to
+ *                     the caption and then to {@code ""}
+ * @param fromId          sender's Telegram user id (used for binding
+ *                        authorization)
+ * @param fromUsername    sender's Telegram @-handle if set
+ * @param fromDisplayName sender's display name for transcript attribution
+ *                        (JCLAW-367): first + last name when available,
+ *                        falling back to the @-handle, else null. Distinct
+ *                        from {@code fromUsername} so the UI can show a
+ *                        human label even for users who never set a handle.
+ * @param botMentioned    JCLAW-367 access-policy signal: true when the bot
+ *                        was directly addressed in this message — via an
+ *                        {@code @botusername} mention, a {@code text_mention}
+ *                        resolving to the bot's own user id, a
+ *                        {@code /cmd@botusername} bot_command suffix, or a
+ *                        reply to one of the bot's own messages. A later
+ *                        group-gating story consumes this; parsing here does
+ *                        NOT itself gate or drop anything. Best-effort when
+ *                        the bot identity is unknown (see
+ *                        {@link TelegramInboundParser#parseUpdate(Update)}).
+ * @param attachments     inbound file attachments (resolved lazily by the
+ *                        webhook handler)
+ * @param mediaGroupId    Telegram media-group identifier when multiple
+ *                        attachments are part of one user upload; null for
+ *                        single-attachment / text-only messages
+ * @param messageId       JCLAW-368: the inbound {@code message_id}, copied
+ *                        verbatim from the Update so replies/edits can
+ *                        target the originating message. Null when the
+ *                        Update carries no message id.
+ * @param messageThreadId JCLAW-368: the forum-topic thread id
+ *                        ({@code message_thread_id}) when the message lands
+ *                        in a topic ({@code is_topic_message} true); null
+ *                        for plain non-topic messages so a thread id is
+ *                        only carried when Telegram actually scopes the
+ *                        message to a topic.
+ * @param replyContext    JCLAW-366: the {@link QuotedReply#block} for a
+ *                        message that replies to (or natively quotes) an
+ *                        earlier one: the quoted span when there is one, else
+ *                        the replied-to text, else its media type. Null when
+ *                        the message is not a reply. Kept out of {@code text};
+ *                        {@link TelegramInboundTurn} folds it ahead of the
+ *                        text, so it is stored with the user turn
+ *                        (JCLAW-1296).
+ */
+public record InboundMessage(String chatId, @Nullable String chatType, String text,
+                             @Nullable String fromId, @Nullable String fromUsername,
+                             @Nullable String fromDisplayName, boolean botMentioned,
+                             List<PendingAttachment> attachments,
+                             @Nullable String mediaGroupId,
+                             @Nullable Integer messageId, @Nullable Integer messageThreadId,
+                             @Nullable String replyContext) {
+    public InboundMessage(String chatId, @Nullable String chatType, String text,
+                          @Nullable String fromId, @Nullable String fromUsername) {
+        this(chatId, chatType, text, fromId, fromUsername, null, false,
+                List.of(), null, null, null, null);
+    }
+
+    /**
+     * JCLAW-367: pre-sender-capture convenience overload. Callers that
+     * carry attachments + media-group context but no per-message sender
+     * display name / addressed-bot signal (e.g. the media-group reassembler)
+     * use this; {@code fromDisplayName} defaults to null and
+     * {@code botMentioned} to false. JCLAW-368: {@code messageId} and
+     * {@code messageThreadId} default to null — the merge path that uses
+     * this overload synthesizes one inbound from many and has no single
+     * message id / thread id to attribute. JCLAW-366: {@code replyContext}
+     * defaults to null for the same reason.
+     */
+    public InboundMessage(String chatId, @Nullable String chatType, String text,
+                          @Nullable String fromId, @Nullable String fromUsername,
+                          List<PendingAttachment> attachments,
+                          @Nullable String mediaGroupId) {
+        this(chatId, chatType, text, fromId, fromUsername, null, false,
+                attachments, mediaGroupId, null, null, null);
+    }
+
+    /**
+     * JCLAW-368 convenience overload preserved for callers that carry the
+     * full sender/attachment shape but pre-date the {@code replyContext}
+     * field (JCLAW-366) — defaults it to null so those call sites compile
+     * unchanged.
+     */
+    public InboundMessage(String chatId, @Nullable String chatType, String text,
+                          @Nullable String fromId, @Nullable String fromUsername,
+                          @Nullable String fromDisplayName, boolean botMentioned,
+                          List<PendingAttachment> attachments,
+                          @Nullable String mediaGroupId,
+                          @Nullable Integer messageId, @Nullable Integer messageThreadId) {
+        this(chatId, chatType, text, fromId, fromUsername, fromDisplayName,
+                botMentioned, attachments, mediaGroupId, messageId,
+                messageThreadId, null);
+    }
+
+    /**
+     * Coalescing key {@code (chatId, messageThreadId, fromId)} shared by the
+     * Telegram inbound-text and forward-coalesce lanes. Topics and senders stay
+     * distinct so concurrent bursts never interleave into one turn.
+     */
+    public String bufferKey() {
+        return chatId + "|" + messageThreadId + "|" + fromId;
+    }
+
+    /**
+     * This message as the flushed product of a coalescing buffer: every
+     * sender / chat / message component preserved, {@code text} and
+     * {@code attachments} replaced by the burst's merged content, and
+     * {@code mediaGroupId} cleared because the group has been consumed into
+     * this one inbound.
+     *
+     * <p>A wither rather than a 12-arg constructor re-listed at each lane: the
+     * media-group lane once merged through a 7-arg overload that silently
+     * dropped five components (JCLAW-397).
+     */
+    public InboundMessage coalesced(String text, List<PendingAttachment> attachments) {
+        return new InboundMessage(chatId, chatType, text, fromId, fromUsername,
+                fromDisplayName, botMentioned, attachments, null,
+                messageId, messageThreadId, replyContext);
+    }
+}

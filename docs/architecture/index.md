@@ -1,0 +1,72 @@
+# JClaw Documentation Index
+
+> Master index — primary AI retrieval entry point. **Full rescan (deep) by `bmad-document-project` on 2026-08-07.** Supersedes the 2026-06-29 generation and the three surgical correction passes that followed it (2026-07-14, 2026-07-23, 2026-08-07). That rescan added a **third part** (`sidecar`) and closed five subsystems the older set never documented: the pyannote diarization sidecar, the MERaLiON ASR engine, the evals harness, printing, and the vector-memory config surface.
+>
+> Regenerate with `/bmad-document-project` when the codebase structure drifts.
+
+## Project at a glance
+
+- **Name:** JClaw — Abundent's Java-first AI agent & automation platform.
+- **Version:** `application.version` in `conf/application.conf` (source of truth; status: pre-v1 / beta per AGENTS.md).
+- **Repository type:** multi-part monorepo — `backend` (Play 1.x Java), `frontend` (Nuxt 4 SPA), `sidecar` (five on-demand Python ML daemons). Backend + frontend ship as one bundle zip / container image; the sidecars are opt-in and not bundled.
+- **License:** dual-licensed — MIT through v0.15.4; source-available (PolyForm Noncommercial 1.0.0) + commercial from v0.16.0 (see `LICENSE.md` / `COMMERCIAL-LICENSE.md`). Not open source: the noncommercial license restricts the field of use.
+- **Upstream:** `bitbucket.abundent.com/scm/jclaw/jclaw` (Bitbucket origin) + `github.com/tsukhani/jclaw` (GitHub Releases + GHCR).
+- **Reference code:** OpenClaw (Node) and JavaClaw (Spring Boot), used for patterns only. No code is shared.
+
+## Read these first
+
+| If you are… | Start with |
+|---|---|
+| New to the repo | [Project Overview](project-overview.md) → [Source Tree](source-tree-analysis.md) |
+| Building a backend feature | [Backend Architecture](architecture-backend.md) → [API Contracts](api-contracts-backend.md) → [Data Models](data-models-backend.md) |
+| Building a frontend feature | [Frontend Architecture](architecture-frontend.md) → [Component Inventory](component-inventory-frontend.md) |
+| Wiring BE ↔ FE | [Integration Architecture](integration-architecture.md) |
+| Touching local ML (ASR, diarization, TTS, image, video) | [Sidecar Architecture](architecture-sidecar.md) |
+| Setting up / committing | [Development Guide](development-guide.md) |
+| Releasing / running in prod | [Deployment Guide](deployment-guide.md) |
+
+## Document map
+
+| Document | Scope |
+|---|---|
+| [project-overview.md](project-overview.md) | Project purpose, repository type, tech-stack summary, high-level architecture. |
+| [source-tree-analysis.md](source-tree-analysis.md) | Annotated directory tree with role per folder. |
+| [architecture-backend.md](architecture-backend.md) | Play 1.x pipeline, subsystems (agents/llm/tools/jobs/channels/mcp/memory/search), cross-cutting concerns. |
+| [architecture-frontend.md](architecture-frontend.md) | Nuxt 4 SPA structure, composables, auth model, testing approach. |
+| [api-contracts-backend.md](api-contracts-backend.md) | Every `/api/*` endpoint from `conf/routes`, grouped by domain. |
+| [data-models-backend.md](data-models-backend.md) | JPA entities, columns, indexes, enum conventions, search-index hooks, migration policy. |
+| [component-inventory-frontend.md](component-inventory-frontend.md) | Pages, components, composables, middleware, plugins, utilities, types. |
+| [integration-architecture.md](integration-architecture.md) | REST + SSE transports, external channels, deploy-artifact unification. |
+| [development-guide.md](development-guide.md) | Local setup, test commands, post-coding workflow (required). |
+| [deployment-guide.md](deployment-guide.md) | Jenkins pipeline, `jclaw.sh` / bundle, Docker, production config. |
+| [architecture-sidecar.md](architecture-sidecar.md) | The five local Python ML daemons: two-tier uv split, protocols, engines, lifecycle. |
+| [project-parts.json](project-parts.json) | Machine-readable part/tech/integration metadata. |
+
+## Runtime topology (one-line)
+
+```
+Browser (Nuxt 4 SPA) ── $fetch + EventSource ──► Play :9000/:9443 ── LlmProvider (OkHttp 5/SSE) ──► OpenAI/OpenRouter/Ollama/TogetherAI
+                                       + WS /api/voice          ├── db-scheduler task poller on virtual threads
+                                                                ├── Channel adapters (Slack / Telegram / WhatsApp Cloud+Web)
+                                                                ├── Lucene 10 full-text index (data/jclaw-lucene/)
+                                                                ├── JPA → H2 (dev) / PostgreSQL (prod template)
+                                                                └── Python ML sidecars on 127.0.0.1 (on demand):
+                                                                      image :9527 · video :9528 · asr :9529
+                                                                      diarize :9530 · tts :9531
+```
+
+## Conventions cheat sheet
+
+- **Play 1.x:** static-method controllers/services/jobs. No DI container.
+- **Auth:** cookie session; `AuthCheck @Before` (+ Bearer `ApiToken` for the in-process `jclaw_api` tool); webhooks exempt. Unauthenticated = **HTTP 401**; genuine authorization failures = **403**.
+- **Transactions:** `services.Tx.run(...)` wraps `JPA.withTransaction` (and no-ops if already inside one). Re-fetch entities after nested `Tx.run`.
+- **Outbound HTTP:** single **OkHttp 5** stack via `utils.HttpFactories` (`llmStreaming` / `llmSingleShot` / `general`). No `java.net.http.HttpClient` in `app/`.
+- **JSON:** single `utils.GsonHolder.INSTANCE`.
+- **Enums in DB:** string-backed (`@Enumerated(STRING)` or manual conversion) for hot-reload safety.
+- **Full-text search:** **Lucene 10** (`LuceneIndexer` + `DirectLuceneMessageSearchRepository`), synced via JPA `@Post*` hooks. Status/type filters still use LIKE.
+- **Test commands:** `play autotest` (NOT `play test`, which is interactive) + `cd frontend && pnpm test` after every frontend edit.
+- **Commit flow:** stop at the local commit; `/deploy` bumps `application.version` → pushes to **both** remotes (`origin` Bitbucket + `github`).
+
+## Open work / external references
+
+- Hand-authored architecture note alongside the generated set: [`jclaw-agentic-refactor.md`](jclaw-agentic-refactor.md) (refactor plan). This is **not** regenerated by this workflow.

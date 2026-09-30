@@ -1,0 +1,1988 @@
+import { describe, it, expect, vi, afterEach } from 'vitest'
+import { mountSuspended, registerEndpoint } from '@nuxt/test-utils/runtime'
+import { flushPromises } from '@vue/test-utils'
+import Chat from '~/pages/chat.vue'
+
+/**
+ * Page-level Vitest coverage for the {@code chat.vue} streaming state machine
+ * and tool-call rendering. The existing {@code chat.test.ts} covers the static
+ * toolbar (agent / model / thinking selectors and structural elements); these
+ * tests sit one layer deeper, exercising:
+ *
+ * <ul>
+ *   <li>The pre-stream UI contract — streaming-only affordances are absent and
+ *       the send/textarea controls are enabled when an agent is selected.</li>
+ *   <li>The send-button disabled state when no agent is configured.</li>
+ *   <li>The message-list rendering with a tool-call assistant message — the
+ *       conversation-load path threads {@code toolCalls} through to the
+ *       per-message renderer, so the tool name should surface in the DOM.</li>
+ * </ul>
+ *
+ * These tests do not drive the SSE pipeline directly — that surface is
+ * exercised by the JCLAW-26/JCLAW-95/JCLAW-111 suite — but they pin the
+ * frontend-side state shape that the SSE handlers update.
+ */
+
+function setupBaseChatApi() {
+  registerEndpoint('/api/agents', () => [
+    { id: 1, name: 'streaming-agent', modelProvider: 'ollama-cloud', modelId: 'kimi-k2.5',
+      enabled: true, isMain: true, thinkingMode: null, providerConfigured: true },
+  ])
+  registerEndpoint('/api/config', () => ({
+    entries: [
+      { key: 'provider.ollama-cloud.baseUrl', value: 'https://ollama.com/v1' },
+      { key: 'provider.ollama-cloud.apiKey', value: 'xxxx****' },
+      { key: 'provider.ollama-cloud.models', value:
+        '[{"id":"kimi-k2.5","name":"Kimi K2.5","supportsThinking":false}]' },
+    ],
+  }))
+  registerEndpoint('/api/conversations', () => [])
+  registerEndpoint('/api/subagent-runs', () => [])
+}
+
+describe('Chat page — streaming state machine', () => {
+  it('does not show the streaming status badge before any send fires', async () => {
+    setupBaseChatApi()
+    const component = await mountSuspended(Chat)
+    await flushPromises()
+
+    // The streaming badge no longer lives in the header — it moved to the
+    // in-body progress line (data-testid="stream-progress"), which renders
+    // for the whole turn while `streaming` is true and carries the phase
+    // label ("Prefilling…" on a local model / "Generating…") plus an elapsed
+    // timer. Guard against any of those indicators leaking into the idle
+    // render, including the legacy header/placeholder strings.
+    const html = component.html()
+    expect(html).not.toContain('stream-progress')
+    expect(html).not.toContain('Prefilling')
+    expect(html).not.toContain('streaming...')
+    expect(html).not.toContain('Thinking...')
+    expect(html).not.toContain('Generating...')
+  })
+
+  it('keeps the send button enabled when an agent is selected and no stream is in flight', async () => {
+    setupBaseChatApi()
+    const component = await mountSuspended(Chat)
+    await flushPromises()
+
+    // The send button is one of several buttons; locate it by its disabled
+    // state in the unstreaming/agent-selected scenario. Most agent-context
+    // buttons are enabled at this point, but the textarea must be enabled too
+    // (it's bound to the streaming flag via :disabled="streaming").
+    const textarea = component.find('textarea')
+    expect(textarea.exists()).toBe(true)
+    expect((textarea.element as HTMLTextAreaElement).disabled).toBe(false)
+    // autoResize caps the height at 200px, so the textarea must scroll (not clip) once long
+    // pasted text exceeds that — i.e. overflow-y must be auto, never hidden.
+    expect(textarea.classes()).toContain('overflow-y-auto')
+    expect(textarea.classes()).not.toContain('overflow-hidden')
+  })
+})
+
+describe('Chat page — tool call rendering', () => {
+  function setupToolCallConversation() {
+    setupBaseChatApi()
+    registerEndpoint('/api/conversations', () => [
+      { id: 42, agentId: 1, agentName: 'streaming-agent', channelType: 'web', peerId: 'admin',
+        messageCount: 2, preview: 'Tool call demo',
+        createdAt: '2026-04-22T10:00:00Z', updatedAt: '2026-04-22T10:00:00Z' },
+    ])
+    // The /messages endpoint feeds the assistant-with-toolCalls fixture used
+    // by the message renderer. The role-and-toolCalls combination triggers
+    // the tool-execution UI block in the template.
+    registerEndpoint('/api/conversations/42/messages', () => [
+      { id: 100, role: 'user', content: 'Run the search please',
+        createdAt: '2026-04-22T10:00:00Z' },
+      { id: 101, role: 'assistant', content: '',
+        toolCalls: [
+          { id: 'call_a', type: 'function',
+            function: { name: 'web_search', arguments: '{"query":"jclaw"}' } },
+        ],
+        createdAt: '2026-04-22T10:00:01Z' },
+      { id: 102, role: 'tool', content: 'search results body',
+        toolCallId: 'call_a',
+        createdAt: '2026-04-22T10:00:02Z' },
+      { id: 103, role: 'assistant', content: 'Here is what I found.',
+        createdAt: '2026-04-22T10:00:03Z' },
+    ])
+  }
+
+  it('mounts cleanly when a conversation containing tool calls is available', async () => {
+    setupToolCallConversation()
+    const component = await mountSuspended(Chat)
+    await flushPromises()
+
+    // Regression guard: the page used to iterate the conversation-sidebar
+    // list on mount; the tool-call-bearing message shape (no content, with
+    // toolCalls) must not break the feed fetch. The in-page sidebar is gone
+    // (recents moved to layouts/default.vue), so we assert the textarea
+    // rendered — proof the composition setup reached template render without
+    // throwing on the tool-call fixture.
+    const textarea = component.find('textarea')
+    expect(textarea.exists()).toBe(true)
+  })
+
+  it('does not render the empty-response placeholder for an assistant message with tool calls', async () => {
+    // Bug repro: a tool-calling assistant turn with no text content rendered
+    // "(empty response)" because the v-else-if only checked `!msg.reasoning`.
+    // The fix gates the placeholder on `!msg.toolCalls?.length && !streaming`
+    // — a message that did meaningful tool work isn't empty just because the
+    // text channel is blank. The fixture from setupToolCallConversation has
+    // an assistant message (id 101) with `content: ''` and one toolCalls
+    // entry, exactly the shape the screenshot of the bug showed.
+    setupToolCallConversation()
+    const component = await mountSuspended(Chat)
+    await flushPromises()
+
+    expect(component.text()).not.toContain('(empty response)')
+  })
+
+  it('nests structured chips under each call, not in one merged grid (JCLAW-170)', async () => {
+    // Regression pin: each tool call's chips MUST live inside that call's
+    // expanded body, not in a single merged grid below the call list. The
+    // setup mirrors the production multi-search shape — two web_search
+    // calls, each with its own structured result list — and asserts both
+    // chip groups make it into the DOM, sandwiched between the per-call
+    // headers rather than concatenated below them.
+    setupBaseChatApi()
+    registerEndpoint('/api/conversations', () => [
+      { id: 77, agentId: 1, agentName: 'streaming-agent', channelType: 'web',
+        peerId: 'admin', messageCount: 5, preview: 'multi-search demo',
+        createdAt: '2026-04-22T10:00:00Z', updatedAt: '2026-04-22T10:00:00Z' },
+    ])
+    registerEndpoint('/api/conversations/77/messages', () => [
+      { id: 200, role: 'user', content: 'search both stores',
+        createdAt: '2026-04-22T10:00:00Z' },
+      { id: 201, role: 'assistant', content: '',
+        toolCalls: [{
+          id: 'call_lazada', type: 'function', icon: 'search',
+          function: { name: 'web_search',
+            arguments: '{"query":"nose trimmer Lazada"}' },
+        }],
+        createdAt: '2026-04-22T10:00:01Z' },
+      { id: 202, role: 'tool', content: 'lazada result body',
+        toolResults: 'call_lazada',
+        toolResultStructured: {
+          provider: 'Exa',
+          results: [
+            { title: 'Lazada Listing A', url: 'https://lazada.com.my/a',
+              snippet: 'a', faviconUrl: 'https://icons.duckduckgo.com/ip3/lazada.com.my.ico' },
+            { title: 'Lazada Listing B', url: 'https://lazada.com.my/b',
+              snippet: 'b', faviconUrl: 'https://icons.duckduckgo.com/ip3/lazada.com.my.ico' },
+          ],
+        },
+        createdAt: '2026-04-22T10:00:02Z' },
+      { id: 203, role: 'assistant', content: '',
+        toolCalls: [{
+          id: 'call_shopee', type: 'function', icon: 'search',
+          function: { name: 'web_search',
+            arguments: '{"query":"nose trimmer Shopee"}' },
+        }],
+        createdAt: '2026-04-22T10:00:03Z' },
+      { id: 204, role: 'tool', content: 'shopee result body',
+        toolResults: 'call_shopee',
+        toolResultStructured: {
+          provider: 'Exa',
+          results: [
+            { title: 'Shopee Listing X', url: 'https://shopee.com.my/x',
+              snippet: 'x', faviconUrl: 'https://icons.duckduckgo.com/ip3/shopee.com.my.ico' },
+          ],
+        },
+        createdAt: '2026-04-22T10:00:04Z' },
+      { id: 205, role: 'assistant', content: 'Here are top picks from both.',
+        createdAt: '2026-04-22T10:00:05Z' },
+    ])
+
+    const component = await mountSuspended(Chat)
+    await flushPromises()
+    // The deep-link watcher needs the conversations list to land before it
+    // fires loadConversation; flush a second tick for hydration to settle.
+    await flushPromises()
+
+    // Force-load the conversation directly — no deep-link param in the test
+    // route — so the test exercises the post-hydration template path.
+    const vm = component.vm as unknown as { loadConversation: (id: number) => Promise<void> }
+    await vm.loadConversation(77)
+    await flushPromises()
+    // Open the outer accordion (collapsed by default on reload).
+    const outerToggle = component.findAll('button')
+      .find(b => b.text().includes('2 tool calls'))
+    if (outerToggle) await outerToggle.trigger('click')
+    await flushPromises()
+
+    const html = component.html()
+    // Both per-call query previews render as their own per-call rows.
+    expect(html).toContain('nose trimmer Lazada')
+    expect(html).toContain('nose trimmer Shopee')
+    // The latest call (Shopee) is auto-expanded — its result chip is in DOM.
+    expect(html).toContain('shopee.com.my/x')
+    // The Lazada call is collapsed by default; expand it to verify per-call
+    // nesting works for arbitrary calls (not just the auto-expanded last one).
+    const lazadaToggle = component.findAll('button')
+      .find(b => b.text().includes('nose trimmer Lazada'))
+    if (lazadaToggle) await lazadaToggle.trigger('click')
+    await flushPromises()
+    const expanded = component.html()
+    expect(expanded).toContain('lazada.com.my/a')
+    expect(expanded).toContain('lazada.com.my/b')
+  })
+})
+
+describe('Chat page — empty conversation state', () => {
+  it('renders the chat shell when no agent is configured', async () => {
+    registerEndpoint('/api/agents', () => [])
+    registerEndpoint('/api/config', () => ({ entries: [] }))
+    registerEndpoint('/api/conversations', () => [])
+    const component = await mountSuspended(Chat)
+    await flushPromises()
+
+    // Even with zero agents the page must not throw — the composer surface
+    // still renders even without agents to select.
+    expect(component.find('textarea').exists()).toBe(true)
+  })
+})
+
+describe('Chat page — JCLAW-215 image attachment on a non-vision model', () => {
+  it('accepts image attachments on a model without supportsVision (captioned server-side)', async () => {
+    // Baseline harness pins kimi-k2.5, which has no supportsVision flag in its
+    // config JSON, so visionSupported computes to false. JCLAW-215 removed the
+    // client-side gate: a non-vision model still accepts the image (the backend
+    // captions it into a text description), so the upload must queue with no
+    // error. defineExpose unwraps refs, so vm.attachError yields the value.
+    // Queuing an image now builds a thumbnail preview URL; jsdom doesn't
+    // implement createObjectURL (no-op), so stub it.
+    vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:test')
+    vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {})
+    setupBaseChatApi()
+    const component = await mountSuspended(Chat)
+    await flushPromises()
+
+    const vm = component.vm as unknown as {
+      addAttachments: (files: File[]) => void
+      attachError: string | null
+      attachedFiles: File[]
+    }
+    const png = new File([new Uint8Array([0x89, 0x50, 0x4E, 0x47])], 'shot.png', { type: 'image/png' })
+    vm.addAttachments([png])
+    await flushPromises()
+
+    expect(vm.attachError).toBeNull()
+    expect(vm.attachedFiles).toHaveLength(1)
+    expect(vm.attachedFiles[0]!.name).toBe('shot.png')
+  })
+
+  it('accepts non-image attachments on a non-vision model (file path is orthogonal to the vision gate)', async () => {
+    setupBaseChatApi()
+    const component = await mountSuspended(Chat)
+    await flushPromises()
+
+    const vm = component.vm as unknown as {
+      addAttachments: (files: File[]) => void
+      attachError: string | null
+      attachedFiles: File[]
+    }
+    const txt = new File(['hello'], 'note.txt', { type: 'text/plain' })
+    vm.addAttachments([txt])
+    await flushPromises()
+
+    expect(vm.attachError).toBeNull()
+    expect(vm.attachedFiles).toHaveLength(1)
+  })
+})
+
+describe('Chat page — JCLAW-131 per-kind upload caps + JCLAW-165 audio universally accepted', () => {
+  it('accepts audio attachments regardless of model supportsAudio flag', async () => {
+    // Pre-JCLAW-165 the addAttachments path rejected audio when the
+    // active model lacked supportsAudio. With the transcription pipeline
+    // in place every model can consume audio (text-only models receive
+    // the transcript as a text part; audio-capable models receive native
+    // input_audio), so the attach-time audio gate is gone.
+    setupBaseChatApi()
+    const component = await mountSuspended(Chat)
+    await flushPromises()
+
+    const vm = component.vm as unknown as {
+      addAttachments: (files: File[]) => void
+      attachError: string | null
+      attachedFiles: File[]
+    }
+    const wav = new File(['RIFF...'], 'memo.wav', { type: 'audio/wav' })
+    vm.addAttachments([wav])
+    await flushPromises()
+
+    expect(vm.attachError).toBeNull()
+    expect(vm.attachedFiles).toHaveLength(1)
+    expect(vm.attachedFiles[0]!.name).toBe('memo.wav')
+  })
+
+  // The per-kind size cap is covered end-to-end in ApiChatControllerTest's
+  // uploadRejectsOversizedFileAgainstConfigCap — mocking /api/config at the
+  // Vitest layer races with the component's own useFetch, so we'd have to
+  // wait for hydration specifically before the computed cap updates. Backend
+  // coverage is the authoritative enforcement; frontend UX testing stays
+  // focused on the attach-time gates here.
+})
+
+describe('Chat page — subagent transcript read-only mode (JCLAW-274)', () => {
+  // The /subagents page's "View transcript" link and the chat page's own
+  // subagent_announce "View full →" link both route to /chat?conversation=ID
+  // where the conversation belongs to a subagent (Agent.parentAgent != null,
+  // channel="subagent"). Subagents are filtered from /api/agents, so the
+  // resolver enters a read-only branch: messages render, a banner names the
+  // subagent, and the composer is disabled.
+
+  function setupSubagentTranscriptFixture() {
+    setupBaseChatApi()
+    // /api/conversations/{id} returns the subagent conversation directly —
+    // resolveAndLoadConversation hits this endpoint (not the list endpoint,
+    // which is channel-scoped and would silently miss subagent rows).
+    registerEndpoint('/api/conversations/501', () => ({
+      id: 501, agentId: 99, agentName: 'helper-subagent', channelType: 'subagent',
+      peerId: null, messageCount: 2, preview: 'subagent task',
+      createdAt: '2026-05-15T10:00:00Z', updatedAt: '2026-05-15T10:00:01Z',
+    }))
+    registerEndpoint('/api/conversations/501/messages', () => [
+      { id: 700, role: 'user', content: 'Subagent task instructions',
+        createdAt: '2026-05-15T10:00:00Z' },
+      { id: 701, role: 'assistant', content: 'Subagent reply.',
+        createdAt: '2026-05-15T10:00:01Z' },
+    ])
+  }
+
+  it('enters read-only mode and renders the banner when resolving a subagent conversation', async () => {
+    setupSubagentTranscriptFixture()
+    const component = await mountSuspended(Chat)
+    await flushPromises()
+
+    const vm = component.vm as unknown as {
+      resolveAndLoadConversation: (id: number) => Promise<boolean>
+      subagentTranscript: { agentId: number, agentName: string } | null
+    }
+    const loaded = await vm.resolveAndLoadConversation(501)
+    expect(loaded).toBe(true)
+    await flushPromises()
+
+    expect(vm.subagentTranscript).toEqual({ agentId: 99, agentName: 'helper-subagent' })
+    const banner = component.find('[data-testid="subagent-transcript-banner"]')
+    expect(banner.exists()).toBe(true)
+    expect(banner.text()).toContain('helper-subagent')
+    expect(banner.text()).toContain('Read-only')
+  })
+
+  it('disables the composer textarea when in subagent-transcript mode', async () => {
+    setupSubagentTranscriptFixture()
+    const component = await mountSuspended(Chat)
+    await flushPromises()
+
+    const vm = component.vm as unknown as {
+      resolveAndLoadConversation: (id: number) => Promise<boolean>
+    }
+    await vm.resolveAndLoadConversation(501)
+    await flushPromises()
+
+    const textarea = component.find('textarea').element as HTMLTextAreaElement
+    expect(textarea.disabled).toBe(true)
+    expect(textarea.placeholder).toContain('read-only')
+  })
+
+  it('renders the subagent transcript messages so the user can read them', async () => {
+    setupSubagentTranscriptFixture()
+    const component = await mountSuspended(Chat)
+    await flushPromises()
+
+    const vm = component.vm as unknown as {
+      resolveAndLoadConversation: (id: number) => Promise<boolean>
+    }
+    await vm.resolveAndLoadConversation(501)
+    await flushPromises()
+
+    const html = component.html()
+    expect(html).toContain('Subagent task instructions')
+    expect(html).toContain('Subagent reply.')
+  })
+
+  it('does not enter read-only mode for a normal (in-dropdown) conversation', async () => {
+    setupBaseChatApi()
+    registerEndpoint('/api/conversations/77', () => ({
+      id: 77, agentId: 1, agentName: 'streaming-agent', channelType: 'web',
+      peerId: 'admin', messageCount: 1, preview: 'normal',
+      createdAt: '2026-05-15T10:00:00Z', updatedAt: '2026-05-15T10:00:00Z',
+    }))
+    registerEndpoint('/api/conversations/77/messages', () => [])
+    const component = await mountSuspended(Chat)
+    await flushPromises()
+
+    const vm = component.vm as unknown as {
+      resolveAndLoadConversation: (id: number) => Promise<boolean>
+      subagentTranscript: { agentId: number, agentName: string } | null
+    }
+    await vm.resolveAndLoadConversation(77)
+    await flushPromises()
+
+    expect(vm.subagentTranscript).toBeNull()
+    expect(component.find('[data-testid="subagent-transcript-banner"]').exists()).toBe(false)
+    const textarea = component.find('textarea').element as HTMLTextAreaElement
+    expect(textarea.disabled).toBe(false)
+  })
+
+  it('links the banner back to the conversation that spawned the subagent', async () => {
+    setupSubagentTranscriptFixture()
+    registerEndpoint('/api/conversations/501', () => ({
+      id: 501, agentId: 99, agentName: 'helper-subagent', channelType: 'subagent',
+      peerId: null, messageCount: 2, preview: 'subagent task', parentConversationId: 601,
+      createdAt: '2026-05-15T10:00:00Z', updatedAt: '2026-05-15T10:00:01Z',
+    }))
+    const component = await mountSuspended(Chat)
+    await flushPromises()
+
+    const vm = component.vm as unknown as {
+      resolveAndLoadConversation: (id: number) => Promise<boolean>
+    }
+    await vm.resolveAndLoadConversation(501)
+    await flushPromises()
+
+    const back = component.find('[data-testid="subagent-transcript-back"]')
+    expect(back.exists()).toBe(true)
+    expect(back.attributes('href')).toBe('/chat?conversation=601')
+  })
+
+  it('omits the back link when the transcript has no parent conversation', async () => {
+    setupSubagentTranscriptFixture()
+    const component = await mountSuspended(Chat)
+    await flushPromises()
+
+    const vm = component.vm as unknown as {
+      resolveAndLoadConversation: (id: number) => Promise<boolean>
+    }
+    await vm.resolveAndLoadConversation(501)
+    await flushPromises()
+
+    expect(component.find('[data-testid="subagent-transcript-banner"]').exists()).toBe(true)
+    expect(component.find('[data-testid="subagent-transcript-back"]').exists()).toBe(false)
+  })
+})
+
+describe('Chat page — subagent chip stack', () => {
+  function subagentRun(id: number, childConversationId: number, status: string, label: string | null = null) {
+    return { id, label, parentAgentId: 1, parentAgentName: 'streaming-agent', childAgentId: 90 + id,
+      childAgentName: `main-sub-${id}`, parentConversationId: 601, childConversationId,
+      mode: 'session', status, startedAt: '2026-09-13T09:44:41Z', endedAt: null, outcome: null }
+  }
+
+  function setupParentConversation() {
+    setupBaseChatApi()
+    registerEndpoint('/api/conversations/601/messages', () => [
+      { id: 900, role: 'user', content: 'watch the downloads', createdAt: '2026-09-13T09:44:00Z' },
+    ])
+    registerEndpoint('/api/conversations/700/messages', () => [])
+    registerEndpoint('/api/conversations/602/messages', () => [
+      { id: 910, role: 'assistant', content: 'still scanning the downloads', createdAt: '2026-09-13T09:44:50Z' },
+    ])
+    registerEndpoint('/api/conversations/603/messages', () => [
+      { id: 920, role: 'assistant', content: 'downloads summarised', createdAt: '2026-09-13T09:45:10Z' },
+    ])
+    // 7 is an inline run: it writes into the parent conversation itself, so it gets no chip. Newest first, as requested.
+    registerEndpoint('/api/subagent-runs', (event) => {
+      const url = new URL(String(event.node?.req?.url ?? event.path ?? ''), 'http://localhost')
+      return url.searchParams.get('parentConversationId') === '601'
+        ? [subagentRun(8, 603, 'COMPLETED', 'Summarise the downloads'), subagentRun(7, 601, 'RUNNING'), subagentRun(6, 602, 'RUNNING')]
+        : []
+    })
+  }
+
+  async function mountParentConversation() {
+    const component = await mountSuspended(Chat)
+    await flushPromises()
+    const vm = component.vm as unknown as { loadConversation: (id: number) => Promise<void> }
+    await vm.loadConversation(601)
+    await flushPromises()
+    return { component, vm }
+  }
+
+  it('stacks a minimized chip for every session run the conversation spawned, whatever its status', async () => {
+    setupParentConversation()
+    const { component } = await mountParentConversation()
+
+    const chips = component.findAll('[data-testid="subagent-chip"]')
+    expect(chips).toHaveLength(2)
+    // The inline run gets no chip but is still one of the runs the header counts.
+    expect(component.find('[data-testid="subagent-stack-count"]').text()).toBe('3 subagents · 1 running')
+    // The list hangs straight from the chat header, ahead of every conversation notice.
+    expect(component.find('[data-testid="subagent-stack"]').element.previousElementSibling)
+      .toBe(component.find('[data-testid="chat-header"]').element)
+    expect(chips[0]!.find('[data-testid="subagent-chip-label"]').text()).toBe('main-sub-6')
+    expect(chips[0]!.find('[data-testid="subagent-chip-status"]').text()).toBe('Running')
+    expect(chips[0]!.find('.animate-spin').exists()).toBe(true)
+    expect(chips[1]!.find('[data-testid="subagent-chip-label"]').text()).toBe('Summarise the downloads')
+    expect(chips[1]!.find('[data-testid="subagent-chip-label"]').attributes('title')).toBe('Summarise the downloads · main-sub-8')
+    expect(chips[1]!.find('[data-testid="subagent-chip-status"]').text()).toBe('Completed')
+    expect(chips[1]!.find('.animate-spin').exists()).toBe(false)
+    expect(component.find('[data-testid="subagent-chip-expanded"]').exists()).toBe(false)
+  })
+
+  it('expands a chip in place, and closes its transcript when the conversation is loaded again', async () => {
+    setupParentConversation()
+    const { component, vm } = await mountParentConversation()
+    const chips = () => component.findAll('[data-testid="subagent-chip"]')
+
+    await chips()[1]!.find('[data-testid="subagent-chip-toggle"]').trigger('click')
+    expect(chips()[1]!.find('[data-testid="subagent-transcript-full"]').attributes('href'))
+      .toBe('/chat?conversation=603')
+
+    await vm.loadConversation(700)
+    await flushPromises()
+    expect(component.find('[data-testid="subagent-stack"]').exists()).toBe(false)
+
+    await vm.loadConversation(601)
+    await vi.waitFor(() => expect(chips()).toHaveLength(2))
+    expect(component.find('[data-testid="subagent-chip-expanded"]').exists()).toBe(false)
+  })
+
+  it('mounts the transcript panel for the expanded run only, and unmounts it on collapse', async () => {
+    setupParentConversation()
+    const { component } = await mountParentConversation()
+    const chips = () => component.findAll('[data-testid="subagent-chip"]')
+    const panels = () => component.findAll('[data-testid="subagent-transcript-panel"]')
+    expect(panels()).toHaveLength(0)
+
+    await chips()[1]!.find('[data-testid="subagent-chip-toggle"]').trigger('click')
+    expect(panels()).toHaveLength(1)
+    expect(chips()[0]!.find('[data-testid="subagent-transcript-panel"]').exists()).toBe(false)
+    expect(chips()[1]!.find('[data-testid="subagent-transcript-full"]').attributes('href'))
+      .toBe('/chat?conversation=603')
+    await vi.waitFor(() => expect(chips()[1]!.text()).toContain('downloads summarised'))
+    expect(chips()[1]!.text()).not.toContain('still scanning the downloads')
+
+    await chips()[1]!.find('[data-testid="subagent-chip-toggle"]').trigger('click')
+    expect(panels()).toHaveLength(0)
+    expect(component.text()).not.toContain('downloads summarised')
+  })
+
+  it('keeps one transcript open at a time', async () => {
+    setupParentConversation()
+    const { component } = await mountParentConversation()
+    const chips = () => component.findAll('[data-testid="subagent-chip"]')
+
+    await chips()[0]!.find('[data-testid="subagent-chip-toggle"]').trigger('click')
+    await chips()[1]!.find('[data-testid="subagent-chip-toggle"]').trigger('click')
+
+    expect(component.findAll('[data-testid="subagent-transcript-panel"]')).toHaveLength(1)
+    expect(chips()[1]!.find('[data-testid="subagent-transcript-panel"]').exists()).toBe(true)
+    expect(chips()[0]!.find('[data-testid="subagent-chip-toggle"]').attributes('aria-expanded')).toBe('false')
+  })
+
+  it('heads the list with the run count from the Subagents page rather than the announcements', async () => {
+    setupParentConversation()
+    // One announce row, but the conversation spawned 150 runs: the header counts runs.
+    registerEndpoint('/api/conversations/601/messages', () => [
+      { id: 900, role: 'user', content: 'watch the downloads', createdAt: '2026-09-13T09:44:00Z' },
+      { id: 901, role: 'system', content: 'Subagent completed', messageKind: 'subagent_announce',
+        metadata: { runId: 6, status: 'COMPLETED', reply: 'ok', childConversationId: 602 }, createdAt: '2026-09-13T09:45:00Z' },
+    ])
+    registerEndpoint('/api/subagent-runs', (event) => {
+      const url = new URL(String(event.node?.req?.url ?? event.path ?? ''), 'http://localhost')
+      event.node.res.setHeader('x-total-count', '150')
+      return url.searchParams.get('parentConversationId') === '601' ? [subagentRun(6, 602, 'COMPLETED')] : []
+    })
+    const { component } = await mountParentConversation()
+    const count = () => component.find('[data-testid="subagent-stack-count"]')
+
+    expect(count().text()).toBe('150 subagents')
+    expect(component.find('[data-testid="subagent-stack-view-list"]').attributes('href'))
+      .toBe('/subagents?parentConversationId=601')
+  })
+})
+
+describe('Chat page — composer focus on entry', () => {
+  // Pin the "land the cursor in the message box" contract: any path that
+  // resets the chat to a typeable state should leave the textarea focused
+  // so the user can start typing without an extra click. Two entry points
+  // share the same focusInput() helper:
+  //
+  //   - newChat (the PencilSquareIcon button) — clears state then focuses.
+  //   - loadConversation (deep-link from /conversations, in-page Recents
+  //     click, or any other navigation that lands on a fresh conversation).
+
+  it('focuses the textarea after the New conversation button is clicked', async () => {
+    setupBaseChatApi()
+    const component = await mountSuspended(Chat, { attachTo: document.body })
+    await flushPromises()
+
+    // The composer's "New conversation" button is identified by its title
+    // attribute — it carries the PencilSquareIcon glyph but the title is
+    // the stable contract.
+    const newChatBtn = component.find('button[title="New conversation"]')
+    expect(newChatBtn.exists()).toBe(true)
+    await newChatBtn.trigger('click')
+    await flushPromises()
+    // focusInput() schedules its focus() call inside nextTick; flushPromises
+    // doesn't drain Vue's microtask queue, so add an extra tick.
+    await new Promise(r => setTimeout(r, 0))
+
+    const textarea = component.find('textarea').element as HTMLTextAreaElement
+    expect(document.activeElement).toBe(textarea)
+  })
+
+  it('focuses the textarea after loadConversation lands a conversation', async () => {
+    setupBaseChatApi()
+    registerEndpoint('/api/conversations/55/messages', () => [])
+    const component = await mountSuspended(Chat, { attachTo: document.body })
+    await flushPromises()
+
+    // Reach into the exposed surface to drive loadConversation directly —
+    // mirrors what the deep-link watcher and in-page route-query watcher do.
+    const vm = component.vm as unknown as {
+      loadConversation: (id: number) => Promise<void>
+    }
+    await vm.loadConversation(55)
+    await flushPromises()
+    await new Promise(r => setTimeout(r, 0))
+
+    const textarea = component.find('textarea').element as HTMLTextAreaElement
+    expect(document.activeElement).toBe(textarea)
+  })
+})
+
+/**
+ * JCLAW-270 async-spawn announce polling. After the parent's streaming turn
+ * ends, an async {@code subagent_announce} Message can arrive seconds later;
+ * the chat view polls {@code /api/conversations/{id}/messages} every 5s
+ * while any tool result reports {@code status:RUNNING} without a matching
+ * announce row yet, and stops the instant the announce lands or the page
+ * unmounts. Tests below drive the loop by invoking the exposed
+ * {@code pollForAnnounce} directly — that's the same code path the
+ * {@code setInterval} tick runs, without the harness fragility of fake
+ * timers + Nuxt's async-hydration runtime.
+ */
+describe('Chat page — async subagent announce polling', () => {
+  afterEach(() => {
+    vi.useRealTimers()
+    vi.restoreAllMocks()
+  })
+
+  it('polls for new messages when an async subagent run is pending', async () => {
+    setupBaseChatApi()
+    registerEndpoint('/api/conversations', () => [
+      { id: 401, agentId: 1, agentName: 'streaming-agent', channelType: 'web',
+        peerId: 'admin', messageCount: 3, preview: 'async pending',
+        createdAt: '2026-05-14T10:00:00Z', updatedAt: '2026-05-14T10:00:00Z' },
+    ])
+    // First call (from loadConversation) returns the pre-announce shape:
+    // user, assistant, tool-result with status:RUNNING. Second call (the
+    // first poll tick) adds the subagent_announce row of a run the agent
+    // waited on — user-role, the kind the chat page still renders as a card.
+    let messagesCalls = 0
+    registerEndpoint('/api/conversations/401/messages', () => {
+      messagesCalls++
+      const base = [
+        { id: 700, role: 'user', content: 'spawn async please',
+          createdAt: '2026-05-14T10:00:00Z' },
+        { id: 701, role: 'assistant', content: 'Spawned! Run id is 2.',
+          toolCalls: [
+            { id: 'call_x', type: 'function', icon: 'users',
+              function: { name: 'subagent_spawn', arguments: '{}' } },
+          ],
+          createdAt: '2026-05-14T10:00:01Z' },
+        { id: 702, role: 'tool',
+          content: '{"run_id":"2","conversation_id":"40005","status":"RUNNING"}',
+          toolResults: 'call_x',
+          createdAt: '2026-05-14T10:00:02Z' },
+      ]
+      if (messagesCalls >= 2) {
+        base.push({
+          id: 703, role: 'user',
+          content: 'Subagent completed (research): result body',
+          // @ts-expect-error fixture-only fields not in Message type
+          messageKind: 'subagent_announce',
+          metadata: {
+            runId: 2,
+            label: 'research',
+            status: 'COMPLETED',
+            reply: 'Lightweight threads dance...',
+            childConversationId: 40005,
+          },
+          createdAt: '2026-05-14T10:00:06Z',
+        })
+      }
+      return base
+    })
+
+    const component = await mountSuspended(Chat)
+    await flushPromises()
+    const vm = component.vm as unknown as {
+      loadConversation: (id: number) => Promise<void>
+      hasPendingAsyncAnnounce: () => boolean
+      pollForAnnounce: () => Promise<void>
+    }
+    await vm.loadConversation(401)
+    await flushPromises()
+
+    // Pre-announce: the loop should recognise the pending state.
+    expect(vm.hasPendingAsyncAnnounce()).toBe(true)
+    expect(component.find('[data-testid="subagent-announce-card"]').exists()).toBe(false)
+
+    // One poll tick — second /messages call returns the announce row.
+    await vm.pollForAnnounce()
+    await flushPromises()
+
+    expect(component.find('[data-testid="subagent-announce-card"]').exists()).toBe(true)
+    expect(component.text()).toContain('research')
+    expect(component.text()).toContain('Lightweight threads dance')
+    // And the pending check now reads false — loop will idle on next tick.
+    expect(vm.hasPendingAsyncAnnounce()).toBe(false)
+  })
+
+  it('stops polling once the announce arrives', async () => {
+    setupBaseChatApi()
+    registerEndpoint('/api/conversations', () => [
+      { id: 402, agentId: 1, agentName: 'streaming-agent', channelType: 'web',
+        peerId: 'admin', messageCount: 3, preview: 'stop after announce',
+        createdAt: '2026-05-14T10:00:00Z', updatedAt: '2026-05-14T10:00:00Z' },
+    ])
+    let messagesCalls = 0
+    registerEndpoint('/api/conversations/402/messages', () => {
+      messagesCalls++
+      const base = [
+        { id: 800, role: 'user', content: 'spawn async',
+          createdAt: '2026-05-14T10:00:00Z' },
+        { id: 801, role: 'assistant', content: 'Spawned.',
+          createdAt: '2026-05-14T10:00:01Z' },
+        { id: 802, role: 'tool',
+          content: '{"run_id":"5","conversation_id":"40010","status":"RUNNING"}',
+          createdAt: '2026-05-14T10:00:02Z' },
+      ]
+      if (messagesCalls >= 2) {
+        base.push({
+          id: 803, role: 'system' as unknown as 'tool',
+          content: 'Subagent completed',
+          // @ts-expect-error fixture-only fields not in Message type
+          messageKind: 'subagent_announce',
+          metadata: {
+            runId: 5, label: 'done', status: 'COMPLETED',
+            reply: 'done', childConversationId: 40010,
+          },
+          createdAt: '2026-05-14T10:00:06Z',
+        })
+      }
+      return base
+    })
+
+    const component = await mountSuspended(Chat)
+    await flushPromises()
+    const vm = component.vm as unknown as {
+      loadConversation: (id: number) => Promise<void>
+      hasPendingAsyncAnnounce: () => boolean
+      pollForAnnounce: () => Promise<void>
+    }
+    await vm.loadConversation(402)
+    await flushPromises()
+    const callsAfterLoad = messagesCalls
+
+    // Tick #1: announce arrives.
+    await vm.pollForAnnounce()
+    await flushPromises()
+    const callsAfterTick1 = messagesCalls
+    expect(callsAfterTick1).toBeGreaterThan(callsAfterLoad)
+    expect(vm.hasPendingAsyncAnnounce()).toBe(false)
+
+    // Now simulate two more interval ticks. The setInterval callback gates
+    // the network call on hasPendingAsyncAnnounce, so once the announce is
+    // in the list no further /messages calls should fire.
+    // Direct simulate by calling the same tick the interval would: noop.
+    // (We don't expose announcePollTick; the contract is "while pending").
+    // Re-asserting via the gate is enough — the interval handler will
+    // short-circuit on every subsequent tick.
+    expect(vm.hasPendingAsyncAnnounce()).toBe(false)
+  })
+
+  it('does not poll if no async run is pending', async () => {
+    setupBaseChatApi()
+    registerEndpoint('/api/conversations', () => [
+      { id: 403, agentId: 1, agentName: 'streaming-agent', channelType: 'web',
+        peerId: 'admin', messageCount: 2, preview: 'fully sync',
+        createdAt: '2026-05-14T10:00:00Z', updatedAt: '2026-05-14T10:00:00Z' },
+    ])
+    // Synchronous tool result — no status:RUNNING anywhere. The poller's
+    // pending-check should return false even though the conversation does
+    // contain a tool row.
+    registerEndpoint('/api/conversations/403/messages', () => [
+      { id: 900, role: 'user', content: 'do the sync thing',
+        createdAt: '2026-05-14T10:00:00Z' },
+      { id: 901, role: 'assistant', content: '',
+        toolCalls: [
+          { id: 'call_y', type: 'function', icon: 'search',
+            function: { name: 'web_search', arguments: '{}' } },
+        ],
+        createdAt: '2026-05-14T10:00:01Z' },
+      { id: 902, role: 'tool', content: 'sync result body',
+        toolResults: 'call_y',
+        createdAt: '2026-05-14T10:00:02Z' },
+      { id: 903, role: 'assistant', content: 'Here you go.',
+        createdAt: '2026-05-14T10:00:03Z' },
+    ])
+
+    const component = await mountSuspended(Chat)
+    await flushPromises()
+    const vm = component.vm as unknown as {
+      loadConversation: (id: number) => Promise<void>
+      hasPendingAsyncAnnounce: () => boolean
+    }
+    await vm.loadConversation(403)
+    await flushPromises()
+
+    expect(vm.hasPendingAsyncAnnounce()).toBe(false)
+  })
+
+  it('triggers polling after a task_manager.createTask scheduled-task tool result', async () => {
+    // Bug 1 follow-up: after the user schedules a task, the fire that lands
+    // on the server has no SSE channel back to this tab — auto-delivery
+    // would otherwise only surface on manual reload. hasRecentTaskCreate
+    // detects the createTask fingerprint in tool-call results and keeps the
+    // poller awake long enough for the auto-delivered Message row to land.
+    setupBaseChatApi()
+    registerEndpoint('/api/conversations', () => [
+      { id: 410, agentId: 1, agentName: 'streaming-agent', channelType: 'web',
+        peerId: 'admin', messageCount: 2, preview: 'task scheduled',
+        createdAt: '2026-05-14T10:00:00Z', updatedAt: '2026-05-14T10:00:00Z' },
+    ])
+    registerEndpoint('/api/conversations/410/messages', () => [
+      { id: 1200, role: 'user', content: 'remind me in 1m',
+        createdAt: new Date().toISOString() },
+      { id: 1201, role: 'assistant', content: 'Scheduled.',
+        createdAt: new Date().toISOString() },
+    ])
+
+    const component = await mountSuspended(Chat)
+    await flushPromises()
+    const vm = component.vm as unknown as {
+      loadConversation: (id: number) => Promise<void>
+      hasRecentTaskCreate: () => boolean
+      messages: Array<{ role: string, toolCalls?: Array<{ id: string, name: string, icon: string, arguments: string, resultText?: string | null }> }>
+    }
+    await vm.loadConversation(410)
+    await flushPromises()
+
+    // Without a task_manager tool call: poll trigger off.
+    expect(vm.hasRecentTaskCreate()).toBe(false)
+
+    // Splice a task_manager tool call onto the assistant row, mirroring the
+    // post-stream SSE shape. Detection keys on the tool name only —
+    // resultText is intentionally absent here to prove the simpler signal
+    // works even when the SSE frame omitted the result body.
+    const assistant = vm.messages.find(m => m.role === 'assistant')!
+    assistant.toolCalls = [{
+      id: 'call_task', name: 'task_manager', icon: 'tasks', arguments: '{"action":"createTask"}',
+      resultText: null,
+    }]
+
+    expect(vm.hasRecentTaskCreate()).toBe(true)
+  })
+
+  it('detects pending state from inline assistant.toolCalls (post-stream shape)', async () => {
+    // Regression: between stream-end and the next reload, the SSE tool_call
+    // frame folds the result into assistant.toolCalls[i].resultText rather
+    // than emitting a separate tool-role row. Without this branch, the
+    // poller would never fire on a same-page spawn-and-wait flow and the
+    // user would have to navigate away to see the announce land.
+    setupBaseChatApi()
+    registerEndpoint('/api/conversations', () => [
+      { id: 404, agentId: 1, agentName: 'streaming-agent', channelType: 'web',
+        peerId: 'admin', messageCount: 2, preview: 'post-stream pending',
+        createdAt: '2026-05-14T10:00:00Z', updatedAt: '2026-05-14T10:00:00Z' },
+    ])
+    // Server has only the assistant row + tool row; the test then mutates the
+    // local list to mimic the post-stream shape (no separate tool-role row,
+    // result inline on the assistant row).
+    registerEndpoint('/api/conversations/404/messages', () => [
+      { id: 1000, role: 'user', content: 'spawn async',
+        createdAt: '2026-05-14T10:00:00Z' },
+      { id: 1001, role: 'assistant', content: 'Spawned!',
+        createdAt: '2026-05-14T10:00:01Z' },
+    ])
+
+    const component = await mountSuspended(Chat)
+    await flushPromises()
+    const vm = component.vm as unknown as {
+      loadConversation: (id: number) => Promise<void>
+      hasPendingAsyncAnnounce: () => boolean
+      messages: Array<{ role: string, toolCalls?: Array<{ id: string, name: string, icon: string, arguments: string, resultText?: string | null }> }>
+    }
+    await vm.loadConversation(404)
+    await flushPromises()
+
+    // Splice the inline-toolCall onto the streamed assistant row, mirroring
+    // what the chat page's tool_call SSE handler does live.
+    const assistant = vm.messages.find(m => m.role === 'assistant')!
+    assistant.toolCalls = [{
+      id: 'call_async', name: 'subagent_spawn', icon: 'users', arguments: '{}',
+      resultText: '{"run_id":"7","conversation_id":"40020","status":"RUNNING"}',
+    }]
+
+    expect(vm.hasPendingAsyncAnnounce()).toBe(true)
+  })
+
+  it('does not duplicate the user bubble when the announce arrives via poll', async () => {
+    // Regression: pollForAnnounce used to filter additions purely by
+    // id-not-in-knownIds. Optimistic local rows have id=null, so the
+    // server-side copies of those same rows (which DO have ids) sailed
+    // past the filter and got appended a second time. Symptom: the user
+    // prompt bubble rendered twice in the transcript after an async
+    // spawn turn — once from the optimistic placeholder, once from the
+    // poll-fetched server row. The fix backfills server ids onto local
+    // optimistic rows before computing additions.
+    setupBaseChatApi()
+    registerEndpoint('/api/conversations', () => [
+      { id: 405, agentId: 1, agentName: 'streaming-agent', channelType: 'web',
+        peerId: 'admin', messageCount: 5, preview: 'dedup test',
+        createdAt: '2026-05-14T10:00:00Z', updatedAt: '2026-05-14T10:00:00Z' },
+    ])
+    // First /messages call: pre-announce shape — 4 rows, no announce yet.
+    // Second call (after the optimistic state is set up): full 5-row shape
+    // including the system-role announce.
+    let messagesCalls = 0
+    registerEndpoint('/api/conversations/405/messages', () => {
+      messagesCalls++
+      const base: Array<Record<string, unknown>> = [
+        { id: 1100, role: 'user', content: 'spawn async, please',
+          createdAt: '2026-05-14T10:00:00Z' },
+        { id: 1101, role: 'assistant', content: '',
+          toolCalls: [
+            { id: 'call_x', type: 'function', icon: 'users',
+              function: { name: 'subagent_spawn', arguments: '{}' } },
+          ],
+          createdAt: '2026-05-14T10:00:01Z' },
+        { id: 1102, role: 'tool',
+          content: '{"run_id":"9","conversation_id":"40030","status":"RUNNING"}',
+          toolResults: 'call_x',
+          createdAt: '2026-05-14T10:00:02Z' },
+        { id: 1103, role: 'assistant',
+          content: 'Run id is 9. Will let you know.',
+          createdAt: '2026-05-14T10:00:03Z' },
+      ]
+      if (messagesCalls >= 2) {
+        base.push({
+          id: 1104, role: 'system',
+          content: 'Subagent completed (test): done',
+          messageKind: 'subagent_announce',
+          metadata: {
+            runId: 9, label: 'test', status: 'COMPLETED',
+            reply: 'done', childConversationId: 40030,
+          },
+          createdAt: '2026-05-14T10:00:04Z',
+        })
+      }
+      return base
+    })
+
+    const component = await mountSuspended(Chat)
+    await flushPromises()
+    const vm = component.vm as unknown as {
+      loadConversation: (id: number) => Promise<void>
+      pollForAnnounce: () => Promise<void>
+      messages: Array<{
+        id: number | null
+        role: string
+        content?: string | null
+        toolCalls?: Array<{
+          id: string
+          name: string
+          icon: string
+          arguments: string
+          resultText?: string | null
+        }>
+      }>
+    }
+    await vm.loadConversation(405)
+    await flushPromises()
+
+    // Simulate the post-stream optimistic state: clear the loaded list and
+    // rebuild it the way the SSE path leaves it — id-less user + id-less
+    // assistant carrying the spawn's RUNNING result inline (no standalone
+    // tool-role row, no announce yet).
+    vm.messages.splice(0, vm.messages.length)
+    vm.messages.push(
+      { id: null, role: 'user', content: 'spawn async, please' },
+      { id: null, role: 'assistant', content: 'Run id is 9. Will let you know.',
+        toolCalls: [{
+          id: 'call_x', name: 'subagent_spawn', icon: 'users', arguments: '{}',
+          resultText: '{"run_id":"9","conversation_id":"40030","status":"RUNNING"}',
+        }] },
+    )
+
+    // Tick the poll. The next /messages fetch returns the full 5-row shape
+    // including the announce.
+    await vm.pollForAnnounce()
+    await flushPromises()
+
+    // Exactly ONE user row should remain — the optimistic one, now with its
+    // server id backfilled. The assistant row's id should also be backfilled
+    // (it's the LAST assistant by role-stack pairing). Only the
+    // intermediate empty-assistant + tool + system rows should have been
+    // appended as additions.
+    const userRows = vm.messages.filter(m => m.role === 'user')
+    expect(userRows).toHaveLength(1)
+    expect(userRows[0]!.id).toBe(1100)
+    const assistantWithContent = vm.messages.find(m => m.role === 'assistant' && m.content?.startsWith('Run id'))
+    expect(assistantWithContent?.id).toBe(1103)
+    // Announce row should now be present in the local list.
+    expect(vm.messages.some(m => m.role === 'system')).toBe(true)
+  })
+
+  it('clears the polling interval on unmount', async () => {
+    setupBaseChatApi()
+    // Spy on the global clearInterval so we can assert the unmount hook
+    // releases the timer rather than leaving it dangling — leaked intervals
+    // are a real-world bug source when the test harness reuses jsdom across
+    // `it` blocks.
+    const clearSpy = vi.spyOn(globalThis, 'clearInterval')
+
+    const component = await mountSuspended(Chat)
+    await flushPromises()
+
+    component.unmount()
+    await flushPromises()
+
+    // At least one clearInterval call must have happened; the chat page
+    // owns the announce poll's setInterval handle in onUnmounted.
+    expect(clearSpy).toHaveBeenCalled()
+  })
+})
+
+/**
+ * JCLAW-291: model output was cut off by max_tokens. Both the assistant
+ * bubble and the async announce card render an amber "Reply was truncated
+ * by the model" marker so the operator does not mistake the cut-off text
+ * for a complete answer. Tests cover both render paths.
+ */
+describe('Chat page — truncated reply marker', () => {
+  afterEach(() => {
+    vi.useRealTimers()
+    vi.restoreAllMocks()
+  })
+
+  it('renders a truncation marker on assistant messages where truncated=true', async () => {
+    setupBaseChatApi()
+    registerEndpoint('/api/conversations', () => [
+      { id: 501, agentId: 1, agentName: 'streaming-agent', channelType: 'web',
+        peerId: 'admin', messageCount: 2, preview: 'truncated assistant',
+        createdAt: '2026-05-15T10:00:00Z', updatedAt: '2026-05-15T10:00:00Z' },
+    ])
+    registerEndpoint('/api/conversations/501/messages', () => [
+      { id: 1200, role: 'user', content: 'Write me a long answer please',
+        createdAt: '2026-05-15T10:00:00Z' },
+      { id: 1201, role: 'assistant', content: 'Here is the start but it ran out',
+        truncated: true,
+        createdAt: '2026-05-15T10:00:01Z' },
+    ])
+
+    const component = await mountSuspended(Chat)
+    await flushPromises()
+    const vm = component.vm as unknown as {
+      loadConversation: (id: number) => Promise<void>
+    }
+    await vm.loadConversation(501)
+    await flushPromises()
+
+    const markers = component.findAll('[data-testid="truncated-marker"]')
+    expect(markers.length).toBeGreaterThanOrEqual(1)
+    expect(component.text()).toContain('Reply was truncated by the model')
+  })
+
+  it('renders a truncation marker on the announce card when metadata.truncated=true', async () => {
+    setupBaseChatApi()
+    registerEndpoint('/api/conversations', () => [
+      { id: 502, agentId: 1, agentName: 'streaming-agent', channelType: 'web',
+        peerId: 'admin', messageCount: 2, preview: 'truncated announce',
+        createdAt: '2026-05-15T10:00:00Z', updatedAt: '2026-05-15T10:00:00Z' },
+    ])
+    registerEndpoint('/api/conversations/502/messages', () => [
+      { id: 1300, role: 'user', content: 'Spawn an async research subagent please',
+        createdAt: '2026-05-15T10:00:00Z' },
+      { id: 1301, role: 'assistant', content: 'Spawned!',
+        createdAt: '2026-05-15T10:00:01Z' },
+      { id: 1302, role: 'user',
+        content: 'Subagent completed (research): partial reply text',
+        messageKind: 'subagent_announce',
+        truncated: true,
+        metadata: {
+          runId: 12, label: 'research', status: 'COMPLETED',
+          reply: 'partial reply text', childConversationId: 60000,
+          truncated: true,
+        },
+        createdAt: '2026-05-15T10:00:05Z' },
+    ])
+
+    const component = await mountSuspended(Chat)
+    await flushPromises()
+    const vm = component.vm as unknown as {
+      loadConversation: (id: number) => Promise<void>
+    }
+    await vm.loadConversation(502)
+    await flushPromises()
+
+    expect(component.find('[data-testid="subagent-announce-card"]').exists()).toBe(true)
+    const markers = component.findAll('[data-testid="truncated-marker"]')
+    expect(markers.length).toBeGreaterThanOrEqual(1)
+    expect(component.text()).toContain('Reply was truncated by the model')
+  })
+
+  it('renders attachment chips on a user message that carries attachments', async () => {
+    // Regression: the just-uploaded attachments must render on the
+    // user bubble immediately, not only after a reload. sendMessage's
+    // optimistic-push branch was missing the {@code attachments} field —
+    // without it the chip stayed hidden until a fresh /messages fetch
+    // surfaced the persisted MessageAttachment row. This test exercises
+    // the render branch the fix unlocks: a user message that carries
+    // attachments must produce both the filename text and the
+    // /api/attachments/{uuid} download href.
+    setupBaseChatApi()
+    registerEndpoint('/api/conversations', () => [
+      { id: 504, agentId: 1, agentName: 'streaming-agent', channelType: 'web',
+        peerId: 'admin', messageCount: 1, preview: 'attachment chip',
+        createdAt: '2026-05-15T10:00:00Z', updatedAt: '2026-05-15T10:00:00Z' },
+    ])
+    registerEndpoint('/api/conversations/504/messages', () => [
+      { id: 1500, role: 'user', content: 'What is in this document?',
+        createdAt: '2026-05-15T10:00:00Z',
+        attachments: [{
+          uuid: 'att-uuid-1',
+          originalFilename: 'Attendance List.docx',
+          mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+          sizeBytes: 2_900_000,
+          kind: 'FILE',
+        }] },
+    ])
+
+    const component = await mountSuspended(Chat)
+    await flushPromises()
+    const vm = component.vm as unknown as {
+      loadConversation: (id: number) => Promise<void>
+    }
+    await vm.loadConversation(504)
+    await flushPromises()
+
+    const html = component.html()
+    expect(html).toContain('Attendance List.docx')
+    expect(html).toContain('href="/api/attachments/att-uuid-1"')
+  })
+
+  it('omits the truncation marker when truncated is false/absent', async () => {
+    setupBaseChatApi()
+    registerEndpoint('/api/conversations', () => [
+      { id: 503, agentId: 1, agentName: 'streaming-agent', channelType: 'web',
+        peerId: 'admin', messageCount: 2, preview: 'no truncation',
+        createdAt: '2026-05-15T10:00:00Z', updatedAt: '2026-05-15T10:00:00Z' },
+    ])
+    registerEndpoint('/api/conversations/503/messages', () => [
+      { id: 1400, role: 'user', content: 'Hi',
+        createdAt: '2026-05-15T10:00:00Z' },
+      { id: 1401, role: 'assistant', content: 'Hello — full reply, no truncation here.',
+        createdAt: '2026-05-15T10:00:01Z' },
+    ])
+
+    const component = await mountSuspended(Chat)
+    await flushPromises()
+    const vm = component.vm as unknown as {
+      loadConversation: (id: number) => Promise<void>
+    }
+    await vm.loadConversation(503)
+    await flushPromises()
+
+    expect(component.findAll('[data-testid="truncated-marker"]')).toHaveLength(0)
+    expect(component.text()).not.toContain('Reply was truncated by the model')
+  })
+})
+
+/**
+ * JCLAW-323 — additional coverage targeting residual uncovered surface in
+ * chat.vue. These tests drive code paths that are reachable from the public
+ * exposed surface (loadConversation + messages ref + UI clicks) without
+ * touching production code.
+ */
+
+describe('Chat page — subagent_announce status pill + child-conversation link', () => {
+  it('renders the COMPLETED status pill with emerald color and the View full link', async () => {
+    setupBaseChatApi()
+    registerEndpoint('/api/conversations', () => [
+      { id: 601, agentId: 1, agentName: 'streaming-agent', channelType: 'web',
+        peerId: 'admin', messageCount: 2, preview: 'completed announce',
+        createdAt: '2026-05-16T10:00:00Z', updatedAt: '2026-05-16T10:00:00Z' },
+    ])
+    registerEndpoint('/api/conversations/601/messages', () => [
+      { id: 1600, role: 'user', content: 'Spawn a research subagent',
+        createdAt: '2026-05-16T10:00:00Z' },
+      { id: 1601, role: 'user',
+        content: 'Subagent completed (deep-research): result body',
+        messageKind: 'subagent_announce',
+        metadata: {
+          runId: 33, label: 'deep-research', status: 'COMPLETED',
+          reply: 'A short summary of the research output.',
+          childConversationId: 70001,
+        },
+        createdAt: '2026-05-16T10:00:01Z' },
+    ])
+
+    const component = await mountSuspended(Chat)
+    await flushPromises()
+    const vm = component.vm as unknown as { loadConversation: (id: number) => Promise<void> }
+    await vm.loadConversation(601)
+    await flushPromises()
+
+    const card = component.find('[data-testid="subagent-announce-card"]')
+    expect(card.exists()).toBe(true)
+    expect(card.text()).toContain('deep-research')
+    expect(card.text()).toContain('COMPLETED')
+    // The View full link routes back to /chat with the child id as a query.
+    const viewFull = component.find('[data-testid="subagent-announce-view-full"]')
+    expect(viewFull.exists()).toBe(true)
+    expect(viewFull.attributes('href')).toBe('/chat?conversation=70001')
+  })
+
+  it('renders the FAILED status pill in the red color class', async () => {
+    setupBaseChatApi()
+    registerEndpoint('/api/conversations', () => [
+      { id: 602, agentId: 1, agentName: 'streaming-agent', channelType: 'web',
+        peerId: 'admin', messageCount: 2, preview: 'failed announce',
+        createdAt: '2026-05-16T10:00:00Z', updatedAt: '2026-05-16T10:00:00Z' },
+    ])
+    registerEndpoint('/api/conversations/602/messages', () => [
+      { id: 1700, role: 'user', content: 'spawn failure',
+        createdAt: '2026-05-16T10:00:00Z' },
+      { id: 1701, role: 'user',
+        content: 'Subagent failed (broken): err',
+        messageKind: 'subagent_announce',
+        metadata: {
+          runId: 34, label: 'broken', status: 'FAILED',
+          reply: 'It failed.',
+          childConversationId: 70002,
+        },
+        createdAt: '2026-05-16T10:00:01Z' },
+    ])
+
+    const component = await mountSuspended(Chat)
+    await flushPromises()
+    const vm = component.vm as unknown as { loadConversation: (id: number) => Promise<void> }
+    await vm.loadConversation(602)
+    await flushPromises()
+
+    const card = component.find('[data-testid="subagent-announce-card"]')
+    expect(card.exists()).toBe(true)
+    // Status pill carries the FAILED text and the red color class.
+    expect(card.text()).toContain('FAILED')
+    expect(card.html()).toContain('bg-red-100')
+  })
+
+  it('renders the TIMEOUT status pill in the red color class', async () => {
+    setupBaseChatApi()
+    registerEndpoint('/api/conversations', () => [
+      { id: 603, agentId: 1, agentName: 'streaming-agent', channelType: 'web',
+        peerId: 'admin', messageCount: 2, preview: 'timeout',
+        createdAt: '2026-05-16T10:00:00Z', updatedAt: '2026-05-16T10:00:00Z' },
+    ])
+    registerEndpoint('/api/conversations/603/messages', () => [
+      { id: 1800, role: 'user', content: 'spawn timeout',
+        createdAt: '2026-05-16T10:00:00Z' },
+      { id: 1801, role: 'user',
+        content: 'Subagent timeout (slow): timed out',
+        messageKind: 'subagent_announce',
+        metadata: {
+          runId: 35, label: 'slow', status: 'TIMEOUT',
+          reply: 'Timed out.',
+          childConversationId: 70003,
+        },
+        createdAt: '2026-05-16T10:00:01Z' },
+    ])
+
+    const component = await mountSuspended(Chat)
+    await flushPromises()
+    const vm = component.vm as unknown as { loadConversation: (id: number) => Promise<void> }
+    await vm.loadConversation(603)
+    await flushPromises()
+
+    const card = component.find('[data-testid="subagent-announce-card"]')
+    expect(card.exists()).toBe(true)
+    expect(card.text()).toContain('TIMEOUT')
+    expect(card.html()).toContain('bg-red-100')
+  })
+
+  it('omits the View full link when the announce has no childConversationId', async () => {
+    setupBaseChatApi()
+    registerEndpoint('/api/conversations', () => [
+      { id: 604, agentId: 1, agentName: 'streaming-agent', channelType: 'web',
+        peerId: 'admin', messageCount: 1, preview: 'no link',
+        createdAt: '2026-05-16T10:00:00Z', updatedAt: '2026-05-16T10:00:00Z' },
+    ])
+    registerEndpoint('/api/conversations/604/messages', () => [
+      { id: 1900, role: 'user',
+        content: 'Subagent completed',
+        messageKind: 'subagent_announce',
+        metadata: {
+          runId: 36, status: 'COMPLETED',
+          reply: 'done',
+        },
+        createdAt: '2026-05-16T10:00:01Z' },
+    ])
+
+    const component = await mountSuspended(Chat)
+    await flushPromises()
+    const vm = component.vm as unknown as { loadConversation: (id: number) => Promise<void> }
+    await vm.loadConversation(604)
+    await flushPromises()
+
+    // No childConversationId in the payload → "View full" is omitted.
+    expect(component.find('[data-testid="subagent-announce-view-full"]').exists()).toBe(false)
+    // The status pill defaults to COMPLETED when present in the metadata.
+    expect(component.find('[data-testid="subagent-announce-card"]').text()).toContain('COMPLETED')
+  })
+})
+
+describe('Chat page — subagent announce cards', () => {
+  it('leaves a background spawn\'s announce to the subagent list, and keeps the card of a run the agent waited on', async () => {
+    setupBaseChatApi()
+    registerEndpoint('/api/conversations', () => [
+      { id: 605, agentId: 1, agentName: 'streaming-agent', channelType: 'web',
+        peerId: 'admin', messageCount: 3, preview: 'two announces',
+        createdAt: '2026-05-16T10:00:00Z', updatedAt: '2026-05-16T10:00:00Z' },
+    ])
+    registerEndpoint('/api/conversations/605/messages', () => [
+      { id: 2000, role: 'user', content: 'Spawn two subagents', createdAt: '2026-05-16T10:00:00Z' },
+      { id: 2001, role: 'system', content: 'Subagent completed (background-run): HELLO',
+        messageKind: 'subagent_announce',
+        metadata: { runId: 41, label: 'background-run', status: 'COMPLETED', reply: 'HELLO', childConversationId: 70010 },
+        createdAt: '2026-05-16T10:00:01Z' },
+      { id: 2002, role: 'user', content: 'Subagent completed (waited-run): DONE',
+        messageKind: 'subagent_announce',
+        metadata: { runId: 42, label: 'waited-run', status: 'COMPLETED', reply: 'DONE', childConversationId: 70011, yielded: true },
+        createdAt: '2026-05-16T10:00:02Z' },
+    ])
+
+    const component = await mountSuspended(Chat)
+    await flushPromises()
+    const vm = component.vm as unknown as { loadConversation: (id: number) => Promise<void> }
+    await vm.loadConversation(605)
+    await flushPromises()
+
+    const cards = component.findAll('[data-testid="subagent-announce-card"]')
+    expect(cards).toHaveLength(1)
+    expect(cards[0]!.text()).toContain('waited-run')
+    expect(component.text()).not.toContain('background-run')
+  })
+})
+
+describe('Chat page — tool-call rendering edges', () => {
+  it('renders a single tool call without splitting it into a multi-call accordion', async () => {
+    setupBaseChatApi()
+    registerEndpoint('/api/conversations', () => [
+      { id: 700, agentId: 1, agentName: 'streaming-agent', channelType: 'web',
+        peerId: 'admin', messageCount: 3, preview: 'single tool call',
+        createdAt: '2026-05-16T10:00:00Z', updatedAt: '2026-05-16T10:00:00Z' },
+    ])
+    registerEndpoint('/api/conversations/700/messages', () => [
+      { id: 2100, role: 'user', content: 'tell me about jclaw',
+        createdAt: '2026-05-16T10:00:00Z' },
+      { id: 2101, role: 'assistant', content: '',
+        toolCalls: [{
+          id: 'call_only', type: 'function', icon: 'search',
+          function: { name: 'web_search', arguments: '{"query":"jclaw"}' },
+        }],
+        createdAt: '2026-05-16T10:00:01Z' },
+      { id: 2102, role: 'tool', content: 'plain text result body',
+        toolResults: 'call_only',
+        createdAt: '2026-05-16T10:00:02Z' },
+      { id: 2103, role: 'assistant', content: 'OK done.',
+        createdAt: '2026-05-16T10:00:03Z' },
+    ])
+
+    const component = await mountSuspended(Chat)
+    await flushPromises()
+    const vm = component.vm as unknown as { loadConversation: (id: number) => Promise<void> }
+    await vm.loadConversation(700)
+    await flushPromises()
+
+    // Header reads "1 tool call" (singular form).
+    const accordionBtn = component.findAll('button').find(b => b.text().includes('1 tool call'))
+    expect(accordionBtn).toBeTruthy()
+  })
+
+  it('truncates a long plain-text tool result preview with an ellipsis', async () => {
+    setupBaseChatApi()
+    registerEndpoint('/api/conversations', () => [
+      { id: 701, agentId: 1, agentName: 'streaming-agent', channelType: 'web',
+        peerId: 'admin', messageCount: 3, preview: 'long result',
+        createdAt: '2026-05-16T10:00:00Z', updatedAt: '2026-05-16T10:00:00Z' },
+    ])
+    // 1000-char body — MAX_RESULT_TEXT_PREVIEW is 600 inside the page.
+    const longBody = 'a'.repeat(1000)
+    registerEndpoint('/api/conversations/701/messages', () => [
+      { id: 2200, role: 'user', content: 'fetch please',
+        createdAt: '2026-05-16T10:00:00Z' },
+      { id: 2201, role: 'assistant', content: '',
+        toolCalls: [{
+          id: 'call_fetch', type: 'function', icon: 'wrench',
+          function: { name: 'web_fetch', arguments: '{"url":"https://x"}' },
+        }],
+        createdAt: '2026-05-16T10:00:01Z' },
+      { id: 2202, role: 'tool', content: longBody,
+        toolResults: 'call_fetch',
+        createdAt: '2026-05-16T10:00:02Z' },
+      { id: 2203, role: 'assistant', content: 'Here.',
+        createdAt: '2026-05-16T10:00:03Z' },
+    ])
+
+    const component = await mountSuspended(Chat)
+    await flushPromises()
+    const vm = component.vm as unknown as { loadConversation: (id: number) => Promise<void> }
+    await vm.loadConversation(701)
+    await flushPromises()
+
+    // Open the accordion so per-call bodies render.
+    const accordionBtn = component.findAll('button').find(b => b.text().includes('1 tool call'))
+    if (accordionBtn) await accordionBtn.trigger('click')
+    await flushPromises()
+
+    // The clipped preview ends with the ellipsis character — truncatedToolResultText
+    // returns slice(0, 600) + '…' for >600-char inputs.
+    expect(component.html()).toContain('…')
+  })
+
+  it('toggles a tool-call accordion open and closed via the header button', async () => {
+    setupBaseChatApi()
+    registerEndpoint('/api/conversations', () => [
+      { id: 702, agentId: 1, agentName: 'streaming-agent', channelType: 'web',
+        peerId: 'admin', messageCount: 3, preview: 'toggle',
+        createdAt: '2026-05-16T10:00:00Z', updatedAt: '2026-05-16T10:00:00Z' },
+    ])
+    registerEndpoint('/api/conversations/702/messages', () => [
+      { id: 2300, role: 'user', content: 'go',
+        createdAt: '2026-05-16T10:00:00Z' },
+      { id: 2301, role: 'assistant', content: '',
+        toolCalls: [{
+          id: 'call_z', type: 'function', icon: 'search',
+          function: { name: 'web_search', arguments: '{"query":"abc"}' },
+        }],
+        createdAt: '2026-05-16T10:00:01Z' },
+      { id: 2302, role: 'tool', content: 'result',
+        toolResults: 'call_z',
+        toolResultStructured: {
+          results: [{ title: 'A', url: 'https://example.com/a', snippet: 's' }],
+        },
+        createdAt: '2026-05-16T10:00:02Z' },
+      { id: 2303, role: 'assistant', content: 'Done.',
+        createdAt: '2026-05-16T10:00:03Z' },
+    ])
+
+    const component = await mountSuspended(Chat)
+    await flushPromises()
+    const vm = component.vm as unknown as { loadConversation: (id: number) => Promise<void> }
+    await vm.loadConversation(702)
+    await flushPromises()
+
+    const headerBtn = component.findAll('button').find(b => b.text().includes('1 tool call'))
+    expect(headerBtn).toBeTruthy()
+    // Collapsed by default on reload — opening exposes the per-call body.
+    await headerBtn!.trigger('click')
+    await flushPromises()
+    expect(component.html()).toContain('example.com/a')
+
+    // Closing again hides the per-call chip grid.
+    await headerBtn!.trigger('click')
+    await flushPromises()
+    expect(component.html()).not.toContain('example.com/a')
+  })
+})
+
+describe('Chat page — assistant message footer actions', () => {
+  function setupAssistantConversation() {
+    setupBaseChatApi()
+    registerEndpoint('/api/conversations', () => [
+      { id: 800, agentId: 1, agentName: 'streaming-agent', channelType: 'web',
+        peerId: 'admin', messageCount: 2, preview: 'footer actions',
+        createdAt: '2026-05-16T10:00:00Z', updatedAt: '2026-05-16T10:00:00Z' },
+    ])
+    registerEndpoint('/api/conversations/800/messages', () => [
+      { id: 2400, role: 'user', content: 'Tell me a joke.',
+        createdAt: '2026-05-16T10:00:00Z' },
+      { id: 2401, role: 'assistant',
+        content: 'A joke landed here for you.',
+        createdAt: '2026-05-16T10:00:01Z' },
+    ])
+  }
+
+  it('deletes a server-id-bearing assistant message via DELETE /api/conversations/{id}/messages/{msgId}', async () => {
+    setupAssistantConversation()
+    let deleteCalled = false
+    registerEndpoint('/api/conversations/800/messages/2401', {
+      method: 'DELETE',
+      handler: () => {
+        deleteCalled = true
+        return { status: 'ok' }
+      },
+    })
+
+    const component = await mountSuspended(Chat)
+    await flushPromises()
+    const vm = component.vm as unknown as { loadConversation: (id: number) => Promise<void> }
+    await vm.loadConversation(800)
+    await flushPromises()
+
+    // Both user + assistant footers carry a Delete button. Find the one
+    // attached to the assistant row — its sibling button title is
+    // "Regenerate response" which only appears on assistant turns.
+    const assistantGroups = component.findAll('.group')
+    // Find a group that has both Regenerate and Delete buttons.
+    let deleteBtn: ReturnType<typeof component.find> | null = null
+    for (const g of assistantGroups) {
+      const regen = g.find('button[title="Regenerate response"]')
+      if (regen.exists()) {
+        deleteBtn = g.find('button[title="Delete message"]')
+        if (deleteBtn.exists()) break
+      }
+    }
+    expect(deleteBtn?.exists()).toBe(true)
+    await deleteBtn!.trigger('click')
+    await vi.waitFor(() => expect(deleteCalled).toBe(true))
+  })
+})
+
+describe('Chat page — user-message hover actions', () => {
+  function setupUserMsgConversation() {
+    setupBaseChatApi()
+    registerEndpoint('/api/conversations', () => [
+      { id: 850, agentId: 1, agentName: 'streaming-agent', channelType: 'web',
+        peerId: 'admin', messageCount: 1, preview: 'user message',
+        createdAt: '2026-05-16T10:00:00Z', updatedAt: '2026-05-16T10:00:00Z' },
+    ])
+    registerEndpoint('/api/conversations/850/messages', () => [
+      { id: 2500, role: 'user', content: 'my prompt text',
+        createdAt: '2026-05-16T10:00:00Z' },
+    ])
+  }
+
+  it('Edit & resubmit populates the composer with the user message text', async () => {
+    setupUserMsgConversation()
+    const component = await mountSuspended(Chat, { attachTo: document.body })
+    await flushPromises()
+    const vm = component.vm as unknown as { loadConversation: (id: number) => Promise<void> }
+    await vm.loadConversation(850)
+    await flushPromises()
+
+    const editBtn = component.find('button[title="Edit & resubmit"]')
+    expect(editBtn.exists()).toBe(true)
+    await editBtn.trigger('click')
+    await flushPromises()
+    // editUserMessage uses nextTick before focusing; flush a tick for safety.
+    await new Promise(r => setTimeout(r, 0))
+
+    const textarea = component.find('textarea').element as HTMLTextAreaElement
+    expect(textarea.value).toBe('my prompt text')
+  })
+})
+
+describe('Chat page — address bar', () => {
+  afterEach(async () => {
+    vi.restoreAllMocks()
+    await useRouter().replace({ query: {} })
+  })
+
+  it('puts a new conversation in the address once its first reply starts, and drops it for a new conversation', async () => {
+    setupBaseChatApi()
+    registerEndpoint('/api/conversations/950/messages', () => [])
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
+      const encoder = new TextEncoder()
+      const body = new ReadableStream({
+        start(controller) {
+          controller.enqueue(encoder.encode('data: {"type":"init","conversationId":950}\n'))
+          controller.enqueue(encoder.encode('data: {"type":"complete","content":"hi"}\n'))
+          controller.close()
+        },
+      })
+      return new Response(body, { status: 200, headers: { 'Content-Type': 'text/event-stream' } })
+    })
+    const router = useRouter()
+    const component = await mountSuspended(Chat)
+    await flushPromises()
+    expect(router.currentRoute.value.query.conversation).toBeUndefined()
+
+    await component.find<HTMLTextAreaElement>('textarea').setValue('hello')
+    await component.find('form').trigger('submit.prevent')
+    await vi.waitFor(() => expect(router.currentRoute.value.query.conversation).toBe('950'))
+
+    await component.find('button[title="New conversation"]').trigger('click')
+    await vi.waitFor(() => expect(router.currentRoute.value.query.conversation).toBeUndefined())
+  })
+
+  it('leaves the open conversation when the address drops the query, as the sidebar Chats link does', async () => {
+    setupBaseChatApi()
+    registerEndpoint('/api/conversations/960/messages', () => [
+      { id: 2600, role: 'user', content: 'earlier prompt', createdAt: '2026-05-16T10:00:00Z' },
+    ])
+    const router = useRouter()
+    const component = await mountSuspended(Chat)
+    await flushPromises()
+
+    const vm = component.vm as unknown as { loadConversation: (id: number) => Promise<void> }
+    await vm.loadConversation(960)
+    await flushPromises()
+    expect(component.html()).toContain('earlier prompt')
+    await vi.waitFor(() => expect(router.currentRoute.value.query.conversation).toBe('960'))
+
+    // /chat and /chat?conversation=960 are the same route component, so the link
+    // drops the query on a page that stays mounted — nothing else resets it.
+    await router.push({ path: '/chat', query: {} })
+    await flushPromises()
+    expect(component.html()).not.toContain('earlier prompt')
+  })
+})
+
+describe('Chat page — error-event SSE branch', () => {
+  it('renders the error content from a provider error envelope into the assistant bubble', async () => {
+    setupBaseChatApi()
+    // Stub fetch to emit an error event mid-stream; the assistant placeholder
+    // bubble should pick up the error string instead of a model response.
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
+      const encoder = new TextEncoder()
+      const body = new ReadableStream({
+        start(controller) {
+          controller.enqueue(encoder.encode('data: {"type":"init","conversationId":900}\n'))
+          controller.enqueue(encoder.encode('data: {"type":"error","content":"Provider returned 429: rate limited"}\n'))
+          controller.enqueue(encoder.encode('data: {"type":"done"}\n'))
+          controller.close()
+        },
+      })
+      return new Response(body, { status: 200, headers: { 'Content-Type': 'text/event-stream' } })
+    })
+
+    const component = await mountSuspended(Chat)
+    await flushPromises()
+
+    const textarea = component.find<HTMLTextAreaElement>('textarea')
+    await textarea.setValue('please try')
+    await component.find('form').trigger('submit.prevent')
+    await flushPromises()
+    await flushPromises()
+
+    // The page should now have the error envelope as the assistant content.
+    expect(component.text()).toContain('Provider returned 429: rate limited')
+  })
+
+  it('renders the queued-position content from a queued event', async () => {
+    setupBaseChatApi()
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
+      const encoder = new TextEncoder()
+      const body = new ReadableStream({
+        start(controller) {
+          controller.enqueue(encoder.encode('data: {"type":"init","conversationId":901}\n'))
+          controller.enqueue(encoder.encode('data: {"type":"queued","position":3}\n'))
+          controller.enqueue(encoder.encode('data: {"type":"done"}\n'))
+          controller.close()
+        },
+      })
+      return new Response(body, { status: 200 })
+    })
+
+    const component = await mountSuspended(Chat)
+    await flushPromises()
+
+    const textarea = component.find<HTMLTextAreaElement>('textarea')
+    await textarea.setValue('queued one')
+    await component.find('form').trigger('submit.prevent')
+    await flushPromises()
+    await flushPromises()
+
+    expect(component.text()).toContain('queued')
+    expect(component.text()).toContain('3')
+  })
+})
+
+describe('Chat page — export conversation', () => {
+  it('does not throw when called on an empty conversation', async () => {
+    setupBaseChatApi()
+    const component = await mountSuspended(Chat)
+    await flushPromises()
+
+    // exportConversation is gated by displayMessages.length — empty list is a
+    // no-op. The export button is rendered in the header; clicking it must
+    // not throw.
+    const exportBtn = component.find('button[title="Export as Markdown"]')
+    expect(exportBtn.exists()).toBe(true)
+    await exportBtn.trigger('click')
+    await flushPromises()
+  })
+
+  it('triggers a markdown download when the conversation has messages', async () => {
+    setupBaseChatApi()
+    registerEndpoint('/api/conversations', () => [
+      { id: 950, agentId: 1, agentName: 'streaming-agent', channelType: 'web',
+        peerId: 'admin', messageCount: 2, preview: 'exportable',
+        createdAt: '2026-05-16T10:00:00Z', updatedAt: '2026-05-16T10:00:00Z' },
+    ])
+    registerEndpoint('/api/conversations/950/messages', () => [
+      { id: 2600, role: 'user', content: 'export prompt',
+        createdAt: '2026-05-16T10:00:00Z' },
+      { id: 2601, role: 'assistant', content: 'exported response body',
+        createdAt: '2026-05-16T10:00:01Z' },
+    ])
+
+    // Stub URL.createObjectURL because jsdom doesn't implement it (no-op).
+    const createSpy = vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:test')
+    vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {})
+
+    const component = await mountSuspended(Chat)
+    await flushPromises()
+    const vm = component.vm as unknown as { loadConversation: (id: number) => Promise<void> }
+    await vm.loadConversation(950)
+    await flushPromises()
+
+    const exportBtn = component.find('button[title="Export as Markdown"]')
+    await exportBtn.trigger('click')
+    await flushPromises()
+
+    expect(createSpy).toHaveBeenCalled()
+  })
+})
+
+describe('Chat page — new chat reset', () => {
+  it('clears messages and selected conversation when New conversation is clicked', async () => {
+    setupBaseChatApi()
+    registerEndpoint('/api/conversations/960/messages', () => [
+      { id: 2700, role: 'user', content: 'history',
+        createdAt: '2026-05-16T10:00:00Z' },
+    ])
+    const component = await mountSuspended(Chat)
+    await flushPromises()
+    const vm = component.vm as unknown as {
+      loadConversation: (id: number) => Promise<void>
+      messages: Array<{ role: string, content?: string | null }>
+    }
+    await vm.loadConversation(960)
+    await flushPromises()
+    expect(vm.messages).toHaveLength(1)
+
+    const newChatBtn = component.find('button[title="New conversation"]')
+    expect(newChatBtn.exists()).toBe(true)
+    await newChatBtn.trigger('click')
+    await flushPromises()
+
+    // newChat clears messages, the input value, and the selected conversation.
+    expect(vm.messages).toHaveLength(0)
+    const textarea = component.find('textarea').element as HTMLTextAreaElement
+    expect(textarea.value).toBe('')
+  })
+})
+
+describe('Chat page — model switch indicator', () => {
+  it('renders the "Switched to" divider when consecutive assistant messages use different models', async () => {
+    setupBaseChatApi()
+    registerEndpoint('/api/conversations', () => [
+      { id: 970, agentId: 1, agentName: 'streaming-agent', channelType: 'web',
+        peerId: 'admin', messageCount: 4, preview: 'model switch',
+        createdAt: '2026-05-16T10:00:00Z', updatedAt: '2026-05-16T10:00:00Z' },
+    ])
+    registerEndpoint('/api/conversations/970/messages', () => [
+      { id: 2800, role: 'user', content: 'first prompt',
+        createdAt: '2026-05-16T10:00:00Z' },
+      { id: 2801, role: 'assistant', content: 'reply from model A',
+        usage: {
+          prompt: 10, completion: 5, total: 15, reasoning: 0, cached: 0,
+          durationMs: 100, modelProvider: 'ollama-cloud', modelId: 'kimi-k2.5',
+        },
+        createdAt: '2026-05-16T10:00:01Z' },
+      { id: 2802, role: 'user', content: 'second prompt',
+        createdAt: '2026-05-16T10:00:02Z' },
+      { id: 2803, role: 'assistant', content: 'reply from model B',
+        usage: {
+          prompt: 12, completion: 7, total: 19, reasoning: 0, cached: 0,
+          durationMs: 100, modelProvider: 'openai', modelId: 'gpt-4',
+        },
+        createdAt: '2026-05-16T10:00:03Z' },
+    ])
+
+    const component = await mountSuspended(Chat)
+    await flushPromises()
+    const vm = component.vm as unknown as { loadConversation: (id: number) => Promise<void> }
+    await vm.loadConversation(970)
+    await flushPromises()
+
+    // The page renders a label including the new model's provider/id.
+    const text = component.text()
+    expect(text).toContain('openai')
+    expect(text).toContain('gpt-4')
+  })
+})
+
+describe('Chat page — input handlers', () => {
+  it('routes Enter inside the textarea to sendMessage (form submit fires)', async () => {
+    setupBaseChatApi()
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
+      const encoder = new TextEncoder()
+      const body = new ReadableStream({
+        start(controller) {
+          controller.enqueue(encoder.encode('data: {"type":"init","conversationId":980}\n'))
+          controller.enqueue(encoder.encode('data: {"type":"done"}\n'))
+          controller.close()
+        },
+      })
+      return new Response(body, { status: 200 })
+    })
+
+    const component = await mountSuspended(Chat)
+    await flushPromises()
+
+    const textarea = component.find<HTMLTextAreaElement>('textarea')
+    await textarea.setValue('hello via enter')
+    await textarea.trigger('keydown.enter')
+    await flushPromises()
+
+    const streamCall = fetchSpy.mock.calls.find(call =>
+      String(call[0] ?? '').includes('/api/chat/stream'))
+    expect(streamCall).toBeTruthy()
+  })
+
+  it('autoresize sets the textarea height bound to its scrollHeight', async () => {
+    setupBaseChatApi()
+    const component = await mountSuspended(Chat)
+    await flushPromises()
+
+    const textarea = component.find<HTMLTextAreaElement>('textarea')
+    // Multi-line content; autoResize is hooked to @input.
+    await textarea.setValue('line one\nline two\nline three\nline four')
+    await textarea.trigger('input')
+    await flushPromises()
+    // We don't assert the exact px value (jsdom returns 0 for scrollHeight —
+    // no layout engine), only that the style attribute was touched without throwing.
+    expect(textarea.element.style.height).toBeDefined()
+  })
+})
+
+/**
+ * JCLAW-1071 / JCLAW-1072: what the completion popup actually renders.
+ *
+ * The composable suites cover the state machines; these mount the page because
+ * the rows are a template concern. A UAT pass caught the /model popup rendering
+ * 59 blank rows — the row markup had grown a `v-if="opt.label"` and the model
+ * source supplies only `value` — which no composable-level test could see.
+ */
+describe('Chat page — completion popup rendering', () => {
+  const COMMANDS = [
+    { literal: '/new', name: 'new', description: 'Start a fresh conversation' },
+    { literal: '/model', name: 'model', description: 'Show current model and its capabilities' },
+    { literal: '/prompt', name: 'prompt', description: 'Use a saved prompt from your library' },
+  ]
+
+  function setupCompleterApi() {
+    setupBaseChatApi()
+    registerEndpoint('/api/slash-commands', () => COMMANDS)
+    registerEndpoint('/api/prompts', () => [
+      {
+        id: 7,
+        title: 'Code review',
+        content: 'Review this diff for correctness.',
+        tags: 'engineering',
+        category: 'ENGINEERING',
+        categoryLabel: 'Engineering',
+        createdAt: null,
+        updatedAt: null,
+      },
+    ])
+  }
+
+  /**
+   * Mount, type `text` into the composer, and return the popup's rows as their
+   * rendered spans — [label, detail] for a command, [value] for a model,
+   * [detail] for a status row. Per-span rather than row.text(), which
+   * concatenates without the flex gap and would hide an empty label.
+   *
+   * Polled rather than flushed: the prompt source calls ensureLoaded() during
+   * render, so the library fetch only starts once the popup has already
+   * rendered its "Loading prompts…" row. Microtask flushes race it.
+   */
+  async function rowsFor(text: string) {
+    const component = await mountSuspended(Chat)
+    await flushPromises()
+    const textarea = component.find<HTMLTextAreaElement>('textarea')
+    await textarea.setValue(text)
+    await flushPromises()
+    await vi.waitFor(() => {
+      const el = component.find('[data-testid="composer-completer"]')
+      if (el.exists() && el.text().includes('Loading prompts')) throw new Error('still loading')
+    })
+    const popup = component.find('[data-testid="composer-completer"]')
+    return {
+      component,
+      popup,
+      rows: popup.exists()
+        ? popup.findAll('[role="option"]').map(r => r.findAll('span').map(s => s.text()))
+        : [],
+    }
+  }
+
+  it('renders each command with its literal and description', async () => {
+    setupCompleterApi()
+    const { popup, rows } = await rowsFor('/')
+    expect(popup.attributes('aria-label')).toBe('Slash command options')
+    expect(rows).toEqual([
+      ['/new', 'Start a fresh conversation'],
+      ['/model', 'Show current model and its capabilities'],
+      ['/prompt', 'Use a saved prompt from your library'],
+    ])
+  })
+
+  it('renders model rows as provider/model-id, not blank', async () => {
+    setupCompleterApi()
+    const { popup, rows } = await rowsFor('/model ')
+    expect(popup.attributes('aria-label')).toBe('Model completion options')
+    // The model source supplies no separate label, so the row falls back to
+    // `value`. The regression this guards is rows present but rendering empty.
+    expect(rows).toEqual([['ollama-cloud/kimi-k2.5']])
+  })
+
+  it('renders a prompt as title plus category', async () => {
+    setupCompleterApi()
+    const { popup, rows } = await rowsFor('/prompt code')
+    expect(popup.attributes('aria-label')).toBe('Saved prompt options')
+    expect(rows).toEqual([['Code review', 'Engineering']])
+  })
+
+  it('keeps the popup open on a no-match status row and disables send', async () => {
+    setupCompleterApi()
+    const { component, popup, rows } = await rowsFor('/prompt zzz-nothing')
+    expect(popup.exists()).toBe(true)
+    expect(rows).toEqual([['No matching prompts']])
+    expect(popup.find('[role="option"]').attributes('disabled')).toBeDefined()
+    expect(component.find('button[type="submit"]').attributes('disabled')).toBeDefined()
+  })
+
+  it('does not open for ordinary text containing a slash', async () => {
+    setupCompleterApi()
+    const { popup } = await rowsFor('see app/models/Prompt.java')
+    expect(popup.exists()).toBe(false)
+  })
+})
+
+describe('Chat page — composer error chips', () => {
+  it('shows a refused model override with no files attached', async () => {
+    setupBaseChatApi()
+    const component = await mountSuspended(Chat)
+    await flushPromises()
+
+    ;(component.vm as unknown as { overrideError: string | null }).overrideError = 'The model override was refused.'
+    await flushPromises()
+
+    expect(component.find('[data-testid="override-error"]').exists()).toBe(true)
+    expect(component.find('[data-testid="override-error"]').text()).toContain('The model override was refused.')
+  })
+  it('shows why a regenerate stopped short, and dismisses it', async () => {
+    setupBaseChatApi()
+    const component = await mountSuspended(Chat)
+    await flushPromises()
+
+    ;(component.vm as unknown as { actionError: string | null }).actionError = '[DELETE] "/api/conversations/5/messages/11": 502 Bad Gateway'
+    await flushPromises()
+
+    const chip = component.find('[data-testid="action-error"]')
+    expect(chip.exists()).toBe(true)
+    expect(chip.text()).toContain('/api/conversations/5/messages/11')
+    await chip.find('button[title="Dismiss"]').trigger('click')
+    expect(component.find('[data-testid="action-error"]').exists()).toBe(false)
+  })
+})

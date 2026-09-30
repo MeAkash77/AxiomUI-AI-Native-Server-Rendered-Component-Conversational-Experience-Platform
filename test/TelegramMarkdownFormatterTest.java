@@ -1,0 +1,642 @@
+import channels.TelegramMarkdownFormatter;
+import channels.TelegramMarkdownFormatter.TableMode;
+import org.junit.jupiter.api.Test;
+import play.test.UnitTest;
+
+/**
+ * Coverage for the JCLAW-91 markdown → Telegram-safe HTML converter. Tests are
+ * organized by construct (bold, italic, link, table, etc.) plus a chunker
+ * section at the end. Each test asserts on an exact-or-contains substring so
+ * the test stays robust against flexmark's internal whitespace choices.
+ */
+class TelegramMarkdownFormatterTest extends UnitTest {
+
+    // ── Inline formatting ──
+
+    @Test
+    void boldGeneratesBTags() {
+        var html = TelegramMarkdownFormatter.toHtml("This is **bold** text.");
+        assertTrue(html.contains("<b>bold</b>"),
+                () -> "expected bold HTML, got: " + html);
+    }
+
+    @Test
+    void italicGeneratesITags() {
+        var starForm = TelegramMarkdownFormatter.toHtml("An *italic* word.");
+        assertTrue(starForm.contains("<i>italic</i>"),
+                () -> "expected italic HTML from *x* syntax, got: " + starForm);
+
+        var underscoreForm = TelegramMarkdownFormatter.toHtml("An _italic_ word.");
+        assertTrue(underscoreForm.contains("<i>italic</i>"),
+                () -> "expected italic HTML from _x_ syntax, got: " + underscoreForm);
+    }
+
+    @Test
+    void strikethroughGeneratesSTags() {
+        var html = TelegramMarkdownFormatter.toHtml("This is ~~removed~~ now.");
+        assertTrue(html.contains("<s>removed</s>"),
+                () -> "expected strikethrough HTML, got: " + html);
+    }
+
+    @Test
+    void inlineCodeGeneratesCodeTags() {
+        var html = TelegramMarkdownFormatter.toHtml("Call `foo.bar()` on it.");
+        assertTrue(html.contains("<code>foo.bar()</code>"),
+                () -> "expected inline code HTML, got: " + html);
+    }
+
+    @Test
+    void inlineCodeEscapesHtmlSpecials() {
+        var html = TelegramMarkdownFormatter.toHtml("Run `<script>alert(1)</script>` never.");
+        assertTrue(html.contains("<code>&lt;script&gt;alert(1)&lt;/script&gt;</code>"),
+                () -> "inline code must escape &, <, >: " + html);
+    }
+
+    // ── Block formatting ──
+
+    @Test
+    void headingsFlattenToBold() {
+        var html = TelegramMarkdownFormatter.toHtml("# H1\n\n## H2\n\n### H3");
+        assertTrue(html.contains("<b>H1</b>"),
+                () -> "h1 → <b>: " + html);
+        assertTrue(html.contains("<b>H2</b>"),
+                () -> "h2 → <b>: " + html);
+        assertTrue(html.contains("<b>H3</b>"),
+                () -> "h3 → <b>: " + html);
+        // No actual <h1>/<h2>/<h3> tags — Telegram would reject them.
+        assertFalse(html.contains("<h1"), "headings must not pass through as <h*> tags");
+    }
+
+    @Test
+    void fencedCodeBlockGeneratesPreCode() {
+        var md = """
+                ```
+                hello world
+                ```
+                """;
+        var html = TelegramMarkdownFormatter.toHtml(md);
+        assertTrue(html.contains("<pre><code>"),
+                () -> "fenced code opens <pre><code>: " + html);
+        assertTrue(html.contains("hello world"),
+                () -> "fenced code preserves content: " + html);
+        assertTrue(html.contains("</code></pre>"),
+                () -> "fenced code closes </code></pre>: " + html);
+    }
+
+    @Test
+    void fencedCodeBlockPreservesLanguageHint() {
+        var md = """
+                ```python
+                print(1)
+                ```
+                """;
+        var html = TelegramMarkdownFormatter.toHtml(md);
+        assertTrue(html.contains("class=\"language-python\""),
+                () -> "language hint becomes class attr: " + html);
+    }
+
+    @Test
+    void fencedCodeBlockEscapesHtmlSpecials() {
+        var md = """
+                ```
+                a < b && c > d
+                ```
+                """;
+        var html = TelegramMarkdownFormatter.toHtml(md);
+        assertTrue(html.contains("a &lt; b &amp;&amp; c &gt; d"),
+                () -> "code content must be HTML-escaped: " + html);
+    }
+
+    @Test
+    void blockQuoteGeneratesBlockquoteTag() {
+        var html = TelegramMarkdownFormatter.toHtml("> A famous saying.");
+        assertTrue(html.contains("<blockquote>") && html.contains("</blockquote>"),
+                () -> "blockquote renders wrapped: " + html);
+        assertTrue(html.contains("A famous saying."),
+                () -> "blockquote content preserved: " + html);
+    }
+
+    @Test
+    void thematicBreakRendersAsEmDash() {
+        var html = TelegramMarkdownFormatter.toHtml("Before\n\n---\n\nAfter");
+        // Telegram has no <hr>; we emit an em-dash visual separator.
+        assertTrue(html.contains("—"),
+                () -> "thematic break becomes em-dash: " + html);
+        assertFalse(html.contains("<hr"),
+                () -> "no <hr> tag (Telegram rejects it): " + html);
+    }
+
+    // ── Lists ──
+
+    @Test
+    void unorderedListRendersWithBullets() {
+        var md = """
+                - alpha
+                - beta
+                - gamma
+                """;
+        var html = TelegramMarkdownFormatter.toHtml(md);
+        assertTrue(html.contains("• alpha"),
+                () -> "bullet prefix expected: " + html);
+        assertTrue(html.contains("• beta"),
+                () -> "bullet prefix expected: " + html);
+        assertTrue(html.contains("• gamma"),
+                () -> "bullet prefix expected: " + html);
+        assertFalse(html.contains("<ul"),
+                () -> "no <ul> tag (Telegram rejects it): " + html);
+    }
+
+    @Test
+    void orderedListRendersWithNumberedPrefix() {
+        var md = """
+                1. first
+                2. second
+                3. third
+                """;
+        var html = TelegramMarkdownFormatter.toHtml(md);
+        assertTrue(html.contains("1. first"),
+                () -> "numeric prefix expected: " + html);
+        assertTrue(html.contains("2. second"),
+                () -> "numeric prefix expected: " + html);
+        assertTrue(html.contains("3. third"),
+                () -> "numeric prefix expected: " + html);
+        assertFalse(html.contains("<ol"),
+                () -> "no <ol> tag: " + html);
+    }
+
+    // ── Links ──
+
+    @Test
+    void linkGeneratesATagWithHref() {
+        var html = TelegramMarkdownFormatter.toHtml("See [docs](https://example.com/docs).");
+        assertTrue(html.contains("<a href=\"https://example.com/docs\">docs</a>"),
+                () -> "link renders with href + text: " + html);
+    }
+
+    @Test
+    void linkEscapesAttributeQuotesAndAmpersands() {
+        var html = TelegramMarkdownFormatter.toHtml("[q](https://example.com/search?a=1&b=\"2\")");
+        // The href value must not contain raw " or unescaped & — both would break
+        // the attribute or the parseMode check.
+        assertTrue(html.contains("&amp;"),
+                () -> "ampersand must be entity-escaped inside href: " + html);
+        assertTrue(html.contains("&quot;"),
+                () -> "double-quote must be entity-escaped inside href: " + html);
+    }
+
+    // ── Tables ──
+
+    @Test
+    void tableRendersAsBulletsByDefault() {
+        var md = """
+                | Name | Status |
+                | --- | --- |
+                | foo | active |
+                | bar | disabled |
+                """;
+        var html = TelegramMarkdownFormatter.toHtml(md);
+        assertTrue(html.contains("• <b>Name</b>: foo — <b>Status</b>: active"),
+                () -> "bullets mode labels each cell by its header: " + html);
+        assertTrue(html.contains("• <b>Name</b>: bar — <b>Status</b>: disabled"),
+                () -> "bullets mode renders every body row: " + html);
+        assertFalse(html.contains("<table"),
+                () -> "no <table> tag (Telegram rejects it): " + html);
+    }
+
+    @Test
+    void wideTableEmitsHeaderOnceInsteadOfPerRow() {
+        // GH #10: a long table headed "Response | Tool" rendered those two words once
+        // per row — 200 rows put each of them on screen 200 times and grew the reply
+        // 2.6x, splitting one Telegram message into three.
+        var md = new StringBuilder("| Response | Tool |\n| --- | --- |\n");
+        for (int i = 0; i < 200; i++) {
+            md.append("| ok").append(i).append(" | shell |\n");
+        }
+        var html = TelegramMarkdownFormatter.toHtml(md.toString());
+
+        assertEquals(1, countOccurrences(html, "Response"),
+                () -> "header emitted once, not per row: " + html.substring(0, 200));
+        assertEquals(1, countOccurrences(html, "Tool"),
+                () -> "header emitted once, not per row: " + html.substring(0, 200));
+        assertTrue(html.contains("<b>Response \u2014 Tool</b>"),
+                () -> "header rides one lead-in line: " + html.substring(0, 200));
+        assertTrue(html.contains("\u2022 ok0 \u2014 shell"),
+                () -> "rows keep their cells, unlabeled: " + html.substring(0, 200));
+        assertTrue(html.contains("\u2022 ok199 \u2014 shell"),
+                () -> "every row still rendered: " + html);
+        assertTrue(html.length() < md.length() * 1.2,
+                () -> "render must not balloon the reply: md=" + md.length() + " html=" + html.length());
+    }
+
+    @Test
+    void tableCodeModeWrapsInPreCode() {
+        var md = """
+                | A | B |
+                | --- | --- |
+                | 1 | 2 |
+                """;
+        var html = TelegramMarkdownFormatter.toHtml(md, TableMode.CODE);
+        assertTrue(html.contains("<pre><code>"),
+                () -> "CODE mode wraps in <pre><code>: " + html);
+        assertTrue(html.contains("| A | B |") || html.contains("A"),
+                () -> "CODE mode preserves table text: " + html);
+    }
+
+    @Test
+    void tableOffModeDropsTable() {
+        var md = """
+                before
+
+                | A | B |
+                | --- | --- |
+                | 1 | 2 |
+
+                after
+                """;
+        var html = TelegramMarkdownFormatter.toHtml(md, TableMode.OFF);
+        assertTrue(html.contains("before"), () -> "surrounding text preserved: " + html);
+        assertTrue(html.contains("after"), () -> "surrounding text preserved: " + html);
+        assertFalse(html.contains("| A |"),
+                () -> "OFF mode drops table content: " + html);
+    }
+
+    // ── Safety: raw HTML in input ──
+
+    @Test
+    void rawHtmlInInputIsEscaped() {
+        var html = TelegramMarkdownFormatter.toHtml("Plain <script>alert(1)</script> text.");
+        assertFalse(html.contains("<script>"),
+                () -> "raw <script> must never pass through: " + html);
+        assertTrue(html.contains("&lt;script&gt;"),
+                () -> "raw HTML must be entity-escaped: " + html);
+    }
+
+    @Test
+    void rawTelegramSafeHtmlPassesThrough() {
+        // LLMs sometimes emit literal <b>...</b> in place of **bold**. Telegram's
+        // HTML parse mode supports a small no-attribute tag subset; pass those
+        // through verbatim so the user actually sees bold rather than the
+        // literal "<b>...</b>" characters.
+        var html = TelegramMarkdownFormatter.toHtml("<b>Lazada</b> is <i>strong</i>.");
+        assertTrue(html.contains("<b>Lazada</b>"),
+                () -> "<b> tag should pass through, not be escaped: " + html);
+        assertTrue(html.contains("<i>strong</i>"),
+                () -> "<i> tag should pass through, not be escaped: " + html);
+        assertFalse(html.contains("&lt;b&gt;"),
+                () -> "safe tags must not be escaped: " + html);
+    }
+
+    @Test
+    void rawHtmlWithAttributesIsEscaped() {
+        // Attribute parsing is a foot-gun (event handlers, javascript: URLs,
+        // injection vectors). Even allowlisted tags lose pass-through when
+        // they carry any attribute.
+        var html = TelegramMarkdownFormatter.toHtml("<b onclick=\"evil()\">bad</b>");
+        assertFalse(html.contains("<b onclick"),
+                () -> "tag with attribute must not pass through: " + html);
+        assertTrue(html.contains("&lt;b onclick"),
+                () -> "attributed tag must be escaped: " + html);
+    }
+
+    @Test
+    void plainTextIsPassedThroughEscaped() {
+        var html = TelegramMarkdownFormatter.toHtml("just some text");
+        assertTrue(html.contains("just some text"),
+                () -> "plain text preserved: " + html);
+    }
+
+    @Test
+    void nullAndEmptyInputReturnEmptyString() {
+        assertEquals("", TelegramMarkdownFormatter.toHtml(null));
+        assertEquals("", TelegramMarkdownFormatter.toHtml(""));
+    }
+
+    // ── Chunker ──
+
+    @Test
+    void chunkHtmlReturnsSingleChunkWhenUnderLimit() {
+        var chunks = TelegramMarkdownFormatter.chunkHtml("<b>short</b>", 4000);
+        assertEquals(1, chunks.size());
+        assertEquals("<b>short</b>", chunks.get(0));
+    }
+
+    @Test
+    void chunkHtmlSplitsAtBlockBoundaries() {
+        // Three ~100-char blocks separated by \n\n; maxLen of 150 forces splits.
+        var blockA = "<b>" + "A".repeat(90) + "</b>";
+        var blockB = "<b>" + "B".repeat(90) + "</b>";
+        var blockC = "<b>" + "C".repeat(90) + "</b>";
+        var html = blockA + "\n\n" + blockB + "\n\n" + blockC;
+        var chunks = TelegramMarkdownFormatter.chunkHtml(html, 150);
+        assertTrue(chunks.size() >= 2,
+                () -> "expected multi-chunk split, got " + chunks.size());
+        for (String c : chunks) {
+            assertTrue(c.length() <= 150,
+                    () -> "chunk exceeds maxLen: " + c.length());
+        }
+        // No chunk should have a dangling unclosed <b> (block boundaries split
+        // at \n\n, and each block is individually balanced).
+        for (String c : chunks) {
+            int opens = countOccurrences(c, "<b>");
+            int closes = countOccurrences(c, "</b>");
+            assertEquals(opens, closes,
+                    () -> "tag imbalance in chunk: " + c);
+        }
+    }
+
+    @Test
+    void chunkHtmlRewrapsOversizedCodeFence() {
+        // Build an HTML payload with a single oversized <pre><code> block.
+        var inner = ("line " + "x".repeat(50) + "\n").repeat(40); // ~2000 chars inner
+        var html = "<pre><code>" + inner + "</code></pre>";
+        var maxLen = 500;
+        var chunks = TelegramMarkdownFormatter.chunkHtml(html, maxLen);
+
+        assertTrue(chunks.size() >= 2,
+                () -> "oversized code should split, got " + chunks.size());
+        for (String c : chunks) {
+            assertTrue(c.length() <= maxLen,
+                    () -> "chunk exceeds maxLen: " + c.length());
+            // Every chunk must be individually well-formed: starts with <pre><code>,
+            // ends with </code></pre>.
+            assertTrue(c.startsWith("<pre><code>"),
+                    () -> "chunk must open with <pre><code>: " + c.substring(0, Math.min(30, c.length())));
+            assertTrue(c.endsWith("</code></pre>"),
+                    () -> "chunk must close with </code></pre>: " + c.substring(Math.max(0, c.length() - 30)));
+        }
+    }
+
+    @Test
+    void chunkHtmlHandlesLanguageHintedCodeFence() {
+        var inner = ("a".repeat(200) + "\n").repeat(10);
+        var html = "<pre><code class=\"language-python\">" + inner + "</code></pre>";
+        var chunks = TelegramMarkdownFormatter.chunkHtml(html, 600);
+        assertTrue(chunks.size() >= 2, "should split");
+        for (String c : chunks) {
+            assertTrue(c.startsWith("<pre><code class=\"language-python\">"),
+                    () -> "open tag with language hint preserved on every chunk: "
+                            + c.substring(0, Math.min(60, c.length())));
+            assertTrue(c.endsWith("</code></pre>"),
+                    () -> "close tag present: " + c.substring(Math.max(0, c.length() - 30)));
+        }
+    }
+
+    @Test
+    void chunkHtmlKeepsFenceWithInternalBlankLineIntact() {
+        // D1 regression: a <pre><code> fence whose source has an internal blank
+        // line carries a literal \n\n that flexmark preserves. The rendered HTML
+        // exceeds the chunk limit, so without fence-awareness the naive
+        // split("\n\n") would cut the fence in half and emit chunks with
+        // unbalanced <pre>/<code> tags. Build such a payload directly.
+        var maxLen = 4000;
+        // Prose before, then a fence containing an internal blank line, then prose
+        // after. Pad both prose blocks so the whole payload comfortably exceeds the
+        // chunk limit and a real split is forced.
+        var before = "<b>" + "b".repeat(2500) + "</b>";
+        var after = "<b>" + "a".repeat(2500) + "</b>";
+        var fence = "<pre><code>top line\n\nbottom line</code></pre>";
+        var html = before + "\n\n" + fence + "\n\n" + after;
+        assertTrue(html.length() > 4000, "payload must exceed the chunk limit");
+
+        var chunks = TelegramMarkdownFormatter.chunkHtml(html, maxLen);
+        assertTrue(chunks.size() >= 2,
+                () -> "oversized payload should split, got " + chunks.size());
+
+        for (String c : chunks) {
+            // (b) every chunk within the size limit
+            assertTrue(c.length() <= maxLen,
+                    () -> "chunk exceeds maxLen: " + c.length());
+            // (a) no chunk has an unbalanced <pre> or <code> tag
+            assertEquals(countOccurrences(c, "<pre>"), countOccurrences(c, "</pre>"),
+                    () -> "unbalanced <pre> in chunk: " + c);
+            assertEquals(countOccurrences(c, "<code>"), countOccurrences(c, "</code>"),
+                    () -> "unbalanced <code> in chunk: " + c);
+        }
+
+        // (c) the fence is not split at the internal blank line: exactly one chunk
+        // carries the whole fence, with both halves still together.
+        long fenceChunks = chunks.stream()
+                .filter(c -> c.contains("top line") || c.contains("bottom line"))
+                .count();
+        assertEquals(1L, fenceChunks,
+                () -> "fence content must stay in a single chunk: " + chunks);
+        var fenceChunk = chunks.stream()
+                .filter(c -> c.contains("top line"))
+                .findFirst()
+                .orElseThrow();
+        assertTrue(fenceChunk.contains("top line\n\nbottom line"),
+                () -> "internal blank line must stay inside the fence: " + fenceChunk);
+    }
+
+    @Test
+    void chunkHtmlEmptyInputReturnsEmptyList() {
+        assertTrue(TelegramMarkdownFormatter.chunkHtml(null, 100).isEmpty());
+        assertTrue(TelegramMarkdownFormatter.chunkHtml("", 100).isEmpty());
+    }
+
+    @Test
+    void chunkHtmlHardCutNeverSplitsEntitiesOrTags() {
+        // A2 regression: a single line longer than maxLen takes the hard-cut path.
+        // The naive fixed-stride substring slice could land mid-entity (&amp; →
+        // "&am" + "p;") or mid-tag (<b> → "<b" + ">"). Build a >4000-char line that
+        // is dense with entities and short tags so a naive length-cut at 4000 would
+        // almost certainly slice one, then assert no chunk does.
+        var maxLen = 4000;
+        // Each unit is a small mix of an entity, a tag pair, and another entity.
+        // ~30 chars/unit → ~150 units to clear 4000 with no \n\n or \n boundaries.
+        var unit = "x &amp; <b>y</b> z &lt; ";
+        var line = unit.repeat(200); // single physical line, no newlines at all
+        assertTrue(line.length() > maxLen, "fixture line must exceed the chunk limit");
+        assertFalse(line.contains("\n"), "fixture must be a single line to hit the hard-cut path");
+
+        var chunks = TelegramMarkdownFormatter.chunkHtml(line, maxLen);
+        assertTrue(chunks.size() >= 2,
+                () -> "oversized single line should split, got " + chunks.size());
+
+        for (String c : chunks) {
+            // (b) every chunk within the size limit
+            assertTrue(c.length() <= maxLen,
+                    () -> "chunk exceeds maxLen: " + c.length());
+            // (a) no chunk splits an entity: a chunk must not end with a dangling
+            // "&…" that lacks its ';', and must not start with an orphan entity tail.
+            assertFalse(danglingEntityAtEnd(c),
+                    () -> "chunk ends mid-entity (unterminated &): "
+                            + c.substring(Math.max(0, c.length() - 12)));
+            assertFalse(orphanEntityTailAtStart(c),
+                    () -> "chunk starts with an orphan entity tail: "
+                            + c.substring(0, Math.min(12, c.length())));
+            // (a) no chunk splits a tag: balanced '<' and '>' and no open-tag
+            // straddling the chunk boundary in either direction.
+            assertEquals(countOccurrences(c, "<"), countOccurrences(c, ">"),
+                    () -> "chunk splits a tag (unbalanced < / >): " + tailHead(c));
+            assertFalse(c.endsWith("<") || hasUnterminatedTagAtEnd(c),
+                    () -> "chunk ends mid-tag: " + c.substring(Math.max(0, c.length() - 12)));
+        }
+
+        // (c) reassembly is lossless — concatenation reproduces the original line.
+        var reassembled = String.join("", chunks);
+        assertEquals(line, reassembled,
+                () -> "reassembled chunks must equal the original line");
+    }
+
+    @Test
+    void chunkHtmlHardCutMakesProgressWhenTagExceedsLimit() {
+        // Pathological guard: a single tag longer than maxLen can't be kept atomic.
+        // The splitter must still make progress (terminate, no infinite loop) rather
+        // than refusing to cut. A long <a href="…"> open tag is the realistic shape.
+        var maxLen = 50;
+        var href = "https://example.com/" + "p".repeat(200);
+        var line = "<a href=\"" + href + "\">link text here</a> trailing prose";
+        assertTrue(line.indexOf('>') > maxLen,
+                "the leading tag itself must exceed maxLen for this guard to bite");
+
+        var chunks = TelegramMarkdownFormatter.chunkHtml(line, maxLen);
+        assertTrue(chunks.size() >= 2, () -> "should split, got " + chunks.size());
+        for (String c : chunks) {
+            assertTrue(c.length() <= maxLen,
+                    () -> "chunk exceeds maxLen even in the pathological case: " + c.length());
+        }
+        // Reassembly still lossless despite the unavoidable mid-tag cut.
+        assertEquals(line, String.join("", chunks),
+                () -> "reassembly must stay lossless in the pathological case");
+    }
+
+    // ── JCLAW-92: autolink, typographic, tasklist extensions ──
+
+    @Test
+    void autolinkPromotesBareUrlToAnchor() {
+        var html = TelegramMarkdownFormatter.toHtml("Visit https://example.com now.");
+        assertTrue(html.contains("<a href=\"https://example.com\">https://example.com</a>"),
+                () -> "bare URL should be promoted to an anchor: " + html);
+    }
+
+    @Test
+    void autolinkLeavesFormattedLinksAlone() {
+        // Explicit [text](url) links must still render with the author's text,
+        // not get clobbered by the autolink extension.
+        var html = TelegramMarkdownFormatter.toHtml("See [the docs](https://example.com).");
+        assertTrue(html.contains("<a href=\"https://example.com\">the docs</a>"),
+                () -> "explicit link text preserved: " + html);
+    }
+
+    @Test
+    void typographicReplacesEmAndEnDashes() {
+        // Two hyphens → en dash; three → em dash.
+        var enDash = TelegramMarkdownFormatter.toHtml("range 1--10");
+        assertTrue(enDash.contains("\u20131"),
+                () -> "-- should become en dash (U+2013): " + enDash);
+
+        var emDash = TelegramMarkdownFormatter.toHtml("wait --- yes");
+        assertTrue(emDash.contains("\u2014"),
+                () -> "--- should become em dash (U+2014): " + emDash);
+    }
+
+    @Test
+    void typographicReplacesEllipsis() {
+        var html = TelegramMarkdownFormatter.toHtml("and so on...");
+        assertTrue(html.contains("\u2026"),
+                () -> "... should become … (U+2026): " + html);
+    }
+
+    @Test
+    void tasklistPendingRendersEmptyBox() {
+        var html = TelegramMarkdownFormatter.toHtml("- [ ] pending item");
+        assertTrue(html.contains("\u2610 pending item"),
+                () -> "empty checkbox (U+2610) expected: " + html);
+        assertFalse(html.contains("[ ]"),
+                () -> "raw brackets must not leak: " + html);
+    }
+
+    @Test
+    void tasklistDoneRendersCheckedBox() {
+        var html = TelegramMarkdownFormatter.toHtml("- [x] done item");
+        assertTrue(html.contains("\u2611 done item"),
+                () -> "checked box (U+2611) expected: " + html);
+        assertFalse(html.contains("[x]"),
+                () -> "raw brackets must not leak: " + html);
+    }
+
+    @Test
+    void tasklistMixedStateRendersPerItem() {
+        var md = """
+                - [x] alpha
+                - [ ] beta
+                - [x] gamma
+                """;
+        var html = TelegramMarkdownFormatter.toHtml(md);
+        assertTrue(html.contains("\u2611 alpha"), () -> "alpha should be checked: " + html);
+        assertTrue(html.contains("\u2610 beta"), () -> "beta should be empty: " + html);
+        assertTrue(html.contains("\u2611 gamma"), () -> "gamma should be checked: " + html);
+    }
+
+    // ── End-to-end: the skills-table screenshot scenario ──
+
+    @Test
+    void endToEndSkillsTableRendersAsBullets() {
+        // The v0.9.24 screenshot: an agent emitted a skills table that rendered
+        // as raw pipes in Telegram. After JCLAW-91 it should come out as bullets.
+        var md = """
+                Here are the skills I have available:
+
+                | Skill | Description |
+                | --- | --- |
+                | codebase-to-course | Transform any codebase into a course. |
+                | daily-briefing | Generate a daily briefing. |
+
+                Would you like to use any of these?
+                """;
+        var html = TelegramMarkdownFormatter.toHtml(md);
+        assertFalse(html.contains("| Skill |"),
+                () -> "raw pipe header must not leak through: " + html);
+        assertTrue(html.contains("• <b>Skill</b>: codebase-to-course — <b>Description</b>: Transform any codebase into a course."),
+                () -> "first row should render as a keyed bullet: " + html);
+        assertTrue(html.contains("Would you like to use any of these?"),
+                () -> "trailing prose preserved: " + html);
+    }
+
+    // ── Helpers ──
+
+    private static int countOccurrences(String haystack, String needle) {
+        int count = 0;
+        int idx = 0;
+        while ((idx = haystack.indexOf(needle, idx)) >= 0) {
+            count++;
+            idx += needle.length();
+        }
+        return count;
+    }
+
+    /** True if the chunk ends with an HTML entity that lost its closing ';'
+     *  (a '&' near the end with no following ';' before the chunk's end). */
+    private static boolean danglingEntityAtEnd(String chunk) {
+        int amp = chunk.lastIndexOf('&');
+        if (amp < 0) return false;
+        int semi = chunk.indexOf(';', amp + 1);
+        return semi < 0; // & with no ';' after it within this chunk
+    }
+
+    /** True if the chunk begins with an orphaned entity tail — i.e. a ';'
+     *  appears before any '&', meaning the entity opener was cut into the
+     *  previous chunk (e.g. previous chunk ended "&am", this one starts "p;"). */
+    private static boolean orphanEntityTailAtStart(String chunk) {
+        int semi = chunk.indexOf(';');
+        if (semi < 0) return false;
+        int amp = chunk.indexOf('&');
+        return amp < 0 || amp > semi;
+    }
+
+    /** True if the chunk ends mid-tag — a trailing '<' opener with no closing
+     *  '>' after it within this chunk. */
+    private static boolean hasUnterminatedTagAtEnd(String chunk) {
+        int lt = chunk.lastIndexOf('<');
+        if (lt < 0) return false;
+        int gt = chunk.indexOf('>', lt + 1);
+        return gt < 0;
+    }
+
+    /** Compact "head…tail" rendering for assertion messages on long chunks. */
+    private static String tailHead(String c) {
+        if (c.length() <= 24) return c;
+        return c.substring(0, 12) + "…" + c.substring(c.length() - 12);
+    }
+}

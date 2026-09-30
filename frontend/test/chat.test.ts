@@ -1,0 +1,112 @@
+import { describe, it, expect } from 'vitest'
+import { mountSuspended, registerEndpoint } from '@nuxt/test-utils/runtime'
+import { flushPromises } from '@vue/test-utils'
+import Chat from '~/pages/chat.vue'
+
+function setupChatApi() {
+  registerEndpoint('/api/agents', () => [
+    { id: 1, name: 'main-agent', modelProvider: 'ollama-cloud', modelId: 'kimi-k2.5', enabled: true, isMain: true, thinkingMode: null, providerConfigured: true },
+    { id: 2, name: 'secondary', modelProvider: 'openai', modelId: 'gpt-4', enabled: true, isMain: false, thinkingMode: null, providerConfigured: true },
+  ])
+  registerEndpoint('/api/config', () => ({
+    entries: [
+      { key: 'provider.ollama-cloud.baseUrl', value: 'https://ollama.com/v1' },
+      { key: 'provider.ollama-cloud.apiKey', value: 'xxxx****' },
+      { key: 'provider.ollama-cloud.models', value: '[{"id":"kimi-k2.5","name":"Kimi K2.5","supportsThinking":false}]' },
+      { key: 'provider.openai.baseUrl', value: 'https://api.openai.com' },
+      { key: 'provider.openai.apiKey', value: 'sk-xxxx****' },
+      { key: 'provider.openai.models', value: '[{"id":"gpt-4","name":"GPT-4","supportsThinking":false}]' },
+    ],
+  }))
+  registerEndpoint('/api/conversations', () => [
+    { id: 10, agentId: 1, agentName: 'main-agent', channelType: 'web', peerId: 'admin', messageCount: 2, preview: 'Hello world', createdAt: '2026-04-07T10:00:00Z', updatedAt: '2026-04-07T10:00:00Z' },
+  ])
+}
+
+describe('Chat page', () => {
+  it('renders with agent selector when multiple agents exist', async () => {
+    setupChatApi()
+    const component = await mountSuspended(Chat)
+
+    // Agent label only renders when agents.length > 1 (the default fixture has
+    // main-agent + secondary). Two selects expected: agent + conversation scroll.
+    const selects = component.findAll('select')
+    expect(selects.length).toBeGreaterThanOrEqual(1)
+    expect(component.text()).toContain('Agent:')
+  })
+
+  it('shows agent options in the selector', async () => {
+    setupChatApi()
+    const component = await mountSuspended(Chat)
+
+    expect(component.text()).toContain('main-agent')
+    expect(component.text()).toContain('secondary')
+  })
+
+  it('renders the model combobox trigger with the selected model', async () => {
+    setupChatApi()
+    const component = await mountSuspended(Chat)
+
+    // The trigger shows the model display name + provider sublabel; no more
+    // "Model:" label row (replaced by the Unsloth-style combobox).
+    expect(component.text()).toContain('Kimi K2.5')
+    expect(component.text()).toContain('ollama-cloud')
+  })
+
+  it('hides the Think pill for non-thinking models', async () => {
+    setupChatApi()
+    const component = await mountSuspended(Chat)
+
+    // Both mock models have supportsThinking:false, so the Think pill in the
+    // composer footer is hidden. The standalone "Thinking:" level dropdown is
+    // gone entirely — level is controlled on the agent detail page now.
+    expect(component.text()).not.toContain('Thinking:')
+  })
+
+  it('no longer renders an in-page conversations sidebar', async () => {
+    // The in-page Conversations list was removed; the dedicated
+    // /conversations page owns the full list now. The chat page takes the
+    // full content width — no 'Conversations' section title and no resize
+    // handle inside the page itself.
+    setupChatApi()
+    const component = await mountSuspended(Chat)
+    await flushPromises()
+
+    const sidebarTitle = component.findAll('span').find(s => s.text().trim() === 'Conversations')
+    expect(sidebarTitle?.exists() ?? false).toBe(false)
+    expect(component.find('.cursor-col-resize').exists()).toBe(false)
+  })
+
+  // Kept LAST intentionally: registerEndpoint() persists across tests within a
+  // file, and this case overrides /api/agents + /api/config + /api/conversations
+  // with a thinking-capable fixture. Putting it at the end prevents leakage
+  // into unrelated tests above that expect the default non-thinking fixture.
+  it('shows the Think pill for thinking-capable models', async () => {
+    // Clear Nuxt's useFetch cache so re-registered endpoints take effect.
+    // In Nuxt 4, useFetch shares data across calls with the same key (URL),
+    // so stale data from prior tests would otherwise persist.
+    clearNuxtData()
+
+    registerEndpoint('/api/agents', () => [
+      { id: 1, name: 'reasoning-agent', modelProvider: 'ollama-cloud', modelId: 'kimi-k2.5', enabled: true, isMain: true, thinkingMode: 'medium', providerConfigured: true },
+    ])
+    registerEndpoint('/api/config', () => ({
+      entries: [
+        { key: 'provider.ollama-cloud.baseUrl', value: 'https://ollama.com/v1' },
+        { key: 'provider.ollama-cloud.apiKey', value: 'xxxx****' },
+        // supportsThinking gates Think-pill visibility; thinkingLevels is still
+        // carried so the agent detail page can render the level selector.
+        { key: 'provider.ollama-cloud.models', value: '[{"id":"kimi-k2.5","name":"Kimi K2.5","supportsThinking":true,"thinkingLevels":["low","medium","high"]}]' },
+      ],
+    }))
+    registerEndpoint('/api/conversations', () => [])
+
+    const component = await mountSuspended(Chat)
+    await flushPromises()
+
+    // The in-chat Thinking: level dropdown is gone — on/off is the composer's
+    // Think pill, and the level itself lives on the agent detail page.
+    expect(component.text()).not.toContain('Thinking:')
+    expect(component.text()).toContain('Think')
+  })
+})

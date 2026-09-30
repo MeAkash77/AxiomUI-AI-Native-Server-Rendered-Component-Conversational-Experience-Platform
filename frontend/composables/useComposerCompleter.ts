@@ -1,0 +1,161 @@
+import { computed, ref, type Ref, type ComputedRef } from 'vue'
+
+/**
+ * Source-agnostic typeahead for the chat composer (JCLAW-1071). One popup, N
+ * sources: the `/` command menu, the `/model NAME` argument completer, and
+ * whatever comes later. Pure Vue — no DOM — so it's testable without mounting.
+ *
+ * Generalized from useModelAutocomplete (JCLAW-114), which owned both the state
+ * machine and the /model matching rules. Keeping one engine matters because
+ * `useChatComposer` decides what Enter means by asking whether a popup is open:
+ * with a popup per source that question has no single answer.
+ */
+
+/** One row in the completion popup. */
+export interface CompletionOption {
+  /** Identity within a source, and what {@link CompletionSource.apply} receives. */
+  value: string
+  /** Primary row text. Falls back to {@link CompletionOption.value}. */
+  label?: string
+  /** Secondary row text — a command's description, a prompt's category. */
+  detail?: string
+  /** A status row ("Loading…", "No matches"): shown, never accepted. */
+  disabled?: boolean
+}
+
+export interface CompletionSource {
+  /** Identifies the source in tests and lets the popup style its rows. */
+  id: string
+  /** Listbox aria-label while this source is the active one. */
+  ariaLabel: string
+  /** Completions for `text`; an empty array means this source doesn't apply. */
+  options: (text: string) => CompletionOption[]
+  /** The composer text after accepting `choice`. */
+  apply: (text: string, choice: CompletionOption) => string
+  /**
+   * Text the composer must not send as-is — a half-finished invocation only
+   * this source can complete. Consulted independently of {@link open}, so
+   * dismissing the popup with Escape doesn't re-enable sending the literal.
+   */
+  blocksSend?: (text: string) => boolean
+}
+
+/**
+ * Next highlighted index after ArrowDown / ArrowUp, with wrap. Returns 0 for an
+ * empty list — callers check length before rendering, but the wrap stays defined.
+ */
+export function nextAutocompleteIndex(
+  current: number,
+  total: number,
+  direction: 'up' | 'down',
+): number {
+  if (total <= 0) return 0
+  if (direction === 'down') return (current + 1) % total
+  return (current - 1 + total) % total
+}
+
+export interface UseComposerCompleter {
+  readonly open: Ref<boolean>
+  readonly options: Ref<CompletionOption[]>
+  readonly highlightedIndex: Ref<number>
+  readonly highlighted: ComputedRef<CompletionOption | null>
+  /** aria-label for the listbox, from whichever source is active. */
+  readonly ariaLabel: ComputedRef<string>
+  /** Id of the active source, or null when closed. */
+  readonly activeSourceId: ComputedRef<string | null>
+  /** True when the current text is a half-finished invocation — see {@link CompletionSource.blocksSend}. */
+  readonly blocksSend: ComputedRef<boolean>
+  /** Recompute from the textarea's current value. */
+  update: (text: string) => void
+  /**
+   * Re-run the match against the text last passed to {@link update}. For a
+   * source whose options arrive asynchronously: the completer is pull-based,
+   * so without this the popup keeps the snapshot taken at the last keystroke.
+   */
+  refresh: () => void
+  close: () => void
+  moveHighlight: (direction: 'up' | 'down') => void
+  /** Accept the highlighted option; returns the new textarea value, or null. */
+  accept: (currentText: string) => string | null
+}
+
+/**
+ * @param sources tried in order; the first yielding options wins. Sources close
+ *                over their own reactive data, so the array itself is static.
+ */
+export function useComposerCompleter(sources: CompletionSource[]): UseComposerCompleter {
+  const open = ref(false)
+  const options = ref<CompletionOption[]>([])
+  const highlightedIndex = ref(0)
+  const activeSource = ref<CompletionSource | null>(null)
+  // Survives close(), so Escape dismisses the popup without unblocking send.
+  const currentText = ref('')
+
+  const highlighted = computed<CompletionOption | null>(() => {
+    if (!open.value) return null
+    return options.value[highlightedIndex.value] ?? null
+  })
+
+  const ariaLabel = computed(() => activeSource.value?.ariaLabel ?? 'Completion options')
+  const activeSourceId = computed(() => (open.value ? activeSource.value?.id ?? null : null))
+  const blocksSend = computed(() => sources.some(s => s.blocksSend?.(currentText.value) ?? false))
+
+  function update(text: string) {
+    currentText.value = text
+    for (const source of sources) {
+      const found = source.options(text)
+      if (found.length === 0) continue
+      options.value = found
+      activeSource.value = source
+      open.value = true
+      // Clamp so a filter that shrank the list doesn't leave the index past the end.
+      if (highlightedIndex.value >= found.length) highlightedIndex.value = 0
+      return
+    }
+    close()
+  }
+
+  function refresh() {
+    update(currentText.value)
+  }
+
+  function close() {
+    open.value = false
+    options.value = []
+    highlightedIndex.value = 0
+    activeSource.value = null
+  }
+
+  function moveHighlight(direction: 'up' | 'down') {
+    if (!open.value || options.value.length === 0) return
+    highlightedIndex.value = nextAutocompleteIndex(
+      highlightedIndex.value,
+      options.value.length,
+      direction,
+    )
+  }
+
+  function accept(text: string): string | null {
+    if (!open.value) return null
+    const source = activeSource.value
+    const choice = options.value[highlightedIndex.value]
+    if (!source || !choice || choice.disabled) return null
+    close()
+    return source.apply(text, choice)
+  }
+
+  return {
+    open,
+    options,
+    highlightedIndex,
+    highlighted,
+    ariaLabel,
+    activeSourceId,
+    blocksSend,
+    update,
+    refresh,
+    close,
+    moveHighlight,
+    accept,
+  }
+}

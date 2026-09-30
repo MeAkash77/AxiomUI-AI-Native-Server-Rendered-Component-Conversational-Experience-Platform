@@ -1,0 +1,174 @@
+package jobs;
+
+import models.DeliveredMessage;
+import models.Task;
+import play.db.jpa.JPA;
+import play.jobs.Every;
+import play.jobs.Job;
+import play.jobs.OnApplicationStart;
+import services.EventLogger;
+import services.TaskSchedulingService;
+import services.Tx;
+import services.search.LuceneIndexer;
+import utils.AppClock;
+
+import java.time.Instant;
+import java.time.temporal.ChronoUnit;
+import java.util.List;
+
+/**
+ * JCLAW-259: scheduled auto-cleanup for terminal tasks past their
+ * {@code tasks.retentionDays} TTL.
+ *
+ * <p>Runs every 24 hours off the chat hot path. Scans for tasks in a
+ * terminal status ({@link Task.Status#COMPLETED}, {@link Task.Status#FAILED},
+ * {@link Task.Status#CANCELLED}, {@link Task.Status#LOST}) whose
+ * {@code updatedAt} predates {@code now() − retentionDays}, then hard-
+ * deletes them along with their full run history
+ * ({@code TaskRunMessage → TaskRun → Task}) and any leftover
+ * {@code scheduled_tasks} row.
+ *
+ * <p>Configuration: {@code tasks.retentionDays} (integer; default
+ * {@link #DEFAULT_RETENTION_DAYS}). Set to {@link #RETENTION_DISABLED}
+ * — or unset — to disable cleanup entirely (the AC's "unset means
+ * forever" semantic). Out-of-range or non-numeric values fall back to
+ * the default, with a one-shot warn so a typo isn't silently ignored.
+ *
+ * <p>Why the bulk JPQL deletes match {@link controllers.ApiTasksController#delete}:
+ * the FK chain is the same and the per-task delete loop would do N
+ * round-trips per task, but a single batch can address all eligible
+ * tasks in three JPQL statements regardless of count. Scheduler-row
+ * cancel is per-task and idempotent — terminal tasks usually have
+ * already-removed scheduler rows so the cost is a few DB pings.
+ *
+ * <p>Active (PENDING / ACTIVE / RUNNING) tasks are never touched. LOST
+ * is in scope because it's a terminal-shape state (the task isn't going
+ * to run again under its own steam — db-scheduler's re-fire would flip
+ * it back to RUNNING first, at which point the cleanup query no longer
+ * matches). If an operator wants to preserve LOST tasks for forensics
+ * past the TTL, they can retry → PENDING → ACTIVE.
+ */
+// JCLAW-1067: @Every alone first fires a full interval after boot, so a 24h period
+// never elapses on an instance restarted more often than daily.
+@OnApplicationStart(async = true)
+@Every("24h")
+public class TaskCleanupJob extends Job<Void> {
+
+    private static final String EVENT_CATEGORY = "TASK_CLEANUP";
+    private static final String CONFIG_KEY = "tasks.retentionDays";
+
+    /** Default retention window when {@code tasks.retentionDays} is absent. */
+    public static final int DEFAULT_RETENTION_DAYS = 30;
+
+    /** Sentinel value (0) meaning "retention disabled, never auto-delete". */
+    public static final int RETENTION_DISABLED = RetentionDays.DISABLED;
+
+    /** Upper bound on the configured value — defense-in-depth against a
+     *  typo like 365000 that would make the query effectively no-op but
+     *  also looks alarming in logs. ~10 years is the practical ceiling. */
+    private static final int MAX_RETENTION_DAYS = 3650;
+
+    @Override
+    public void doJob() {
+        var retentionDays = resolveRetentionDays();
+        if (retentionDays == RETENTION_DISABLED) {
+            // "Retention disabled" is the deliberate operator choice; log
+            // only at debug-ish-info level so the daily noise stays minimal.
+            EventLogger.info(EVENT_CATEGORY, null, null,
+                    "Skipped: tasks.retentionDays = 0 (cleanup disabled)");
+            return;
+        }
+
+        var cutoff = AppClock.now().minus(retentionDays, ChronoUnit.DAYS);
+        int deleted = Tx.run(() -> deleteExpired(cutoff));
+        // What a task delivered stays quotable as long as its history is kept (JCLAW-1295).
+        int deliveries = Tx.run(() -> DeliveredMessage.delete("createdAt < ?1", cutoff));
+
+        if (deleted > 0 || deliveries > 0) {
+            EventLogger.info(EVENT_CATEGORY, null, null,
+                    "Deleted %d terminal task(s) and %d delivery record(s) older than %d day(s) (cutoff=%s)"
+                            .formatted(deleted, deliveries, retentionDays, cutoff));
+        }
+        // Suppress zero-delete log noise: the job runs daily and silence
+        // here means "system is healthy, nothing to clean", which doesn't
+        // need an audit line.
+    }
+
+    /**
+     * Read {@code tasks.retentionDays}: missing → {@link #DEFAULT_RETENTION_DAYS}, 0 or
+     * less → disabled, above the ceiling or non-numeric → default plus a warn.
+     * {@link RetentionDays#resolve} is the rule the three cleanup jobs share.
+     *
+     * <p>Public because Play 1.x test classes live in the default package, so
+     * {@code TaskCleanupJobTest} could not reach a package-private method.
+     */
+    public static int resolveRetentionDays() {
+        return RetentionDays.fromConfig(CONFIG_KEY, DEFAULT_RETENTION_DAYS,
+                MAX_RETENTION_DAYS, EVENT_CATEGORY);
+    }
+
+    /**
+     * Hard-delete every terminal task whose {@code updatedAt} predates
+     * {@code cutoff}. Mirrors {@link controllers.ApiTasksController#delete}
+     * but as a bulk pass. Returns the number of Task rows removed.
+     *
+     * <p>FK chain ({@code TaskRunMessage → TaskRun → Task}) is swept in
+     * dependency order via JPQL bulk deletes — three statements regardless
+     * of count. The per-row {@code scheduled_tasks} cancel iterates the
+     * eligible ids before any bulk delete fires so we don't try to drop
+     * scheduler rows for tasks we've already evicted from the DB.
+     */
+    private static int deleteExpired(Instant cutoff) {
+        var em = JPA.em();
+
+        // Collect ids first — both for the scheduler-cancel loop AND so the
+        // event log can name the count accurately (JPQL bulk delete returns
+        // the row count of the LAST statement, which is the Task delete).
+        @SuppressWarnings("unchecked")
+        List<Long> expiredIds = em.createQuery(
+                        "SELECT t.id FROM Task t "
+                                + "WHERE t.status IN (:terminal) "
+                                + "AND t.updatedAt < :cutoff "
+                                + "ORDER BY t.id")
+                .setParameter("terminal", List.of(
+                        Task.Status.COMPLETED,
+                        Task.Status.FAILED,
+                        Task.Status.CANCELLED,
+                        Task.Status.LOST))
+                .setParameter("cutoff", cutoff)
+                .getResultList();
+
+        if (expiredIds.isEmpty()) return 0;
+
+        // Drop the FK descendants first, then scheduled_tasks rows, then
+        // the Task rows themselves. Same dependency order the per-task
+        // ApiTasksController.delete uses.
+        // JCLAW-994: collect before the bulk DELETE — it never fires @PostRemove.
+        @SuppressWarnings("unchecked")
+        List<Long> transcriptIds = em.createQuery(
+                        "SELECT m.id FROM TaskRunMessage m WHERE m.taskRun.task.id IN :ids")
+                .setParameter("ids", expiredIds).getResultList();
+        em.createQuery("DELETE FROM TaskRunMessage m WHERE m.taskRun.task.id IN :ids")
+                .setParameter("ids", expiredIds).executeUpdate();
+        em.createQuery("DELETE FROM TaskRun r WHERE r.task.id IN :ids")
+                .setParameter("ids", expiredIds).executeUpdate();
+
+        for (var taskId : expiredIds) {
+            // Idempotent: terminal tasks usually have no scheduler row,
+            // but a CANCELED-then-revived flow could leave one behind.
+            TaskSchedulingService.cancel(taskId);
+        }
+
+        em.createQuery("DELETE FROM Task t WHERE t.id IN :ids")
+                .setParameter("ids", expiredIds).executeUpdate();
+        em.flush();
+
+        // After the flush, so a constraint failure aborts before the
+        // non-transactional index is touched. Both scopes orphan here: the Task
+        // rows go out by bulk DELETE too, so Task.@PostRemove never fires either.
+        LuceneIndexer.removeAll(LuceneIndexer.Scope.TASK_RUN_MESSAGE, transcriptIds);
+        LuceneIndexer.removeAll(LuceneIndexer.Scope.TASK, expiredIds);
+
+        return expiredIds.size();
+    }
+}

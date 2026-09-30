@@ -1,0 +1,151 @@
+package services.transcription;
+
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.RequestBody;
+import org.jspecify.annotations.Nullable;
+import services.ConfigService;
+import services.LocalSidecarDaemon;
+import services.sidecar.SidecarHttpClient;
+
+import java.io.IOException;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantLock;
+
+/**
+ * HTTP client for the local ASR sidecar (JCLAW-565 lineage; ASR-only since
+ * JCLAW-654): plain transcription plus the Settings page's ASR model
+ * status/prefetch. Requests carry the audio by absolute path — both
+ * processes share the host. A JVM-wide fair lock serializes calls so
+ * concurrent conversations queue instead of thrashing the GPU.
+ */
+public class AsrSidecarClient extends SidecarHttpClient {
+
+    /** JCLAW-620: the sidecar is one-inference-at-a-time by design (HTTP
+     *  409 when busy). Serialize all sidecar calls JVM-wide with a FAIR
+     *  lock so concurrent conversations queue instead of surfacing a
+     *  retryable busy condition as a user-facing failure. */
+    private static final ReentrantLock SIDECAR_LOCK =
+            new ReentrantLock(true);
+
+    public AsrSidecarClient() {
+        this(null, defaultClient());
+    }
+
+    /** Test seam: fixed base URL (no sidecar spawn) + injected client. */
+    public AsrSidecarClient(@Nullable String baseUrlOverride, OkHttpClient client) {
+        super(baseUrlOverride, client);
+    }
+
+    @Override
+    protected ReentrantLock sidecarLock() {
+        return SIDECAR_LOCK;
+    }
+
+
+
+
+
+
+
+
+
+    /**
+     * GPU ASR via the sidecar (JCLAW-627): mlx-whisper on Apple silicon,
+     * faster-whisper elsewhere — same weights as whisper.cpp, 5-20x faster.
+     * First call may build the script env and download weights.
+     */
+    public List<WhisperTranscriber.Segment> transcribe(Path audioFile, String model,
+                                                          @Nullable String language) {
+        return withSidecarLock(() -> transcribeLocked(audioFile, model, language));
+    }
+
+    private List<WhisperTranscriber.Segment> transcribeLocked(Path audioFile, String model,
+                                                                 @Nullable String language) {
+        var baseUrl = baseUrlOverride != null ? baseUrlOverride : AsrSidecarManager.ensureRunning();
+        var body = new JsonObject();
+        body.addProperty("audio_path", audioFile.toAbsolutePath().toString());
+        body.addProperty("model", model);
+        if (language != null && !language.isBlank()) body.addProperty("language", language);
+        var call = client.newCall(new Request.Builder()
+                .url(baseUrl + "/transcribe")
+                .header(LocalSidecarDaemon.AUTH_HEADER, AsrSidecarManager.authToken())
+                .post(RequestBody.create(body.toString(), JSON))
+                .build());
+        call.timeout().timeout(ConfigService.getInt(
+                AsrSidecarManager.CONFIG_PREFIX + ".timeoutSeconds", 1800), TimeUnit.SECONDS);
+        try (var resp = call.execute()) {
+            var text = resp.body().string();
+            if (!resp.isSuccessful()) {
+                throw new TranscriptionException(
+                        "ASR sidecar transcribe failed: HTTP %d — %s".formatted(
+                                resp.code(), truncate(text)));
+            }
+            var root = JsonParser.parseString(text).getAsJsonObject();
+            var segments = new ArrayList<WhisperTranscriber.Segment>();
+            for (var el : root.getAsJsonArray("segments")) {
+                var o = el.getAsJsonObject();
+                segments.add(new WhisperTranscriber.Segment(
+                        o.get("startMs").getAsLong(), o.get("endMs").getAsLong(),
+                        o.get("text").getAsString()));
+            }
+            return segments;
+        } catch (IOException e) {
+            throw new TranscriptionException(
+                    "ASR sidecar unreachable: " + e.getMessage(), e);
+        } catch (RuntimeException e) {
+            if (e instanceof TranscriptionException te) throw te;
+            throw new TranscriptionException(
+                    "ASR sidecar returned an unparseable transcribe response: " + e.getMessage(), e);
+        }
+    }
+
+    /** JCLAW-650: host-relevant ASR artifact status (raw JSON body). */
+    public String asrModels(String commaSeparatedIds) {
+        var baseUrl = baseUrlOverride != null ? baseUrlOverride : AsrSidecarManager.ensureRunning();
+        var call = client.newCall(new Request.Builder()
+                .url(baseUrl + "/asr/models?ids=" + commaSeparatedIds)
+                .header(LocalSidecarDaemon.AUTH_HEADER, AsrSidecarManager.authToken()).get().build());
+        call.timeout().timeout(30, TimeUnit.SECONDS);
+        try (var resp = call.execute()) {
+            var text = resp.body().string();
+            if (!resp.isSuccessful()) {
+                throw new TranscriptionException("asr status failed: HTTP %d — %s"
+                        .formatted(resp.code(), truncate(text)));
+            }
+            return text;
+        } catch (IOException e) {
+            throw new TranscriptionException("ASR sidecar unreachable: " + e.getMessage(), e);
+        }
+    }
+
+    /** JCLAW-650: download the host engine's weights for a model id.
+     *  Synchronous; AsrModelStore wraps it in an async single-flight. */
+    public String asrPrefetch(String modelId) {
+        var baseUrl = baseUrlOverride != null ? baseUrlOverride : AsrSidecarManager.ensureRunning();
+        var body = new JsonObject();
+        body.addProperty("model", modelId);
+        var call = client.newCall(new Request.Builder()
+                .url(baseUrl + "/asr/prefetch")
+                .header(LocalSidecarDaemon.AUTH_HEADER, AsrSidecarManager.authToken())
+                .post(RequestBody.create(body.toString(), JSON))
+                .build());
+        call.timeout().timeout(ConfigService.getInt(
+                AsrSidecarManager.CONFIG_PREFIX + ".timeoutSeconds", 1800), TimeUnit.SECONDS);
+        try (var resp = call.execute()) {
+            var text = resp.body().string();
+            if (!resp.isSuccessful()) {
+                throw new TranscriptionException("asr prefetch failed: HTTP %d — %s"
+                        .formatted(resp.code(), truncate(text)));
+            }
+            return text;
+        } catch (IOException e) {
+            throw new TranscriptionException("ASR sidecar unreachable: " + e.getMessage(), e);
+        }
+    }
+}

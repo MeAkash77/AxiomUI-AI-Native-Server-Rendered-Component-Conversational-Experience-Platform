@@ -1,0 +1,268 @@
+import models.Agent;
+import models.Task;
+import models.TaskRun;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import play.test.Fixtures;
+import play.test.FunctionalTest;
+
+import java.time.Instant;
+import java.util.concurrent.atomic.AtomicReference;
+
+/**
+ * Functional HTTP tests for {@code GET /api/tasks/stats} (JCLAW-22 slice K):
+ * the dashboard KPI aggregate — today's run count, success rate, average
+ * duration, and the pending / running / paused / failed task counts.
+ */
+class ApiTasksControllerStatsTest extends FunctionalTest {
+
+    @BeforeEach
+    void setup() {
+        Fixtures.deleteDatabase();
+        AuthFixture.seedAdminPassword("changeme");
+        login();
+    }
+
+    private void login() {
+        assertIsOk(POST("/api/auth/login", "application/json", """
+                {"username": "admin", "password": "changeme"}
+                """));
+    }
+
+    /**
+     * Seed an agent, four tasks and four of-today runs in a fresh tx so the
+     * controller thread sees them. The "running" signal lives on the TaskRun,
+     * not the Task: the ACTIVE recurring task carries the one in-flight RUNNING
+     * run (the realistic case that must count), while the Status.RUNNING task
+     * carries only terminal runs — it must NOT inflate runningCount. The two
+     * COMPLETED runs (1000ms + 3000ms) plus one FAILED run drive successRate /
+     * avgDurationMs.
+     */
+    private static void seedAll() {
+        var err = new AtomicReference<Throwable>();
+        var t = Thread.ofVirtual().start(() -> {
+            try {
+                services.Tx.run(() -> {
+                    var agent = new Agent();
+                    agent.name = "stats-agent";
+                    agent.modelProvider = "openrouter";
+                    agent.modelId = "gpt-4.1";
+                    agent.enabled = true;
+                    agent.save();
+
+                    mkTask(agent, "pending-task", Task.Status.PENDING);
+                    mkTask(agent, "failed-task", Task.Status.FAILED);
+                    var active = mkTask(agent, "active-task", Task.Status.ACTIVE);
+                    var running = mkTask(agent, "running-task", Task.Status.RUNNING);
+
+                    // The realistic in-flight case: a recurring ACTIVE task with
+                    // a RUNNING run. This — not the Status.RUNNING task below — is
+                    // what runningCount must count.
+                    mkRun(active, TaskRun.Status.RUNNING, null);
+
+                    mkRun(running, TaskRun.Status.COMPLETED, 1000L);
+                    mkRun(running, TaskRun.Status.COMPLETED, 3000L);
+                    mkRun(running, TaskRun.Status.FAILED, null);
+                });
+            } catch (Throwable ex) {
+                err.set(ex);
+            }
+        });
+        try {
+            t.join();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException(e);
+        }
+        if (err.get() != null) throw new RuntimeException(err.get());
+    }
+
+    private static Task mkTask(Agent agent, String name, Task.Status status) {
+        return mkTask(agent, name, status, null);
+    }
+
+    private static Task mkTask(Agent agent, String name, Task.Status status, String payloadType) {
+        var t = new Task();
+        t.agent = agent;
+        t.name = name;
+        t.type = Task.Type.IMMEDIATE;
+        t.status = status;
+        t.payloadType = payloadType;
+        t.nextRunAt = Instant.now();
+        t.save();
+        return t;
+    }
+
+    private static void mkRun(Task task, TaskRun.Status status, Long durationMs) {
+        var r = new TaskRun();
+        r.task = task;
+        r.startedAt = Instant.now();
+        r.status = status;
+        if (status == TaskRun.Status.COMPLETED) {
+            r.completedAt = Instant.now();
+            r.durationMs = durationMs;
+        }
+        r.save();
+    }
+
+    @Test
+    void statsReflectsSeededTasksAndRuns() {
+        seedAll();
+
+        var resp = GET("/api/tasks/stats");
+        assertIsOk(resp);
+        var body = getContent(resp);
+        assertTrue(body.contains("\"runsToday\":4"), body);
+        assertTrue(body.contains("\"pendingCount\":1"), body);
+        assertTrue(body.contains("\"failedCount\":1"), body);
+        // runningCount counts RUNNING runs, not Status.RUNNING tasks: only the
+        // ACTIVE task's in-flight run counts; the Status.RUNNING task (terminal
+        // runs only) must not.
+        assertTrue(body.contains("\"runningCount\":1"), body);
+        assertTrue(body.contains("\"activeCount\":1"), body);
+        // 2 COMPLETED / 3 terminal == 0.666...
+        assertTrue(body.contains("\"successRate\":0.6"), body);
+        // (1000 + 3000) / 2 == 2000
+        assertTrue(body.contains("\"avgDurationMs\":2000"), body);
+    }
+
+    @Test
+    void statsAreZeroWithNoData() {
+        var resp = GET("/api/tasks/stats");
+        assertIsOk(resp);
+        var body = getContent(resp);
+        assertTrue(body.contains("\"runsToday\":0"), body);
+        assertTrue(body.contains("\"pendingCount\":0"), body);
+        assertTrue(body.contains("\"failedCount\":0"), body);
+    }
+
+    /**
+     * payloadType scoping: reminders are payloadType=reminder Tasks that the
+     * /tasks page hides (excludePayloadType=reminder) and /reminders shows
+     * (payloadType=reminder). The stats endpoint must scope its counts AND its
+     * run KPIs the same way, so a pending reminder never inflates the Tasks
+     * page's "Pending" while being absent from its list.
+     */
+    @Test
+    void statsScopeByPayloadTypeSeparatesRemindersFromTasks() {
+        seedMixed();
+
+        // Default (no scope): everything — preserves the headless-caller contract.
+        var all = getContent(GET("/api/tasks/stats"));
+        assertTrue(all.contains("\"pendingCount\":2"), all);  // 1 task + 1 reminder pending
+        assertTrue(all.contains("\"runsToday\":2"), all);     // 1 task run + 1 reminder run
+
+        // /tasks scope: reminders excluded from counts AND run KPIs.
+        var tasks = getContent(GET("/api/tasks/stats?excludePayloadType=reminder"));
+        assertTrue(tasks.contains("\"pendingCount\":1"), tasks);
+        assertTrue(tasks.contains("\"runsToday\":1"), tasks);
+
+        // /reminders scope: only reminders.
+        var rem = getContent(GET("/api/tasks/stats?payloadType=reminder"));
+        assertTrue(rem.contains("\"pendingCount\":1"), rem);
+        assertTrue(rem.contains("\"runsToday\":1"), rem);
+    }
+
+    /**
+     * Paused is a flag, not a status: a paused recurring task is still ACTIVE
+     * and a paused one-shot still PENDING. The KPI strip shows both a Paused
+     * card and Active/Pending cards, so the counts must partition the live
+     * tasks — a suspended schedule appears under Paused and nowhere else, or
+     * the strip sums to more tasks than exist.
+     */
+    @Test
+    void pausedTasksCountOnceUnderPausedAndNotUnderActiveOrPending() {
+        seedPaused();
+
+        var resp = GET("/api/tasks/stats");
+        assertIsOk(resp);
+        var body = getContent(resp);
+        // 1 paused ACTIVE + 1 paused PENDING; the two unpaused siblings stay put.
+        assertTrue(body.contains("\"pausedCount\":2"), body);
+        assertTrue(body.contains("\"activeCount\":1"), body);
+        assertTrue(body.contains("\"pendingCount\":1"), body);
+        // A terminal task's stale paused flag has no schedule left to suspend.
+        assertTrue(body.contains("\"failedCount\":1"), body);
+    }
+
+    /**
+     * Seed one paused + one unpaused task in each of the two live states, plus
+     * a FAILED task carrying a stale paused flag (only re-enable clears it).
+     */
+    private static void seedPaused() {
+        var err = new AtomicReference<Throwable>();
+        var t = Thread.ofVirtual().start(() -> {
+            try {
+                services.Tx.run(() -> {
+                    var agent = new Agent();
+                    agent.name = "paused-agent";
+                    agent.modelProvider = "openrouter";
+                    agent.modelId = "gpt-4.1";
+                    agent.enabled = true;
+                    agent.save();
+
+                    mkPausedTask(agent, "active-paused", Task.Status.ACTIVE);
+                    mkPausedTask(agent, "pending-paused", Task.Status.PENDING);
+                    mkPausedTask(agent, "failed-stale-flag", Task.Status.FAILED);
+                    mkTask(agent, "active-live", Task.Status.ACTIVE);
+                    mkTask(agent, "pending-live", Task.Status.PENDING);
+                });
+            } catch (Throwable ex) {
+                err.set(ex);
+            }
+        });
+        try {
+            t.join();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException(e);
+        }
+        if (err.get() != null) throw new RuntimeException(err.get());
+    }
+
+    private static void mkPausedTask(Agent agent, String name, Task.Status status) {
+        var t = mkTask(agent, name, status);
+        t.paused = true;
+        t.save();
+    }
+
+    /**
+     * Seed a mix: one automation task pending + one running (with a COMPLETED
+     * run today), and one reminder pending + one reminder completed (with a
+     * COMPLETED run today). Lets the scoping test pin each filter independently.
+     */
+    private static void seedMixed() {
+        var err = new AtomicReference<Throwable>();
+        var t = Thread.ofVirtual().start(() -> {
+            try {
+                services.Tx.run(() -> {
+                    var agent = new Agent();
+                    agent.name = "mixed-agent";
+                    agent.modelProvider = "openrouter";
+                    agent.modelId = "gpt-4.1";
+                    agent.enabled = true;
+                    agent.save();
+
+                    // Automation tasks (payloadType null)
+                    mkTask(agent, "task-pending", Task.Status.PENDING);
+                    var taskRunning = mkTask(agent, "task-running", Task.Status.RUNNING);
+                    mkRun(taskRunning, TaskRun.Status.COMPLETED, 1000L);
+
+                    // Reminders (payloadType = reminder)
+                    mkTask(agent, "rem-pending", Task.Status.PENDING, "reminder");
+                    var remFired = mkTask(agent, "rem-fired", Task.Status.COMPLETED, "reminder");
+                    mkRun(remFired, TaskRun.Status.COMPLETED, 4L);
+                });
+            } catch (Throwable ex) {
+                err.set(ex);
+            }
+        });
+        try {
+            t.join();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException(e);
+        }
+        if (err.get() != null) throw new RuntimeException(err.get());
+    }
+}

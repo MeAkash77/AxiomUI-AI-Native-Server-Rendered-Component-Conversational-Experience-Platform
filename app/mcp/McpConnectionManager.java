@@ -1,0 +1,834 @@
+package mcp;
+
+import agents.ToolRegistry;
+import com.google.errorprone.annotations.MustBeClosed;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+import mcp.jsonrpc.JsonRpc;
+import mcp.transport.McpStdioTransport;
+import mcp.transport.McpStreamableHttpTransport;
+import mcp.transport.McpTransport;
+import models.EventLog;
+import models.McpServer;
+import org.jspecify.annotations.Nullable;
+import play.Play;
+import play.db.jpa.JPA;
+import services.BreakerAlarms;
+import services.EventLogger;
+import services.Tx;
+import utils.AppClock;
+import utils.CircuitBreaker;
+import utils.CircuitBreakers;
+
+import java.io.IOException;
+import java.net.URI;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.function.Consumer;
+
+/**
+ * Owner of all live MCP server connections (JCLAW-31).
+ *
+ * <p>Loads {@link McpServer} rows at startup, drives each through the
+ * connect → read → reconnect lifecycle on virtual threads, and exposes
+ * the discovered tools via {@link ToolRegistry#publishExternal} so the
+ * agent loop can invoke them.
+ *
+ * <p><b>Threading model.</b> Connect/disconnect attempts run on virtual
+ * threads (blocking I/O is fine — they unmount cleanly). Backoff timers
+ * run on a small {@link ScheduledExecutorService} of <em>platform</em>
+ * threads. The platform-thread choice is deliberate: per JDK-8373224,
+ * many concurrent VTs sleeping inside {@code Thread.sleep} starve the
+ * ForkJoinPool work queue and produce multi-second tail latency. Our
+ * memory note (jdk25 vt_thread_sleep) calls this out — the timer pool
+ * stays platform-only and only schedules work onto the VT pool.
+ *
+ * <p><b>Backoff schedule.</b> {@code min(2^attempts, ceiling) seconds},
+ * reset on successful connect. Defaults to 30s ceiling per the AC ("max
+ * 1 attempt per 30s") with a 1s initial. Configurable via the
+ * {@code backoff*} setters for tests.
+ *
+ * <p><b>Two independent guards.</b> The backoff/watchdog loop above is
+ * per-connection and reacts to a transport that died. The JCLAW-1168
+ * circuit breaker in {@link #callTool} is per-call and reacts to a server
+ * that is still connected but not answering — the case the watchdog cannot
+ * see. They compose rather than overlap: a successful reconnect clears the
+ * breaker, and an open breaker never touches the connection.
+ *
+ * <p>All status mutations on {@link McpServer} rows go through this
+ * class; the admin UI (JCLAW-33) reads them but doesn't write them.
+ */
+public final class McpConnectionManager {
+
+    private static final String CLIENT_VERSION_FALLBACK = "0.0.0-dev";
+    private static final String CATEGORY_CONNECT = "MCP_CONNECT";
+    private static final String CATEGORY_DISCONNECT = "MCP_DISCONNECT";
+    private static final String BREAKER_PREFIX = "mcp:";
+    private static final String TIMESTAMP_LAST_DISCONNECTED = "lastDisconnectedAt";
+
+    private static volatile long backoffInitialMillis = 1_000L;
+    private static volatile long backoffCeilingMillis = 30_000L;
+
+    /** JCLAW-288: per-request timeout used on the very first connect attempt
+     *  for an entry. Cold-cache uvx / npx / pipx subprocesses typically need
+     *  30–60 s to install + bootstrap before they can respond to
+     *  {@code initialize}; the steady-state 30 s {@link McpClient} default
+     *  is too tight and races the install. After the first attempt resolves
+     *  (success or failure), subsequent retries fall back to
+     *  {@link #DEFAULT_REQUEST_TIMEOUT}. Volatile + setter so tests can
+     *  shrink it without waiting two minutes per failure case. */
+    @SuppressWarnings("java:S3008") // mutable test hook deliberately not final
+    private static volatile Duration firstAttemptRequestTimeout = Duration.ofSeconds(120);
+    private static final Duration DEFAULT_REQUEST_TIMEOUT = Duration.ofSeconds(30);
+
+    /** JCLAW-1168: every failing call here costs the full {@link #DEFAULT_REQUEST_TIMEOUT}, and a
+     *  turn rarely makes ten calls to one server, so three timeouts in a row is what opens it. */
+    public static final CircuitBreaker.Config BREAKER_CONFIG =
+            CircuitBreaker.Config.of(10, 0.5, 3, 30_000L).withHalfOpenPermits(2).withConsecutiveFailures(3);
+
+    private static final ConcurrentHashMap<String, Entry> connections = new ConcurrentHashMap<>();
+    // Reference is reassigned under synchronized ensureScheduler(); the held
+    // executor is itself thread-safe, so volatile-on-reference is sufficient.
+    @SuppressWarnings("java:S3077")
+    private static volatile @Nullable ScheduledExecutorService scheduler;
+
+    private McpConnectionManager() {}
+
+    // ==================== lifecycle ====================
+
+    /** JCLAW-496: max time the deferred scheduler start waits for all enabled
+     *  servers' first-connect attempts to resolve before it begins firing tasks.
+     *  Slower servers keep retrying via the watchdog after it elapses. */
+    private static final Duration STARTUP_CONNECT_BUDGET = Duration.ofSeconds(20);
+
+    /** JCLAW-496: the most recent {@link #startAll}'s first-connect futures, for
+     *  the deferred scheduler start ({@link #awaitStartupConnected}) to join. */
+    private static volatile List<CompletableFuture<Void>> startupConnectFutures = List.of();
+
+    /** Load every enabled MCP server row, start a connector for each, then record
+     *  the first-connect futures for the scheduler to join. Does NOT block boot
+     *  (JCLAW-496): the web UI comes up immediately; only task-firing waits for
+     *  MCP readiness, via {@link #awaitStartupConnected} on the scheduler's
+     *  deferred-start thread. Connects run concurrently. */
+    public static void startAll() {
+        ensureScheduler();
+        var configs = Tx.run(McpServer::findEnabled);
+        sweepStaleGrants();
+        var futures = new ArrayList<CompletableFuture<Void>>();
+        for (var server : configs) futures.add(connectAndAwait(server));
+        startupConnectFutures = futures;
+    }
+
+    /**
+     * Reclaim allowlist rows no live agent or server can use. Boot is the whole
+     * window: no subagent survives a restart (their virtual threads don't), so
+     * every subagent grant present now belongs to a finished run.
+     *
+     * <p>Best-effort — a failure here costs disk, not correctness, and must not
+     * stop servers from connecting.
+     */
+    private static void sweepStaleGrants() {
+        try {
+            var removed = Tx.run(() -> {
+                var live = new HashSet<String>();
+                for (McpServer s : McpServer.<McpServer>findAll()) live.add(s.name);
+                return McpAllowlist.sweepStaleGrants(live, Set.of());
+            });
+            if (removed > 0) {
+                EventLogger.info(CATEGORY_CONNECT,
+                        "Reclaimed %d stale MCP allowlist row(s) from finished subagents and removed servers"
+                                .formatted(removed));
+            }
+        } catch (RuntimeException e) {
+            EventLogger.warn(CATEGORY_CONNECT, "MCP allowlist sweep failed: " + e.getMessage());
+        }
+    }
+
+    /** JCLAW-496: block (bounded) until every enabled server's first-connect
+     *  attempt from boot has resolved. Called off the boot thread (the scheduler's
+     *  deferred start) so the web UI stays up while task-firing waits for MCP
+     *  readiness. Returns true if all resolved within the budget. */
+    public static boolean awaitStartupConnected() {
+        return awaitFirstConnects(startupConnectFutures, STARTUP_CONNECT_BUDGET);
+    }
+
+    /**
+     * JCLAW-496: await every first-connect future, bounded by {@code budget}.
+     * Each resolves on success OR failure (see {@link #signalFirstAttemptResolved}),
+     * so only genuinely slow / still-in-flight connects consume the budget —
+     * failed servers resolve immediately and keep retrying via the watchdog.
+     * Never throws: a slow or unreachable server must not block boot indefinitely.
+     *
+     * @return true if every future resolved within the budget.
+     */
+    public static boolean awaitFirstConnects(List<CompletableFuture<Void>> futures, Duration budget) {
+        if (futures.isEmpty()) return true;
+        try {
+            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
+                    .get(budget.toMillis(), TimeUnit.MILLISECONDS);
+            return true;
+        } catch (TimeoutException _) {
+            EventLogger.warn("system", "MCP startup: %d/%d servers connected within the %ds budget; proceeding (slow servers keep retrying)"
+                    .formatted(connectedCount(), futures.size(), budget.toSeconds()));
+            return false;
+        } catch (InterruptedException _) {
+            Thread.currentThread().interrupt();
+            return false;
+        } catch (ExecutionException | CancellationException e) {
+            EventLogger.warn("system", "MCP startup await ended early: " + e.getMessage());
+            return false;
+        }
+    }
+
+    /** Connect (or restart) one configured server. Idempotent: replaces
+     *  any prior entry for the same name. Fire-and-forget: returns once the
+     *  first attempt has been scheduled, not when it resolves. Used by
+     *  {@link #startAll()} on boot, where waiting per-server would serialize
+     *  startup. Callers that need to know the first-attempt outcome (the
+     *  admin API on registration) should use {@link #connectAndAwait}. */
+    public static void connect(McpServer server) {
+        connectInternal(server, null);
+    }
+
+    /** JCLAW-288: variant that returns a future completing when the first
+     *  attempt resolves (success OR failure). The returned future is
+     *  signal-only — callers read live state via {@link #status} and
+     *  {@link #lastError} after it completes. Cancellation completes with
+     *  {@link java.util.concurrent.CancellationException} (e.g. when a
+     *  concurrent {@link #stop} or {@link #connect} replaces the entry
+     *  while the first attempt is still in flight). Subsequent retries
+     *  after this future completes are unaffected: the watchdog and the
+     *  exponential backoff schedule continue to drive reconnects with the
+     *  steady-state {@link #DEFAULT_REQUEST_TIMEOUT}. */
+    public static CompletableFuture<Void> connectAndAwait(McpServer server) {
+        var future = new CompletableFuture<Void>();
+        connectInternal(server, future);
+        return future;
+    }
+
+    private static void connectInternal(McpServer server, @Nullable CompletableFuture<Void> firstAttemptFuture) {
+        ensureScheduler();
+        stop(server.name);
+        var entry = new Entry();
+        entry.firstAttemptFuture = firstAttemptFuture;
+        // JCLAW-388: capture the approval flag from the row now so the
+        // dispatch-path lookup (McpServerTool.dangerous → requiresApproval)
+        // never touches the DB. A subsequent toggle re-runs connectInternal
+        // (McpServerService.syncRuntime → connect replaces the entry), so the
+        // captured value tracks the persisted flag across edits.
+        entry.requiresApproval = server.requiresApproval;
+        connections.put(server.name, entry);
+        scheduleConnect(entry, server, 0);
+    }
+
+    /** Disconnect a single server and remove its tools.
+     *
+     *  <p>Idempotent against missing entries: even when no in-memory connection
+     *  exists for {@code serverName}, the allowlist sweep + audit still run.
+     *  This matters for the admin {@code DELETE /api/mcp-servers/{id}} path
+     *  (JCLAW-33) which must clean up any orphaned {@code agent_skill_allowed_tool}
+     *  rows from prior crashes or pre-restart state. */
+    public static void stop(String serverName) {
+        var entry = connections.remove(serverName);
+        if (entry != null) {
+            if (entry.scheduledRetry != null) entry.scheduledRetry.cancel(false);
+            var client = entry.client;
+            if (client != null) {
+                try { client.close(); } catch (RuntimeException _) { /* best effort */ }
+            }
+            // JCLAW-288: unblock any caller awaiting the first-attempt future
+            // for this entry. Replacing the entry (via a subsequent connect)
+            // or explicitly stopping mid-handshake counts as "first attempt
+            // resolved" for the awaiter — they'll read DISCONNECTED status
+            // and decide what to do.
+            var pending = entry.firstAttemptFuture;
+            if (pending != null && !pending.isDone()) pending.cancel(false);
+            ToolRegistry.unpublishExternal(serverName);
+        }
+        // A deleted or reconfigured server keeps no breaker: the registry is what an ops
+        // view enumerates, and a re-add must not inherit the old one's open state.
+        CircuitBreakers.remove(BREAKER_PREFIX + serverName);
+        clearAllowlistAndAudit(serverName);
+    }
+
+    /** Stop all connections. Called from {@code ShutdownJob}. */
+    public static void shutdown() {
+        for (var name : new ArrayList<>(connections.keySet())) stop(name);
+        var sched = scheduler;
+        if (sched != null) {
+            sched.shutdownNow();
+            try { sched.awaitTermination(5, TimeUnit.SECONDS); }
+            catch (InterruptedException _) { Thread.currentThread().interrupt(); }
+            scheduler = null;
+        }
+    }
+
+    // ==================== queries ====================
+
+    public static McpServer.Status status(String serverName) {
+        var e = connections.get(serverName);
+        return e != null ? e.status : McpServer.Status.DISCONNECTED;
+    }
+
+    public static @Nullable String lastError(String serverName) {
+        var e = connections.get(serverName);
+        return e != null ? e.lastError : null;
+    }
+
+    /**
+     * JCLAW-388: does this server require an interactive approve/deny prompt
+     * before each of its tool calls? Resolved from the in-memory connection
+     * {@link Entry} (captured from the {@link McpServer} row at connect time),
+     * so the dispatch-path lookup in {@link McpServerTool#dangerous()} costs a
+     * single {@link ConcurrentHashMap} read with no DB round-trip. Returns
+     * {@code false} for any server without a live entry — a disconnected
+     * server has no tools to gate, and the default is opt-out anyway.
+     */
+    public static boolean requiresApproval(String serverName) {
+        var e = connections.get(serverName);
+        return e != null && e.requiresApproval;
+    }
+
+    /**
+     * Advertised tools, but only while the entry is CONNECTED. The status gate is
+     * load-bearing: {@code entry.client} is attached before {@link #doConnect} flips
+     * the status, and the watchdog leaves it attached while tearing a dead connection
+     * down, so a bare null check reports a full list through both windows.
+     */
+    public static List<McpToolDef> tools(String serverName) {
+        var e = connections.get(serverName);
+        if (e == null || e.client == null || e.status != McpServer.Status.CONNECTED) return List.of();
+        return e.client.tools();
+    }
+
+    /**
+     * Invoke an MCP tool on a connected server. Used by {@link McpToolAdapter}.
+     *
+     * <p>Guarded by this server's {@link #breaker(String) circuit breaker}, so a
+     * hung server costs the {@link #DEFAULT_REQUEST_TIMEOUT} on the calls that
+     * open the breaker and microseconds on the rest of the turn.
+     */
+    public static CallToolResult callTool(String serverName, String toolName, JsonObject arguments)
+            throws IOException, McpException {
+        var entry = connections.get(serverName);
+        var client = entry == null ? null : entry.client;
+        if (client == null || client.state() != McpClient.State.READY) {
+            throw new McpException("MCP server '" + serverName + "' not ready");
+        }
+        return guardedCall(breaker(serverName), serverName, () -> client.callTool(toolName, arguments));
+    }
+
+    /** One MCP tool call, as {@link #guardedCall} sees it. */
+    @FunctionalInterface
+    public interface McpCall {
+        CallToolResult invoke() throws IOException, McpException;
+    }
+
+    /**
+     * Run {@code call} under {@code breaker}, recording only what is evidence about
+     * the <em>server</em>: an {@link McpException} (JSON-RPC error, protocol violation
+     * or request timeout) and an {@link IOException} record a failure. A returned
+     * {@link CallToolResult#isError()} does not — the tool ran, and its own failure is
+     * tool-level semantics.
+     *
+     * <p>Public so a test can drive the gate against a fake clock without a live server.
+     *
+     * @throws McpException immediately, without invoking {@code call}, while the breaker is open;
+     *                      {@link McpException.ManuallyIsolated} when the operator opened it
+     */
+    public static CallToolResult guardedCall(CircuitBreaker breaker, String serverName, McpCall call)
+            throws IOException, McpException {
+        var admission = breaker.admit();
+        if (!admission.allowed()) throw openBreakerFailure(breaker, serverName);
+        var reported = false;
+        try {
+            var result = call.invoke();
+            breaker.recordSuccess(0L, admission.probeWindow());
+            reported = true;
+            return result;
+        } catch (IOException | McpException e) {
+            breaker.recordFailure(admission.probeWindow());
+            reported = true;
+            throw e;
+        } finally {
+            // JCLAW-1185: a HALF_OPEN probe holds a permit until it reports. A throwable this
+            // method does not classify — a parse failure on a reply that did arrive — must still
+            // hand it back, or the breaker can never gather the successes it needs to close.
+            if (!reported && admission.probe()) breaker.recordSuccess(0L, admission.probeWindow());
+        }
+    }
+
+    /** JCLAW-1187: an operator's isolation is a different fact from the server failing, and says so. */
+    private static McpException openBreakerFailure(CircuitBreaker breaker, String serverName) {
+        if (breaker.stats().reason() == CircuitBreaker.Reason.MANUAL_TRIP) {
+            return new McpException.ManuallyIsolated("MCP server '" + serverName
+                    + "' was isolated by the operator: not calling it until it is restored");
+        }
+        return new McpException("MCP server '" + serverName
+                + "' is failing fast: too many recent tool-call failures");
+    }
+
+    /**
+     * What a successful (re)connect does to the server's breaker: the dead client's failures
+     * are no evidence about the fresh one, so an autonomous open is cleared — but an operator's
+     * trip is the operator's to lift (JCLAW-1187). Public so a test can drive it without a
+     * live server.
+     */
+    public static void clearUnlessIsolated(CircuitBreaker breaker) {
+        var stats = breaker.stats();
+        if (stats.state() == CircuitBreaker.State.CLOSED || stats.reason() == CircuitBreaker.Reason.MANUAL_TRIP) {
+            return;
+        }
+        breaker.reset();
+    }
+
+    /**
+     * This server's tool-call breaker, created on first use. Per-server by design:
+     * one broken server must not fail-fast a healthy one.
+     */
+    public static CircuitBreaker breaker(String serverName) {
+        return CircuitBreakers.find(BREAKER_PREFIX + serverName)
+                .orElseGet(() -> registerBreaker(serverName));
+    }
+
+    private static CircuitBreaker registerBreaker(String serverName) {
+        var name = BREAKER_PREFIX + serverName;
+        var breaker = CircuitBreakers.get(name, BREAKER_CONFIG);
+        breaker.setTransitionListener(
+                BreakerAlarms.listener(name, "MCP server '" + serverName + "'"));
+        return breaker;
+    }
+
+    /** Close an MCP client, swallowing any runtime error — used in race-recovery paths. */
+    private static void bestEffortClose(McpClient client) {
+        try { client.close(); } catch (RuntimeException _) { /* best effort */ }
+    }
+
+    // ==================== test hooks ====================
+
+    public static void setBackoff(long initialMillis, long ceilingMillis) {
+        backoffInitialMillis = initialMillis;
+        backoffCeilingMillis = ceilingMillis;
+    }
+
+    /** JCLAW-288: shrink (or restore) the first-attempt handshake timeout
+     *  for tests that need to exercise the cold-cache failure path without
+     *  waiting the production 120 s. Production code never calls this. */
+    public static void setFirstAttemptRequestTimeout(Duration timeout) {
+        firstAttemptRequestTimeout = timeout;
+    }
+
+    public static int connectionCount() { return connections.size(); }
+
+    /** Servers whose handshake has actually completed. Distinct from
+     *  {@link #connectionCount()}, which counts entries the moment a connect is
+     *  scheduled and so reads "all of them" while every one is still dialling. */
+    public static int connectedCount() {
+        return (int) connections.values().stream()
+                .filter(e -> e.status == McpServer.Status.CONNECTED)
+                .count();
+    }
+
+    /** Names of every server with an in-memory connection entry, regardless
+     *  of state. Used by {@link McpAllowlist#backfillForAgent} to know
+     *  which server scopes a new agent should be granted. */
+    public static Set<String> connectedServerNames() {
+        return Set.copyOf(connections.keySet());
+    }
+
+    // ==================== internals ====================
+
+    private static void scheduleConnect(Entry entry, McpServer server, int attempt) {
+        var delay = backoffDelay(attempt);
+        if (delay == 0) {
+            launchConnect(entry, server, attempt);
+            return;
+        }
+        var sched = scheduler;
+        if (sched == null) return;  // shutdown raced
+        entry.scheduledRetry = sched.schedule(
+                () -> launchConnect(entry, server, attempt),
+                delay, TimeUnit.MILLISECONDS);
+    }
+
+    private static void launchConnect(Entry entry, McpServer server, int attempt) {
+        // Identity, not presence: an admin toggle/config edit re-runs connectInternal, which
+        // stop()s and re-adds a fresh entry under the same name, so a containsKey check would
+        // see the live replacement and let this orphan launch. Mirrors the guard in doConnect.
+        if (connections.get(server.name) != entry) return;
+        Thread.ofVirtual().name("mcp-connect-" + server.name).start(() -> doConnect(entry, server, attempt));
+    }
+
+    // MustBeClosed: the transport and the client it wraps outlive this method by design —
+    // entry.client owns them until stop()/handleDisconnect/onTransportError closes them.
+    @SuppressWarnings("MustBeClosed")
+    private static void doConnect(Entry entry, McpServer server, int attempt) {
+        entry.status = McpServer.Status.CONNECTING;
+        persistStatus(server.id, McpServer.Status.CONNECTING, null);
+
+        McpTransport transport;
+        try {
+            transport = withDisconnectHook(buildTransport(server), server.name,
+                    () -> handleDisconnect(entry, server));
+        } catch (RuntimeException e) {
+            handleFailure(entry, server, attempt, "transport build failed: " + e.getMessage());
+            signalFirstAttemptResolved(entry, attempt);
+            return;
+        }
+
+        // JCLAW-288: the first attempt's handshake gets cold-cache install headroom (see
+        // firstAttemptRequestTimeout); by the second the cache is warm or there's a real
+        // problem, and a long timeout would only delay the failure signal. JCLAW-1191: the
+        // headroom is the handshake's alone — every tool call gets the steady-state budget.
+        var handshakeTimeout = (attempt == 0) ? firstAttemptRequestTimeout : DEFAULT_REQUEST_TIMEOUT;
+        var client = new McpClient(server.name, transport, clientVersion(), handshakeTimeout, DEFAULT_REQUEST_TIMEOUT);
+        client.onToolsChanged(tools -> republishTools(server.name, tools));
+        try {
+            client.connect();
+            // stop() may have removed this entry while connect() was in flight (operator
+            // toggled the server off or replaced its config); an orphaned doConnect would
+            // re-publish tools, re-write the allowlist and persist CONNECTED for it. That
+            // stop() already canceled the orphan's first-attempt future.
+            if (connections.get(server.name) != entry) {
+                bestEffortClose(client);
+                return;
+            }
+            // A prior client may still be attached (watchdog reconnect after onTransportError);
+            // close it before overwriting so a path that reaches scheduleConnect without a
+            // transport error cannot leak one.
+            var prior = entry.client;
+            if (prior != null && prior != client) bestEffortClose(prior);
+            entry.client = client;
+            // republishTools publishes the in-memory tool adapters AND syncs
+            // the DB-authoritative allowlist (JCLAW-32). Both must complete
+            // before status flips to CONNECTED so observers polling state
+            // (tests, admin UI) only see CONNECTED after grants are durable.
+            republishTools(server.name, client.tools());
+            entry.status = McpServer.Status.CONNECTED;
+            entry.lastError = null;
+            entry.attempts = 0;
+            // The watchdog reconnect path never goes through stop(), so clear the breaker here too.
+            clearUnlessIsolated(breaker(server.name));
+            persistStatus(server.id, McpServer.Status.CONNECTED, null);
+            persistTimestamp(server.id, "lastConnectedAt");
+            EventLogger.info(CATEGORY_CONNECT,
+                    "MCP server '%s' connected (%d tools)".formatted(server.name, client.tools().size()));
+            // An error that beat the CONNECTED publish above found the hook's
+            // guard closed, so it skipped the teardown and left a dead
+            // connection marked CONNECTED.
+            if (client.state() != McpClient.State.READY) handleDisconnect(entry, server);
+            signalFirstAttemptResolved(entry, attempt);
+        } catch (Exception e) {
+            try { client.close(); } catch (RuntimeException _) {}
+            handleFailure(entry, server, attempt, e.getMessage());
+            signalFirstAttemptResolved(entry, attempt);
+        }
+    }
+
+    /** JCLAW-288: complete the awaiter's future on the FIRST attempt's
+     *  resolution (success or failure). Subsequent attempts don't touch
+     *  the future — the awaiter only ever waits one cycle, and the
+     *  watchdog/backoff loop handles long-running reconnects. */
+    private static void signalFirstAttemptResolved(Entry entry, int attempt) {
+        if (attempt != 0) return;
+        var future = entry.firstAttemptFuture;
+        if (future != null && !future.isDone()) future.complete(null);
+    }
+
+    /**
+     * Wrap a transport so {@code hook} runs once the client has finished
+     * processing an unrecoverable transport error. That error path and
+     * manager-driven {@code close()} are the only two ways a client leaves
+     * READY, so this sees every disconnect a state poll would have. The hook
+     * gets its own VT: the caller is the transport's reader thread.
+     */
+    private static McpTransport withDisconnectHook(McpTransport delegate, String serverName, Runnable hook) {
+        return new McpTransport() {
+            @Override
+            public void start(Consumer<JsonRpc.Message> onMessage, Consumer<Throwable> onError) throws IOException {
+                delegate.start(onMessage, error -> {
+                    onError.accept(error);
+                    Thread.ofVirtual().name("mcp-disconnect-" + serverName).start(hook);
+                });
+            }
+
+            @Override
+            public void send(JsonRpc.Message msg) throws IOException {
+                delegate.send(msg);
+            }
+
+            @Override
+            public void close() {
+                delegate.close();
+            }
+        };
+    }
+
+    /**
+     * Tear a dead connection down and re-arm the backoff loop. The CONNECTED
+     * guard under the entry monitor admits exactly one teardown per connect
+     * cycle, so the transport-error hook and {@link #doConnect}'s post-publish
+     * re-check cannot start two competing backoff chains for one entry.
+     */
+    private static void handleDisconnect(Entry entry, McpServer server) {
+        McpClient client;
+        synchronized (entry.teardownLock) {
+            // Identity, not presence: an admin toggle/delete replaces the entry
+            // under the same name, and this orphan must not unpublish the live
+            // replacement's tools or clobber its row.
+            if (connections.get(server.name) != entry) return;
+            if (entry.status != McpServer.Status.CONNECTED) return;  // already torn down, or not yet published
+            client = entry.client;
+            if (client == null || client.state() == McpClient.State.READY) return;  // false alarm
+            entry.status = McpServer.Status.DISCONNECTED;
+        }
+        ToolRegistry.unpublishExternal(server.name);
+        clearAllowlistAndAudit(server.name);
+        EventLogger.warn(CATEGORY_DISCONNECT,
+                "MCP server '%s' disconnected: %s".formatted(server.name, client.lastError()));
+        entry.lastError = client.lastError();
+        persistStatus(server.id, McpServer.Status.DISCONNECTED, client.lastError());
+        persistTimestamp(server.id, TIMESTAMP_LAST_DISCONNECTED);
+        // Re-check identity: a toggle/delete during the teardown above would leave this
+        // orphan racing the live replacement's own backoff loop for the same server name.
+        if (connections.get(server.name) != entry) return;
+        scheduleConnect(entry, server, entry.attempts + 1);
+    }
+
+    private static void handleFailure(Entry entry, McpServer server, int attempt, @Nullable String error) {
+        // Identity guard before any mutation — the catch-path counterpart to doConnect's
+        // success-path check: an orphaned failure must not unpublish the live replacement's
+        // tools, clobber its DB row or delete its allowlist rows. The caller already closed
+        // its own client, so nothing leaks by returning here.
+        if (connections.get(server.name) != entry) return;
+        var hadConnection = entry.client != null;
+        if (entry.client != null) {
+            try { entry.client.close(); } catch (RuntimeException _) {}
+            entry.client = null;
+        }
+        ToolRegistry.unpublishExternal(server.name);
+        if (hadConnection) clearAllowlistAndAudit(server.name);
+        entry.status = McpServer.Status.ERROR;
+        entry.lastError = error;
+        entry.attempts = attempt + 1;
+        persistStatus(server.id, McpServer.Status.ERROR, error);
+        if (hadConnection) {
+            EventLogger.warn(CATEGORY_DISCONNECT,
+                    "MCP server '%s' disconnected: %s".formatted(server.name, error));
+            persistTimestamp(server.id, TIMESTAMP_LAST_DISCONNECTED);
+        } else {
+            EventLogger.warn(CATEGORY_CONNECT,
+                    "MCP server '%s' connect attempt %d failed: %s".formatted(
+                            server.name, attempt + 1, error));
+        }
+        scheduleConnect(entry, server, attempt + 1);
+    }
+
+    private static void republishTools(String serverName, List<McpToolDef> defs) {
+        // JCLAW-281: the server-level handle is the one entry per server the LLM sees; the
+        // per-action adapters stay registered as McpServerTool's execution path but are hidden
+        // from the function-calling defs by Tool.isServerLevel + ToolRegistry.getToolDefsForAgent.
+        // Handle first so iteration order keeps the admin UI's per-server card grouping intact.
+        var tools = new ArrayList<ToolRegistry.Tool>(defs.size() + 1);
+        tools.add(new McpServerTool(serverName));
+        for (var def : defs) {
+            tools.add(new McpToolAdapter(serverName, def, McpConnectionManager::callTool));
+        }
+        ToolRegistry.publishExternal(serverName, tools);
+        // JCLAW-32: keep the DB-authoritative allowlist in sync with the
+        // in-memory ToolRegistry on every tool-list change. Idempotent —
+        // McpAllowlist.registerForAllAgents clears the prior set first so
+        // a shrinking tool list doesn't leave orphaned grants.
+        try {
+            Tx.run(() -> McpAllowlist.registerForAllAgents(serverName, defs));
+        } catch (RuntimeException e) {
+            EventLogger.warn("MCP_TOOL_REGISTER",
+                    "Allowlist sync failed for '%s': %s".formatted(serverName, e.getMessage()));
+        }
+    }
+
+    /** Atomic delete-and-audit: drop every allowlist row for this server in
+     *  the same tx as the {@code MCP_TOOL_UNREGISTER} log entry, so the
+     *  audit trail can never disagree with the live row state. Used by
+     *  every disconnect path: explicit {@link #stop}, watchdog teardown,
+     *  and connect-failure rollback. */
+    private static void clearAllowlistAndAudit(String serverName) {
+        // During graceful shutdown JPA is tearing down, so this DELETE cannot begin a
+        // transaction — and it is redundant: the next boot's registerForAllAgents clears the
+        // prior set first, and nothing can use the grants while the app is down. Skipping it
+        // avoids a spurious "begin transaction failed" WARN; runtime disconnects still revoke.
+        if (EventLogger.isShuttingDown()) return;
+        try {
+            Tx.run(() -> {
+                int removed = McpAllowlist.unregister(serverName);
+                if (removed == 0) return;
+                var ev = new EventLog();
+                ev.timestamp = AppClock.now();
+                ev.level = "INFO";
+                ev.category = "MCP_TOOL_UNREGISTER";
+                ev.message = "Removed %d MCP allowlist row(s) for server '%s'"
+                        .formatted(removed, serverName);
+                ev.save();
+            });
+        } catch (RuntimeException e) {
+            EventLogger.warn("MCP_TOOL_UNREGISTER",
+                    "Failed to clear allowlist for '%s': %s".formatted(serverName, e.getMessage()));
+        }
+    }
+
+    private static long backoffDelay(int attempt) {
+        if (attempt <= 0) return 0;
+        long delay = backoffInitialMillis << Math.min(attempt - 1, 30);  // 2^(attempt-1) * initial, capped to avoid overflow
+        return Math.min(delay, backoffCeilingMillis);
+    }
+
+    // Suppressed in the body only: MustBeClosed does not treat a `yield` from a switch
+    // block arm as a return position (a plain `->` arm it does). Callers stay checked —
+    // the @MustBeClosed contract on this method is what the suppression does not touch.
+    @MustBeClosed
+    @SuppressWarnings("MustBeClosed")
+    private static McpTransport buildTransport(McpServer server) {
+        var cfg = JsonParser.parseString(server.configJson).getAsJsonObject();
+        return switch (server.transport) {
+            case STDIO -> {
+                var command = stringList(cfg, "command", "args");
+                var env = stringMap(cfg, "env");
+                yield new McpStdioTransport(server.name, command, env);
+            }
+            case HTTP -> {
+                var url = cfg.get("url").getAsString();
+                var headers = stringMap(cfg, "headers");
+                yield new McpStreamableHttpTransport(server.name, URI.create(url), headers);
+            }
+        };
+    }
+
+    private static List<String> stringList(JsonObject cfg, String firstKey, String restKey) {
+        var out = new ArrayList<String>();
+        if (cfg.has(firstKey)) out.add(cfg.get(firstKey).getAsString());
+        if (cfg.has(restKey) && cfg.get(restKey).isJsonArray()) {
+            for (JsonElement el : cfg.getAsJsonArray(restKey)) out.add(el.getAsString());
+        }
+        return out;
+    }
+
+    private static Map<String, String> stringMap(JsonObject cfg, String key) {
+        if (!cfg.has(key) || !cfg.get(key).isJsonObject()) return Map.of();
+        var map = new HashMap<String, String>();
+        for (var entry : cfg.getAsJsonObject(key).entrySet()) {
+            map.put(entry.getKey(), entry.getValue().getAsString());
+        }
+        return map;
+    }
+
+    /**
+     * Persist a status field with a partial JPQL UPDATE — never load + save
+     * the entity. The connector's persist calls run in their own VTs, in
+     * separate transactions from the controller that just toggled
+     * {@code enabled}. If we used {@code findById + setField + save()},
+     * Hibernate would write back ALL fields of the loaded entity from the
+     * connector's tx, which would race with the controller's pending
+     * {@code enabled=true} update. The lost-update bug surfaced as
+     * "row stays enabled=false even after toggling on" because
+     * persistStatus would load the pre-controller-commit row state and
+     * re-save it. Targeted UPDATE statements only touch the column we
+     * want, so concurrent enabled/configJson changes can't be clobbered.
+     */
+    private static void persistStatus(Long serverId, McpServer.Status status, @Nullable String error) {
+        if (serverId == null) return;
+        var truncated = error != null && error.length() > 500 ? error.substring(0, 500) : error;
+        try {
+            Tx.run(() -> JPA.em().createQuery(
+                        "UPDATE McpServer s SET s.status = :status, s.lastError = :err, s.updatedAt = :now WHERE s.id = :id")
+                        .setParameter("status", status)
+                        .setParameter("err", truncated)
+                        .setParameter("now", AppClock.now())
+                        .setParameter("id", serverId)
+                        .executeUpdate());
+        } catch (RuntimeException _) { /* best effort persistence */ }
+    }
+
+    /** Stamp a timestamp column to now(). {@code column} selects a fully-static JPQL string —
+     *  nothing is concatenated into the query and an unknown column is rejected, so even a
+     *  tainted caller value has no injection surface. Best-effort like its siblings: swallows
+     *  persistence failures and an unsupported column alike. */
+    private static void persistTimestamp(Long serverId, String column) {
+        if (serverId == null) return;
+        try {
+            String jpql = switch (column) {
+                case "lastConnectedAt" ->
+                        "UPDATE McpServer s SET s.lastConnectedAt = :now, s.updatedAt = :now WHERE s.id = :id";
+                case TIMESTAMP_LAST_DISCONNECTED ->
+                        "UPDATE McpServer s SET s.lastDisconnectedAt = :now, s.updatedAt = :now WHERE s.id = :id";
+                default -> throw new IllegalArgumentException("Unsupported timestamp column: " + column);
+            };
+            Tx.run(() -> JPA.em().createQuery(jpql)
+                        .setParameter("now", AppClock.now())
+                        .setParameter("id", serverId)
+                        .executeUpdate());
+        } catch (RuntimeException _) { /* best effort persistence */ }
+    }
+
+    private static synchronized void ensureScheduler() {
+        if (scheduler == null || scheduler.isShutdown()) {
+            // Two platform threads — small, plenty for backoff-timer fan-out;
+            // platform deliberately (NOT virtual) to dodge JDK-8373224.
+            scheduler = Executors.newScheduledThreadPool(2, r -> {
+                var t = new Thread(r);
+                t.setName("mcp-backoff-" + t.threadId());
+                t.setDaemon(true);
+                return t;
+            });
+        }
+    }
+
+    private static String clientVersion() {
+        var v = Play.configuration.getProperty("application.version");
+        return v != null ? v : CLIENT_VERSION_FALLBACK;
+    }
+
+    /** Per-server runtime state. Lives in {@link #connections}. */
+    private static final class Entry {
+        /** Monitor for the teardown guard in {@link #handleDisconnect}. Dedicated rather than
+         *  the Entry itself so the lock cannot be acquired by anything that merely holds the
+         *  reference, and so the guarded state is named at the lock site. */
+        final Object teardownLock = new Object();
+        // McpClient manages its own internal thread-safety (state via AtomicReference,
+        // ConcurrentHashMap for pending requests); volatile here just publishes the
+        // reference. Likewise ScheduledFuture is thread-safe by JDK contract.
+        @SuppressWarnings("java:S3077")
+        volatile @Nullable McpClient client;
+        volatile McpServer.Status status = McpServer.Status.DISCONNECTED;
+        volatile @Nullable String lastError;
+        volatile int attempts;
+        /** JCLAW-388: per-server interactive-approval flag, captured from the
+         *  {@link McpServer} row at connect time. Read on the tool-dispatch
+         *  path via {@link #requiresApproval(String)}; volatile so a
+         *  reconnect that replaces the entry publishes a fresh value. */
+        volatile boolean requiresApproval;
+        @SuppressWarnings("java:S3077")
+        volatile @Nullable ScheduledFuture<?> scheduledRetry;
+        /** JCLAW-288: when non-null, completed on the FIRST attempt's
+         *  resolution (success or failure). Populated by
+         *  {@link #connectAndAwait}; left null for fire-and-forget
+         *  {@link #connect}. CompletableFuture is itself thread-safe;
+         *  this volatile only publishes the reference. */
+        @SuppressWarnings("java:S3077")
+        volatile @Nullable CompletableFuture<Void> firstAttemptFuture;
+    }
+}

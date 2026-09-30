@@ -1,0 +1,1022 @@
+package tools;
+
+import agents.AgentRunner;
+import agents.DangerousActionGate;
+import com.agentclientprotocol.sdk.client.AcpClient;
+import com.agentclientprotocol.sdk.client.AcpSyncClient;
+import com.agentclientprotocol.sdk.client.transport.AgentParameters;
+import com.agentclientprotocol.sdk.client.transport.StdioAcpClientTransport;
+import com.agentclientprotocol.sdk.spec.AcpSchema;
+import com.google.gson.JsonObject;
+import llm.ProviderRegistry;
+import models.Agent;
+import models.Conversation;
+import models.Message;
+import models.MessageRole;
+import models.SubagentRun;
+import org.jspecify.annotations.Nullable;
+import services.AcpCapabilityCatalog;
+import services.AgentService;
+import services.ConfigService;
+import services.ConversationService;
+import services.EventLogger;
+import services.NotificationBus;
+import services.SubagentRegistry;
+import services.Tx;
+import utils.ChannelOriginTrust;
+import utils.GsonHolder;
+import utils.SubprocessEnv;
+
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
+
+/**
+ * JCLAW-677 / JCLAW-499: external-harness ({@code runtime=acp}) integration,
+ * extracted from {@link SubagentSpawnTool}. Runtime validation, the per-run
+ * harness command registry, channel-approval gating, workdir resolution, and the
+ * batch / streaming / rpc launch + line-parse machinery. The native
+ * {@link AgentRunner} path also flows through {@link #executeChildRun}.
+ */
+final class SubagentAcpRunner {
+
+    private static final String NO_OUTPUT = "(no output)";
+    private static final String ACP_EXIT_MSG = "ACP harness exited %d: %s";
+    private static final int ACP_MAX_OUTPUT_BYTES = 400_000;
+
+    // Recognized harness ids. "pi"/"claude" have dedicated streaming adapters;
+    // "codex"/"gemini"/"opencode" are valid ids without a dedicated adapter yet —
+    // they run via the batch/generic path (an unregistered id degrades to batch,
+    // never errors) until a bespoke adapter lands. "generic" is the fallback.
+    private static final Set<String> ACP_HARNESS_IDS =
+            Set.of("pi", "claude", "codex", "gemini", "opencode", "antigravity",
+                    SubagentSpawnTool.DEFAULT_ACP_HARNESS);
+    private static final Set<String> ACP_MODES = Set.of(SubagentSpawnTool.DEFAULT_ACP_MODE, "json", "rpc");
+
+    /** JCLAW-499: the per-spawn external-harness launch for a run, set when
+     *  runtime=acp, consumed once by {@link #executeChildRun}. */
+    static final ConcurrentHashMap<Long, AcpLaunch> ACP_RUNS = new ConcurrentHashMap<>();
+
+    /** What a {@code runtime=acp} spawn resolved at validation time: the operator's harness
+     *  command and, when one applies, the provider/model the harness is pinned to. */
+    record AcpLaunch(List<String> command, @Nullable HarnessModel model) {}
+
+    /** Reply text a run has streamed since its last non-token event. Tokens reach the chat
+     *  one by one (Rail A); the monitor and the transcript get the block as one {@code
+     *  token} event when a non-token event or the run's end closes it (JCLAW-662 replay
+     *  otherwise held one row per token — 73 rows for a two-line reply). */
+    private static final ConcurrentHashMap<Long, TokenBlock> PENDING_TOKENS = new ConcurrentHashMap<>();
+
+    private static final class TokenBlock {
+        private final int firstSeq;
+        private final StringBuilder text = new StringBuilder();
+
+        private TokenBlock(int firstSeq) {
+            this.firstSeq = firstSeq;
+        }
+    }
+
+    /** JCLAW-659: harness-id → adapter registry. JCLAW-660 seeds the {@code pi}
+     *  (streaming JSONL) and {@code generic} (line-tail) adapters; JCLAW-667 adds
+     *  the {@code claude} (streaming NDJSON) adapter; the {@code codex} adapter
+     *  lands in a later JCLAW-657 story. */
+    private static final Map<String, HarnessAdapter> HARNESS_ADAPTERS = new ConcurrentHashMap<>();
+
+    static {
+        registerAdapter("pi", new PiAdapter());
+        registerAdapter("claude", new ClaudeAdapter());
+        registerAdapter(SubagentSpawnTool.DEFAULT_ACP_HARNESS, new GenericAdapter());
+    }
+
+    private SubagentAcpRunner() {}
+
+    /** JCLAW-660: folds a harness event stream into a single reply — a RESULT
+     *  frame wins, else concatenated TOKEN output, else the STEP log. */
+    private static final class ReplyAccumulator {
+        private final StringBuilder tokens = new StringBuilder();
+        private final StringBuilder steps = new StringBuilder();
+        private @Nullable String resultText;
+
+        void fold(HarnessEvent ev) {
+            switch (ev.kind()) {
+                case HarnessEvent.TOKEN -> tokens.append(ev.text());
+                case HarnessEvent.RESULT -> resultText = ev.text();
+                case HarnessEvent.STEP -> {
+                    if (!steps.isEmpty()) steps.append('\n');
+                    steps.append(ev.text());
+                }
+                default -> { /* tool_call / error dispatched but not part of the reply */ }
+            }
+        }
+
+        String reply() {
+            if (resultText != null && !resultText.isBlank()) return resultText;
+            if (!tokens.isEmpty()) return tokens.toString();
+            return steps.toString();
+        }
+    }
+
+    /** JCLAW-659: register a harness adapter under a harness id (see
+     *  {@link #ACP_HARNESS_IDS}). Called by later stories' adapter classes. */
+    static void registerAdapter(String id, HarnessAdapter adapter) {
+        HARNESS_ADAPTERS.put(id, adapter);
+    }
+
+    /**
+     * JCLAW-669: a coding-harness run whose ORIGIN is an unsafe channel (anything
+     * but web chat) must be operator-approved before the process launches — an
+     * inbound Telegram/Slack message can prompt-inject an agent into spawning
+     * arbitrary code execution. Web spawns pass untouched (the pi -p / claude -p
+     * uninterrupted contract); Telegram/Slack route through DangerousActionGate;
+     * other channels follow tool.approval.offChannelPolicy. Throws on denial.
+     *
+     * <p>JCLAW-1021: a run with no parent conversation is unrecorded, not trusted, so it
+     * goes through the gate as well — which resolves it against the task-fire origin
+     * bound by {@link agents.DangerousActionGate#withFireOrigin} when there is one.
+     */
+    private static void enforceChannelApproval(Long runId, Agent childAgent, String task) {
+        // effectiveOrigin, not the parent conversation's channelType directly: outside a chat turn it is
+        // picked by recency (SubagentChildBootstrap.resolveParentConversation), so inside an untrusted fire it is
+        // typically the operator's own web row — reading it directly would hand a spawned run
+        // operator trust one hop out of the fire that must have floored it.
+        var originChannel = DangerousActionGate.effectiveOrigin(parentConversationId(runId));
+        if (ChannelOriginTrust.isOperatorOrigin(originChannel)) return;
+        var decision = DangerousActionGate.guardHarnessPermission(
+                childAgent, parentConversationId(runId), "coding_harness_run", task);
+        var approved = decision == DangerousActionGate.Decision.PROCEED;
+        dispatchHarnessEvent(runId, new HarnessEvent(
+                approved ? HarnessEvent.STEP : HarnessEvent.ERROR,
+                "channel approval (%s): coding run %s".formatted(
+                        originChannel, approved ? "approved" : "denied"),
+                null), 0);
+        if (!approved) {
+            throw new IllegalStateException(
+                    ("coding harness run denied: origin channel '%s' requires operator "
+                            + "approval and it was not granted").formatted(originChannel));
+        }
+    }
+
+    /**
+     * JCLAW-499: run the child body — the configured external harness
+     * ({@code runtime:"acp"}) when an ACP command was registered for this run,
+     * otherwise the native {@link AgentRunner}. Shared by the sync and detached
+     * dispatch paths so ACP composes with sync, async, and batch fan-out.
+     */
+    static AgentRunner.RunResult executeChildRun(Long runId, Agent childAgent,
+                                                 Conversation childConv, String task, boolean inlineMode) {
+        var launch = ACP_RUNS.remove(runId);
+        if (launch != null) {
+            var acpCommand = launch.command();
+            var model = launch.model();
+            var harnessId = resolveHarnessId();
+            // JCLAW-669: gate an unsafe-origin run before the process launches (see
+            // enforceChannelApproval for the per-channel policy).
+            enforceChannelApproval(runId, childAgent, task);
+            // JCLAW-657 (finding A): scope the harness's cwd to a configured
+            // workdir or the child agent's workspace instead of the backend's
+            // CWD. This ORGANIZES output; it does not confine the process —
+            // containment is JCLAW-669/670/671 (channel gating, permission
+            // flags, sandboxing). acpAllowed is the security boundary today.
+            var workdir = resolveAcpWorkdir(childAgent, task);
+            recordWorkdir(runId, workdir);
+            // Stage 2: if the configured harness speaks real ACP (natively or via
+            // a detected adapter) over stdio, drive it over the protocol via the
+            // acp-core SDK instead of the stdin/stdout wrapper — real streaming +
+            // mid-run permission prompts through the gate. WebSocket-only harnesses
+            // (opencode) and ones whose ACP binary isn't installed fall through to
+            // the batch/streaming path below.
+            var acpLaunch = AcpCapabilityCatalog.stdioAcpLaunchCommand(harnessId);
+            // The override is bound differently per launch path (see HarnessModelBinding);
+            // one transcript step records which model the run actually asked for. Seq -1
+            // keeps it ahead of the seq-0 channel-approval step in the monitor's order.
+            if (model != null) {
+                dispatchHarnessEvent(runId, new HarnessEvent(HarnessEvent.STEP,
+                        HarnessModelBinding.describe(harnessId, model, acpLaunch != null), null), -1);
+            }
+            var env = model == null ? Map.<String, String>of() : HarnessModelBinding.env(harnessId, model);
+            if (acpLaunch != null) {
+                return runAcpSdk(runId, acpLaunch, task, childAgent, workdir, model, env);
+            }
+            var modelArgs = model == null ? List.<String>of() : HarnessModelBinding.wrapperArgs(harnessId, model);
+            // JCLAW-660: batch stays one-shot; json/rpc stream the harness output
+            // line-by-line through the selected adapter.
+            var mode = resolveAcpMode();
+            if (SubagentSpawnTool.DEFAULT_ACP_MODE.equals(mode)) {
+                return runAcpBatch(runId, concat(acpCommand, modelArgs), task, workdir, env);
+            }
+            var adapter = resolveAdapter();
+            if (adapter == null) {
+                // No adapter registered for the configured harness — degrade to the
+                // one-shot batch path rather than fail the run.
+                return runAcpBatch(runId, concat(acpCommand, modelArgs), task, workdir, env);
+            }
+            // JCLAW-665: rpc mode against a harness that advertises a bidirectional
+            // session routes the harness's mid-run permission requests through the
+            // operator approval gate (decision written back on stdin). Strictly
+            // capability-gated: any non-bidirectional harness — or json mode — falls
+            // back to one-way streaming.
+            if ("rpc".equals(mode) && adapter.capabilities().bidirectional()) {
+                return runAcpRpc(runId, acpCommand, task, adapter, childAgent, workdir, modelArgs, env);
+            }
+            return runAcpStreaming(acpCommand, task, runId, adapter, workdir, modelArgs, env);
+        }
+        if (inlineMode) {
+            // JCLAW-267: inline runs in the parent Conversation (queue owned), with
+            // a ThreadLocal marker stamping every Message AgentRunner persists.
+            return ConversationService.withSubagentRunIdMarker(runId,
+                    () -> AgentRunner.runWithOwnedQueue(childAgent, childConv, task));
+        }
+        return AgentRunner.run(childAgent, childConv, task);
+    }
+
+    /**
+     * JCLAW-657 (finding A): resolve the directory the acp harness process runs
+     * in. An operator-set {@link SubagentSpawnTool#ACP_WORKDIR_KEY} wins; otherwise
+     * the child agent's own workspace, so a real coding harness (whose file writes
+     * are outside JClaw's tool confinement) is scoped there rather than the
+     * backend's CWD. Returns {@code null} — inherit the server CWD — only when
+     * neither is resolvable or the directory can't be created.
+     */
+    private static @Nullable File resolveAcpWorkdir(Agent childAgent, String task) {
+        var configured = ConfigService.get(SubagentSpawnTool.ACP_WORKDIR_KEY);
+        Path dir;
+        if (configured != null && !configured.isBlank()) {
+            dir = Path.of(configured.strip());
+        } else if (childAgent != null && childAgent.name != null) {
+            // JCLAW-666: each coding session gets its own directory under the
+            // agent workspace's coding/ parent, named from the task ("create
+            // fibonacci program" -> coding/create-fibonacci-program/). An
+            // existing directory is never reused — collisions get -2, -3, …
+            // so consecutive sessions' artifacts don't interleave.
+            var base = AgentService.workspacePath(childAgent.name).resolve("coding");
+            var slug = SubagentSpawnTool.codingSlug(task);
+            dir = base.resolve(slug);
+            for (int n = 2; Files.exists(dir); n++) {
+                dir = base.resolve(slug + "-" + n);
+            }
+        } else {
+            return null;
+        }
+        try {
+            Files.createDirectories(dir);
+        } catch (IOException e) {
+            EventLogger.warn(SubagentSpawnTool.SUBAGENT_CHANNEL, null, null,
+                    "acp workdir '%s' could not be created (%s); harness inherits the server CWD"
+                            .formatted(dir, e.getMessage()));
+            return null;
+        }
+        return dir.toFile();
+    }
+
+    /** JCLAW-666: persist the resolved session directory on the run row so the
+     *  operator and the CodingRunMonitor can find the coding artifacts (they
+     *  live in the workspace, not in MessageAttachment). Best-effort. */
+    private static void recordWorkdir(Long runId, @Nullable File workdir) {
+        if (runId == null || workdir == null) return;
+        try {
+            Tx.run(() -> {
+                SubagentRun run = SubagentRun.findById(runId);
+                if (run != null) {
+                    run.workdir = workdir.getAbsolutePath();
+                    run.save();
+                }
+                return null;
+            });
+        } catch (RuntimeException e) {
+            EventLogger.warn(SubagentSpawnTool.SUBAGENT_CHANNEL, null, null,
+                    "could not record acp workdir on run %d: %s".formatted(runId, e.getMessage()));
+        }
+    }
+
+    /**
+     * JCLAW-499: run an external agent harness (Codex / Claude / Gemini CLI, …)
+     * one-shot ({@code subagent.acp.mode=batch}): launch the operator-configured
+     * command, deliver {@code task} on stdin, and capture stdout (bounded) as the
+     * child reply. Bounded by the wall-clock ceiling — a runaway harness is
+     * force-killed. A non-zero exit raises with the harness's stderr so the spawn
+     * records a FAILED outcome.
+     */
+    private static AgentRunner.RunResult runAcpBatch(Long runId, List<String> command, String task,
+                                                     @Nullable File workdir, Map<String, String> env) {
+        Process proc = null;
+        try {
+            // JCLAW-672: batch mode has no streaming adapter; sandbox with the
+            // generic (no HOME allowances) profile when enabled. JCLAW-709: pass
+            // the origin trust so the untrusted-only mode can confine this run.
+            var launched = HarnessSandbox.wrap(
+                    command, workdir, new GenericAdapter(), sandboxTrustedOrigin(runId));
+            var pb = new ProcessBuilder(launched);
+            if (workdir != null) pb.directory(workdir);
+            SubprocessEnv.apply(pb, env);   // JCLAW-779: strip inherited host secrets; the model-override env wins
+            proc = pb.start();
+            // JCLAW-664: track the live process so SubagentRegistry.kill (and the
+            // idle/ceiling timeout via requestStop) can force-terminate it and its
+            // descendants instead of leaving it orphaned.
+            SubagentRegistry.registerProcess(runId, proc);
+            try (var stdin = proc.getOutputStream()) {
+                stdin.write(task.getBytes(StandardCharsets.UTF_8));
+                stdin.flush();
+            }
+            var out = drainAsync(proc.getInputStream());
+            var err = drainAsync(proc.getErrorStream());
+            int ceiling = ConfigService.getInt(SubagentSpawnTool.MAX_WALLCLOCK_KEY,
+                    SubagentSpawnTool.DEFAULT_MAX_WALLCLOCK_SECONDS);
+            boolean done;
+            if (ceiling <= 0) {
+                proc.waitFor();   // no ceiling configured — wait until the harness exits
+                done = true;
+            } else {
+                done = proc.waitFor(ceiling, TimeUnit.SECONDS);
+            }
+            if (!done) {
+                proc.destroyForcibly();
+                throw new IllegalStateException("ACP harness exceeded the %ds ceiling and was killed.".formatted(ceiling));
+            }
+            return finishAcpRun(proc, out, err);
+        } catch (InterruptedException e) {
+            // proc is non-null here: InterruptedException only comes from waitFor(),
+            // which runs after ProcessBuilder.start() above has already succeeded.
+            proc.destroyForcibly();
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Interrupted awaiting the ACP harness.", e);
+        } catch (IOException | ExecutionException | TimeoutException e) {
+            if (proc != null) proc.destroyForcibly();
+            throw new IllegalStateException("ACP harness failed: " + e.getMessage(), e);
+        } finally {
+            SubagentHarnessPermissions.evictStdinLock(runId);
+            SubagentRegistry.unregisterProcess(runId);
+        }
+    }
+
+    /**
+     * JCLAW-660: run an external harness in streaming mode ({@code
+     * subagent.acp.mode=json|rpc}). Launch the argv the {@code adapter} builds,
+     * deliver {@code task} on stdin when the adapter left it out of the argv, then
+     * read stdout LINE BY LINE — each line is parsed into a {@link HarnessEvent}
+     * and fanned out via {@link #dispatchHarnessEvent} while the reply text
+     * accumulates. Same guardrails as {@link #runAcpBatch}: the {@link
+     * #ACP_MAX_OUTPUT_BYTES} output cap, the wall-clock ceiling, and {@code
+     * destroyForcibly} on either overrun. A non-zero exit raises with the
+     * harness's stderr so the spawn records a FAILED outcome.
+     */
+    private static AgentRunner.RunResult runAcpStreaming(List<String> command, String task,
+                                                         Long runId, HarnessAdapter adapter, @Nullable File workdir,
+                                                         List<String> modelArgs, Map<String, String> env) {
+        var argv = concat(SubagentSpawnTool.withPermissionArgs(adapter, adapter.launchArgs(command, task)), modelArgs);
+        // The adapter delivers the task on stdin unless it placed it in the argv.
+        boolean taskOnStdin = !argv.contains(task);
+        Process proc = null;
+        try {
+            var pb = new ProcessBuilder(
+                    HarnessSandbox.wrap(argv, workdir, adapter, sandboxTrustedOrigin(runId)));
+            if (workdir != null) pb.directory(workdir);
+            SubprocessEnv.apply(pb, env);   // JCLAW-779: strip inherited host secrets; the model-override env wins
+            proc = pb.start();
+            // JCLAW-664: track the live process so SubagentRegistry.kill and the
+            // idle/ceiling timeout (via requestStop) can force-terminate it and
+            // its descendants — the harness has no cooperative checkpoint.
+            SubagentRegistry.registerProcess(runId, proc);
+            try (var stdin = proc.getOutputStream()) {
+                if (taskOnStdin) {
+                    stdin.write(task.getBytes(StandardCharsets.UTF_8));
+                    stdin.flush();
+                }
+            }
+            var err = drainAsync(proc.getErrorStream());
+            var reply = streamStdout(proc, runId, adapter, null);
+            // JCLAW-664: the idle + wall-clock budgets are enforced by the outer
+            // awaitFuture — each streamed line resets the idle clock (touch(), see
+            // streamStdout), and on idle/ceiling expiry stopChildOnTimeout calls
+            // requestStop, which destroys this process and records TIMEOUT with the
+            // partial transcript. So wait unbounded here: a timeout or a kill
+            // destroys the process, which unblocks this waitFor.
+            proc.waitFor();
+            return finishAcpRun(proc, reply, err);
+        } catch (InterruptedException e) {
+            // proc is non-null here: InterruptedException only comes from waitFor(),
+            // which runs after ProcessBuilder.start() above has already succeeded.
+            proc.destroyForcibly();
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Interrupted awaiting the ACP harness.", e);
+        } catch (IOException | ExecutionException | TimeoutException e) {
+            if (proc != null) proc.destroyForcibly();
+            throw new IllegalStateException("ACP harness failed: " + e.getMessage(), e);
+        } finally {
+            SubagentRegistry.unregisterProcess(runId);
+        }
+    }
+
+    /**
+     * JCLAW-665: run an external harness in bidirectional rpc mode ({@code
+     * subagent.acp.mode=rpc}) against an adapter that advertises {@code
+     * capabilities().bidirectional()}. Same launch + line-streaming machinery as
+     * {@link #runAcpStreaming}, with one addition: stdin is kept OPEN for the whole
+     * run, and each parsed line is inspected for a permission-request frame (see
+     * {@link SubagentHarnessPermissions#detectPermission}). A detected request is
+     * routed through {@link agents.DangerousActionGate#guardHarnessPermission} for
+     * operator approval and the approve/deny decision is written back to the
+     * harness on stdin — a denial cleanly aborts just that action, leaving the run
+     * itself alive (no {@code destroyForcibly}). Non-bidirectional harnesses never
+     * reach here; {@link #executeChildRun} falls them back to one-way
+     * {@link #runAcpStreaming}.
+     */
+    private static AgentRunner.RunResult runAcpRpc(Long runId, List<String> command, String task,
+                                                   HarnessAdapter adapter, Agent childAgent, @Nullable File workdir,
+                                                   List<String> modelArgs, Map<String, String> env) {
+        var argv = concat(SubagentSpawnTool.withPermissionArgs(adapter, adapter.launchArgs(command, task)), modelArgs);
+        boolean taskOnStdin = !argv.contains(task);
+        // Route approval prompts to the PARENT conversation — the child's own
+        // conversation is channelType="subagent" with no approval surface, so a
+        // Telegram/Slack prompt must reach the operator where they're watching.
+        var conversationId = parentConversationId(runId);
+        Process proc = null;
+        OutputStream stdin = null;
+        try {
+            var pb = new ProcessBuilder(
+                    HarnessSandbox.wrap(argv, workdir, adapter, sandboxTrustedOrigin(runId)));
+            if (workdir != null) pb.directory(workdir);
+            SubprocessEnv.apply(pb, env);   // JCLAW-779: strip inherited host secrets; the model-override env wins
+            proc = pb.start();
+            // JCLAW-664: track the live process so the kill / idle-timeout paths can
+            // force-terminate it and its descendants.
+            SubagentRegistry.registerProcess(runId, proc);
+            // JCLAW-665: unlike batch/streaming (which close stdin right after the
+            // task), rpc keeps it OPEN so permission decisions can be written back
+            // mid-run. Not a try-with-resources — closed in the finally.
+            stdin = proc.getOutputStream();
+            if (taskOnStdin) {
+                stdin.write((task + "\n").getBytes(StandardCharsets.UTF_8));
+                stdin.flush();
+            }
+            var err = drainAsync(proc.getErrorStream());
+            final var stdinRef = stdin;
+            var reply = streamStdout(proc, runId, adapter,
+                    ev -> SubagentHarnessPermissions.arbitratePermission(ev, stdinRef, runId, childAgent, conversationId));
+            // See runAcpStreaming: the outer awaitFuture enforces the idle/ceiling
+            // budgets and force-kills on expiry, which unblocks this waitFor.
+            proc.waitFor();
+            return finishAcpRun(proc, reply, err);
+        } catch (InterruptedException e) {
+            // proc is non-null here: InterruptedException only comes from waitFor(),
+            // which runs after ProcessBuilder.start() above has already succeeded.
+            proc.destroyForcibly();
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Interrupted awaiting the ACP harness.", e);
+        } catch (IOException | ExecutionException | TimeoutException e) {
+            if (proc != null) proc.destroyForcibly();
+            throw new IllegalStateException("ACP harness failed: " + e.getMessage(), e);
+        } finally {
+            SubagentHarnessPermissions.closeQuietly(stdin);
+            SubagentRegistry.unregisterProcess(runId);
+        }
+    }
+
+    /**
+     * Stage 2: drive an ACP-capable harness over the real Agent Client Protocol
+     * via the {@code acp-core} SDK, instead of the one-shot stdin/stdout wrapper.
+     * The SDK's stdio transport owns the (sandboxed) subprocess and speaks
+     * JSON-RPC over its pipes; we map its {@code session/update} stream onto the
+     * run rails ({@link #dispatchHarnessEvent}), route its {@code
+     * session/request_permission} requests through {@link
+     * agents.DangerousActionGate}, and decline fs/terminal capabilities so the
+     * harness keeps its own {@link HarnessSandbox}-wrapped filesystem access.
+     * Kill/timeout closes the client (registered as a {@link
+     * SubagentRegistry#registerCloser closer}), tearing down the transport +
+     * subprocess and unblocking the blocking {@code prompt()}.
+     */
+    private static AgentRunner.RunResult runAcpSdk(Long runId, String acpCommand, String task,
+                                                   Agent childAgent, @Nullable File workdir,
+                                                   @Nullable HarnessModel model, Map<String, String> env) {
+        var conversationId = parentConversationId(runId);
+        var acc = new ReplyAccumulator();
+        var thoughts = new AcpThoughtCoalescer();
+        var seq = new AtomicInteger(1);   // seq 0 is the channel-approval step (when gated)
+        var harnessId = resolveHarnessId();
+
+        // Sandbox the launch command, then hand it to the SDK's stdio transport.
+        // No adapter registered for the configured harness: sandbox with the generic
+        // (no HOME allowances) profile, as the batch path does.
+        var sandboxAdapter = resolveAdapter();
+        var launchArgv = concat(List.of(acpCommand.strip().split("\\s+")),
+                model == null ? List.of() : HarnessModelBinding.acpArgs(harnessId, model));
+        var argv = HarnessSandbox.wrap(launchArgv,
+                workdir, sandboxAdapter != null ? sandboxAdapter : new GenericAdapter(),
+                sandboxTrustedOrigin(runId));
+        var params = AgentParameters.builder(argv.getFirst()).args(argv.subList(1, argv.size())).env(env).build();
+
+        // The acp-core SDK applies its per-request timeout (default 30s) to EVERY
+        // request — including prompt(), which in ACP spans the whole agent turn
+        // (minutes for a real coding build). JClaw's own idle + wall-clock budget
+        // (SubagentSyncRunner.awaitFuture, which closes this client on timeout via
+        // the registered closer) is the real governor, so size the SDK's request
+        // timeout to the wall-clock ceiling — a generous fallback when the ceiling
+        // is disabled — so it never preempts a legitimate long turn. Without this,
+        // the 30s default aborted every substantial harness prompt ~40s in, right
+        // after initialize + newSession (JCLAW-768 UAT).
+        int ceilingSeconds = ConfigService.getInt(SubagentSpawnTool.MAX_WALLCLOCK_KEY,
+                SubagentSpawnTool.DEFAULT_MAX_WALLCLOCK_SECONDS);
+        var requestTimeout = Duration.ofSeconds(ceilingSeconds > 0 ? ceilingSeconds : 21600L);
+
+        // JCLAW-779: the SDK's StdioAcpClientTransport spawns the harness with
+        // pb.environment().putAll(params.getEnv()) on top of the FULL inherited
+        // host env — putAll never removes, so host secrets would survive. Override
+        // getProcessBuilder to hand it a secret-filtered base; the SDK then layers
+        // params.getEnv() (config wins) on top of the filtered env.
+        var transport = new StdioAcpClientTransport(params) {
+            @Override
+            protected ProcessBuilder getProcessBuilder() {
+                var pb = super.getProcessBuilder();
+                SubprocessEnv.apply(pb);
+                return pb;
+            }
+        };
+        var client = AcpClient.sync(transport)
+                .requestTimeout(requestTimeout)                           // JClaw's idle/ceiling budget governs, not the SDK's 30s default
+                .clientCapabilities(new AcpSchema.ClientCapabilities())   // decline fs + terminal
+                .sessionUpdateConsumer(n -> {
+                    SubagentRegistry.touch(runId);   // harness activity resets the idle clock
+                    synchronized (acc) {   // keep seq + dispatch + fold ordered; the coalescer rides the same lock
+                        for (var ev : thoughts.accept(n.update())) {
+                            dispatchHarnessEvent(runId, ev, seq.getAndIncrement());
+                            acc.fold(ev);
+                        }
+                    }
+                })
+                .requestPermissionHandler(req -> {
+                    SubagentRegistry.touch(runId);   // operator deliberation isn't idle
+                    var decision = DangerousActionGate.guardHarnessPermission(childAgent, conversationId,
+                            AcpEventMapper.permissionToolName(req), AcpEventMapper.permissionArgsJson(req));
+                    return AcpEventMapper.permissionResponse(req, decision);
+                })
+                .build();
+
+        SubagentRegistry.registerCloser(runId, client);
+        try (client) {
+            client.initialize();
+            var cwd = workdir != null ? workdir.getAbsolutePath() : System.getProperty("user.dir");
+            var session = client.newSession(new AcpSchema.NewSessionRequest(cwd, List.of()));
+            if (model != null) {
+                var note = selectSessionModel(client, session, model.modelId());
+                synchronized (acc) {
+                    dispatchHarnessEvent(runId, new HarnessEvent(HarnessEvent.STEP, note, null), seq.getAndIncrement());
+                }
+            }
+            client.prompt(new AcpSchema.PromptRequest(session.sessionId(),
+                    List.of(new AcpSchema.TextContent(task))));
+            String reply;
+            synchronized (acc) {
+                for (var ev : thoughts.flush()) {   // reasoning the turn ended on, with no later update to close it
+                    dispatchHarnessEvent(runId, ev, seq.getAndIncrement());
+                    acc.fold(ev);
+                }
+                flushTokens(runId);   // the reply block the turn ended on
+                reply = acc.reply();
+            }
+            publishRunDone(runId, seq.get(), reply);
+            return new AgentRunner.RunResult(reply.isBlank() ? NO_OUTPUT : reply, null);
+        } catch (RuntimeException e) {
+            throw new IllegalStateException("ACP harness failed: " + e.getMessage(), e);
+        } finally {
+            flushTokens(runId);   // a failed or killed turn keeps whatever reply it had streamed
+            SubagentRegistry.unregisterCloser(runId);
+        }
+    }
+
+    /**
+     * Pin the ACP session to the requested model through the protocol ({@code
+     * session/set_model}) when the harness lists it; a model the harness does not list
+     * — a custom endpoint's model under claude-agent-acp, say — is left to the launch
+     * env and flags already applied. A harness that lists the model but refuses to
+     * switch fails the run: proceeding would silently run on the wrong model.
+     */
+    // acp-core 0.17 deprecates session/set_model for config options, which the SDK delivers only
+    // as async ConfigOptionUpdate notifications; the session response's model state is the one
+    // surface readable before the prompt goes out.
+    @SuppressWarnings("removal")
+    private static String selectSessionModel(AcpSyncClient client, AcpSchema.NewSessionResponse session,
+                                             String modelId) {
+        var models = session.models();
+        var listed = models != null && models.availableModels() != null
+                && models.availableModels().stream().anyMatch(m -> modelId.equals(m.modelId()));
+        if (!listed) {
+            return "harness did not list model " + modelId + " (current: "
+                    + (models == null ? "unknown" : models.currentModelId()) + "); relying on the launch env and flags";
+        }
+        try {
+            client.setSessionModel(new AcpSchema.SetSessionModelRequest(session.sessionId(), modelId));
+        } catch (RuntimeException e) {
+            throw new IllegalStateException("harness refused model " + modelId + ": " + e.getMessage(), e);
+        }
+        return "harness switched to model " + modelId + " (session/set_model)";
+    }
+
+    private static List<String> concat(List<String> head, List<String> tail) {
+        if (tail.isEmpty()) return head;
+        var out = new ArrayList<String>(head.size() + tail.size());
+        out.addAll(head);
+        out.addAll(tail);
+        return List.copyOf(out);
+    }
+
+    /** JCLAW-662: signal terminal once per run so a live monitor stops tailing
+     *  and falls back to the persisted transcript on reconnect — the SDK path's
+     *  equivalent of {@link #streamStdout}'s EOF publish. */
+    private static void publishRunDone(Long runId, int seq, String reply) {
+        var done = new LinkedHashMap<String, Object>();
+        done.put(SubagentSpawnTool.BUS_RUN_ID, runId);
+        done.put("seq", seq);
+        done.put(SubagentSpawnTool.FIELD_REPLY, reply);
+        NotificationBus.publish(NotificationBus.BUS_CODINGRUN_DONE, done);
+    }
+
+    /**
+     * JCLAW-729: the exit-check the batch / streaming / rpc launch paths share.
+     * Read the process's exit code and captured stdout; on a non-zero exit raise
+     * {@link IllegalStateException} carrying the harness's stderr (falling back to
+     * stdout, then {@value #NO_OUTPUT}) so the spawn records a FAILED outcome; on a
+     * clean exit return the trimmed stdout as the child reply. The 10-second
+     * {@code .get} reads surface the same checked exceptions the callers already
+     * translate in their catch blocks.
+     */
+    private static AgentRunner.RunResult finishAcpRun(Process proc, CompletableFuture<String> stdout,
+                                                      CompletableFuture<String> stderr)
+            throws InterruptedException, ExecutionException, TimeoutException {
+        int exit = proc.exitValue();
+        String out = stdout.get(10, TimeUnit.SECONDS);
+        if (exit != 0) {
+            String err = stderr.get(10, TimeUnit.SECONDS);
+            String detail;
+            if (!err.isBlank()) {
+                detail = err.strip();
+            } else if (!out.isBlank()) {
+                detail = out.strip();
+            } else {
+                detail = NO_OUTPUT;
+            }
+            throw new IllegalStateException(ACP_EXIT_MSG.formatted(exit, detail));
+        }
+        return new AgentRunner.RunResult(out.strip(), null);
+    }
+
+    private static @Nullable Long parentConversationId(Long runId) {
+        if (runId == null) return null;
+        return Tx.run(() -> {
+            var run = (SubagentRun) SubagentRun.findById(runId);
+            return run != null && run.parentConversation != null ? run.parentConversation.id : null;
+        });
+    }
+
+    /** JCLAW-709: a coding run is "trusted" for sandbox purposes only when its origin is
+     *  the operator's own web chat — the same boundary {@link #enforceChannelApproval}
+     *  uses. JCLAW-1021: a parentless run records no origin, and an unrecorded origin is
+     *  not the operator, so the untrusted-only sandbox mode
+     *  ({@code subagent.acp.sandbox=untrusted}) now confines it too. */
+    private static boolean sandboxTrustedOrigin(Long runId) {
+        return ChannelOriginTrust.isOperatorOrigin(
+                DangerousActionGate.effectiveOrigin(parentConversationId(runId)));
+    }
+
+    /**
+     * JCLAW-660: read harness stdout line-by-line on a VT — parse each line into a
+     * {@link HarnessEvent}, dispatch it, and accumulate the reply. The process is
+     * force-killed (never {@link Thread#interrupt interrupted}, since the reader
+     * may touch the DB via {@link #dispatchHarnessEvent}) once cumulative output
+     * crosses {@link #ACP_MAX_OUTPUT_BYTES}. The reply prefers a {@code result}
+     * event, else concatenated {@code token} text, else newline-joined {@code
+     * step} lines (the generic line-tail case).
+     */
+    private static CompletableFuture<String> streamStdout(Process proc, Long runId,
+                                                          HarnessAdapter adapter,
+                                                          @Nullable Consumer<HarnessEvent> permissionArbiter) {
+        var f = new CompletableFuture<String>();
+        Thread.ofVirtual().start(() -> {
+            var acc = new ReplyAccumulator();
+            long bytes = 0;
+            int seq = 1;   // seq 0 is the JCLAW-669 channel-approval step (when gated)
+            try (var reader = proc.inputReader(StandardCharsets.UTF_8)) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    // JCLAW-664: each streamed line is activity — reset the idle clock.
+                    SubagentRegistry.touch(runId);
+                    bytes += line.getBytes(StandardCharsets.UTF_8).length + 1L;
+                    var ev = adapter.parse(line);
+                    // A null event is the adapter dropping a noise/duplicate line.
+                    if (ev != null) {
+                        // JCLAW-665: rpc permission requests route to the gate first.
+                        if (permissionArbiter != null) permissionArbiter.accept(ev);
+                        dispatchHarnessEvent(runId, ev, seq++);
+                        acc.fold(ev);
+                    }
+                    if (bytes >= ACP_MAX_OUTPUT_BYTES) {
+                        proc.destroyForcibly();
+                        break;
+                    }
+                }
+            } catch (IOException _) {
+                // EOF, force-kill, or overrun closed the stream — complete with what we have.
+            }
+            String reply = acc.reply();
+            flushTokens(runId);   // the reply block the stream ended on
+            // JCLAW-662: the harness output stream has ended — signal terminal once
+            // per run (every adapter) so a live monitor stops tailing and, on
+            // reconnect, falls back to the persisted transcript.
+            var done = new LinkedHashMap<String, Object>();
+            done.put(SubagentSpawnTool.BUS_RUN_ID, runId);
+            done.put("seq", seq);
+            done.put(SubagentSpawnTool.FIELD_REPLY, reply);
+            NotificationBus.publish(NotificationBus.BUS_CODINGRUN_DONE, done);
+            f.complete(reply);
+        });
+        return f;
+    }
+
+    /**
+     * JCLAW-660/662: fan a parsed {@link HarnessEvent} out to the run's rails —
+     * (a) publish it live on the {@link NotificationBus} so a connected monitor
+     * sees it immediately, and (b) persist it as a child-Conversation
+     * {@link Message} row so a client that reconnects mid-run can replay the
+     * steps it missed via {@link controllers.ApiSubagentRunsController#steps}.
+     */
+    private static void dispatchHarnessEvent(Long runId, HarnessEvent ev, int seq) {
+        if (HarnessEvent.TOKEN.equals(ev.kind())) {
+            PENDING_TOKENS.computeIfAbsent(runId, _ -> new TokenBlock(seq)).text.append(ev.text());
+            streamToChat(runId, ev);
+            return;
+        }
+        flushTokens(runId);
+        publishAndPersist(runId, ev, seq);
+        streamToChat(runId, ev);
+    }
+
+    /** Close the run's pending reply block: one bus event and one row, at the block's first seq. */
+    private static void flushTokens(Long runId) {
+        var block = PENDING_TOKENS.remove(runId);
+        if (block == null || block.text.isEmpty()) return;
+        publishAndPersist(runId, new HarnessEvent(HarnessEvent.TOKEN, block.text.toString(), null), block.firstSeq);
+    }
+
+    private static void publishAndPersist(Long runId, HarnessEvent ev, int seq) {
+        var payload = new LinkedHashMap<String, Object>();
+        payload.put(SubagentSpawnTool.BUS_RUN_ID, runId);
+        payload.put("seq", seq);
+        payload.put("kind", ev.kind());
+        payload.put("text", ev.text());
+        NotificationBus.publish(NotificationBus.BUS_CODINGRUN_STEP, payload);
+        persistHarnessStep(runId, seq, ev);
+    }
+
+    /**
+     * JCLAW-661: Rail A — when a chat turn is watching this run, map the harness
+     * event onto its live SSE callbacks: {@code token} → onToken, {@code tool_call}
+     * → onToolCall, everything else (step / error / result) → onStatus. Never fires
+     * onComplete/onError — those belong to the chat turn's own lifecycle, not the
+     * run's. Best-effort: a write to an already-closed SSE throws, and swallowing it
+     * here keeps the harness reader VT (which touches the DB and must never be
+     * interrupted) and Rail B intact; the turn's own onComplete/onError unregisters
+     * the callbacks.
+     */
+    private static void streamToChat(Long runId, HarnessEvent ev) {
+        var cb = SubagentChatBridge.callbacksFor(runId);
+        if (cb == null) return;
+        try {
+            switch (ev.kind()) {
+                case HarnessEvent.TOKEN -> cb.onToken().accept(ev.text());
+                case HarnessEvent.TOOL_CALL -> cb.onToolCall().accept(toToolCallEvent(ev));
+                default -> cb.onStatus().accept(ev.text());
+            }
+        } catch (RuntimeException _) {
+            // Chat SSE closed mid-run — drop Rail A for this event; Rail B already fired.
+        }
+    }
+
+    /** JCLAW-661: adapt a harness {@code tool_call} event to the chat SSE's
+     *  {@link AgentRunner.ToolCallEvent} shape — name from the event text, the raw
+     *  JSON frame (when the line was JSON) as arguments; no result payload. */
+    private static AgentRunner.ToolCallEvent toToolCallEvent(HarnessEvent ev) {
+        var arguments = ev.raw() == null ? "" : ev.raw().toString();
+        return new AgentRunner.ToolCallEvent(null, ev.text(), "harness", arguments, "", null, null,
+                List.of());
+    }
+
+    /**
+     * JCLAW-662: persist one harness step as a Message row on the run's child
+     * Conversation (short {@link Tx}) so the transcript survives a monitor
+     * disconnect. Best-effort — a transcript-write failure is logged and
+     * swallowed so it never aborts the stdout reader (whose VT touches the DB
+     * and is therefore only ever force-killed, never interrupted).
+     */
+    private static void persistHarnessStep(Long runId, int seq, HarnessEvent ev) {
+        try {
+            Tx.run(() -> {
+                var run = (SubagentRun) SubagentRun.findById(runId);
+                if (run == null || run.childConversation == null) return;
+                var msg = new Message();
+                msg.conversation = run.childConversation;
+                msg.subagentRunId = runId;
+                msg.role = MessageRole.ASSISTANT.value;
+                msg.messageKind = SubagentSpawnTool.MESSAGE_KIND_CODINGRUN_STEP;
+                msg.content = ev.text();
+                msg.metadata = GsonHolder.GSON.toJson(
+                        Map.of("seq", seq, "kind", ev.kind()), Map.class);
+                msg.save();
+            });
+        } catch (RuntimeException e) {
+            EventLogger.warn(SubagentSpawnTool.SUBAGENT_CHANNEL, null, null,
+                    "Failed to persist coding-run step seq=%d for run %s: %s"
+                            .formatted(seq, runId, e.getMessage()));
+        }
+    }
+
+    /** Drain a process stream on a VT, bounded to {@link #ACP_MAX_OUTPUT_BYTES}. */
+    private static CompletableFuture<String> drainAsync(InputStream in) {
+        var f = new CompletableFuture<String>();
+        Thread.ofVirtual().start(() -> {
+            try (in) {
+                var bytes = in.readNBytes(ACP_MAX_OUTPUT_BYTES);
+                f.complete(new String(bytes, StandardCharsets.UTF_8));
+            } catch (IOException _) {
+                f.complete("");
+            }
+        });
+        return f;
+    }
+
+    /**
+     * JCLAW-499: if {@code runtime} requests the ACP harness, validate it and
+     * register the configured command for {@code runId} (consumed by
+     * {@link #executeChildRun}). Returns an error string to short-circuit the
+     * spawn, or null to proceed (native or successfully-registered acp).
+     *
+     * <p>JCLAW-500 (Change 2): acp is a privileged per-agent capability. The
+     * harness is an operator-configured external process that runs OUTSIDE
+     * JClaw's tool gating and workspace confinement, so only the main agent
+     * (always) and agents an operator has granted {@link Agent#acpAllowed} may
+     * request it. The gate is on the SPAWNING agent, so a confined custom agent
+     * cannot break out via acp — and a subagent of main is itself non-main, so
+     * it cannot escalate either.
+     */
+    static @Nullable String acpRuntimeError(JsonObject args, Agent spawningAgent) {
+        var runtime = SubagentSpawnArgs.optString(args, SubagentSpawnTool.ARG_RUNTIME);
+        if (runtime == null || runtime.isBlank() || "native".equalsIgnoreCase(runtime)) {
+            return null;
+        }
+        if (!"acp".equalsIgnoreCase(runtime)) {
+            return "Error: 'runtime' must be \"native\" (default) or \"acp\"" + SubagentSpawnTool.GOT_LITERAL + runtime + "').";
+        }
+        if (spawningAgent != null && !spawningAgent.isMain() && !spawningAgent.acpAllowed) {
+            return "Error: runtime=\"acp\" is not permitted for agent '" + spawningAgent.name
+                    + "'. The acp runtime launches an external harness outside JClaw's tool and "
+                    + "workspace confinement, so it is restricted to the main agent and agents an "
+                    + "operator has explicitly granted acp.";
+        }
+        if (resolveAcpCommand().isEmpty()) {
+            return "Error: runtime=\"acp\" needs an external harness — the operator must configure '"
+                    + SubagentSpawnTool.ACP_COMMAND_KEY + "' (e.g. \"claude -p\" or \"codex exec\").";
+        }
+        // JCLAW-659: reject an operator-misconfigured harness id / mode up front,
+        // with a clear message, rather than silently falling back to defaults.
+        var harness = ConfigService.get(SubagentSpawnTool.ACP_HARNESS_KEY, SubagentSpawnTool.DEFAULT_ACP_HARNESS);
+        if (harness != null && !harness.isBlank()
+                && !ACP_HARNESS_IDS.contains(harness.strip().toLowerCase(Locale.ROOT))) {
+            return "Error: '" + SubagentSpawnTool.ACP_HARNESS_KEY + "' must be one of " + ACP_HARNESS_IDS
+                    + SubagentSpawnTool.GOT_LITERAL + harness.strip() + "').";
+        }
+        var mode = ConfigService.get(SubagentSpawnTool.ACP_MODE_KEY, SubagentSpawnTool.DEFAULT_ACP_MODE);
+        if (mode != null && !mode.isBlank()
+                && !ACP_MODES.contains(mode.strip().toLowerCase(Locale.ROOT))) {
+            return "Error: '" + SubagentSpawnTool.ACP_MODE_KEY + "' must be one of " + ACP_MODES
+                    + SubagentSpawnTool.GOT_LITERAL + mode.strip() + "').";
+        }
+        return harnessModelError(args);
+    }
+
+    /**
+     * Validate the model override an acp spawn would launch with — the spawn's own
+     * {@code modelProvider}/{@code modelId} when it names a model, else the Settings default.
+     * Refused up front, like a bad harness id: a provider JClaw has no endpoint for, a
+     * provider without a model, or a harness that cannot take the override (see
+     * {@link HarnessModelBinding#rejection}). Returns the error string, or {@code null}.
+     */
+    private static @Nullable String harnessModelError(JsonObject args) {
+        var requested = requestedModel(args);
+        var provider = requested.provider();
+        var modelId = requested.modelId();
+        if (modelId == null || modelId.isBlank()) {
+            if (!SubagentSpawnTool.notBlank(provider)) return null;
+            var source = requested.fromArgs()
+                    ? "'" + SubagentSpawnTool.ARG_MODEL_PROVIDER + "' needs '" + SubagentSpawnTool.ARG_MODEL_ID + "'"
+                    : "'" + SubagentSpawnTool.ACP_MODEL_PROVIDER_KEY + "' needs '" + SubagentSpawnTool.ACP_MODEL_ID_KEY + "'";
+            return "Error: " + source + " — a provider alone does not name a model for the harness.";
+        }
+        var model = resolveHarnessModel(provider, modelId);
+        if (model.hasEndpoint() && model.baseUrl() == null) {
+            return "Error: model provider '" + provider + "' is not configured (Settings → LLM Providers), "
+                    + "so the coding harness cannot be pointed at it.";
+        }
+        var rejection = HarnessModelBinding.rejection(resolveHarnessId(), model);
+        return rejection == null ? null : "Error: " + rejection;
+    }
+
+    /** The override a spawn asks for: its own args when either names something, else the
+     *  Settings default — the one precedence {@link #harnessModelError} and
+     *  {@link #resolveAcpLaunch} share. */
+    private record RequestedModel(@Nullable String provider, @Nullable String modelId, boolean fromArgs) {}
+
+    private static RequestedModel requestedModel(JsonObject args) {
+        var argProvider = SubagentSpawnArgs.optString(args, SubagentSpawnTool.ARG_MODEL_PROVIDER);
+        var argModel = SubagentSpawnArgs.optString(args, SubagentSpawnTool.ARG_MODEL_ID);
+        if (SubagentSpawnTool.notBlank(argModel) || SubagentSpawnTool.notBlank(argProvider)) {
+            return new RequestedModel(argProvider, argModel, true);
+        }
+        return new RequestedModel(ConfigService.get(SubagentSpawnTool.ACP_MODEL_PROVIDER_KEY),
+                ConfigService.get(SubagentSpawnTool.ACP_MODEL_ID_KEY), false);
+    }
+
+    /** The Settings-default override alone (no spawn args), or {@code null} when
+     *  {@link SubagentSpawnTool#ACP_MODEL_ID_KEY} names no model. */
+    static @Nullable HarnessModel settingsModel() {
+        var modelId = ConfigService.get(SubagentSpawnTool.ACP_MODEL_ID_KEY);
+        if (modelId == null || modelId.isBlank()) return null;
+        return resolveHarnessModel(ConfigService.get(SubagentSpawnTool.ACP_MODEL_PROVIDER_KEY), modelId);
+    }
+
+    static boolean isAcpRuntime(JsonObject args) {
+        return "acp".equalsIgnoreCase(SubagentSpawnArgs.optString(args, SubagentSpawnTool.ARG_RUNTIME));
+    }
+
+    /** Operator-configured ACP harness command, whitespace-split. Empty when unset. */
+    static List<String> resolveAcpCommand() {
+        var configured = ConfigService.get(SubagentSpawnTool.ACP_COMMAND_KEY);
+        if (configured == null || configured.isBlank()) return List.of();
+        return List.of(configured.strip().split("\\s+"));
+    }
+
+    /** The launch a validated ({@link #acpRuntimeError} returned null) acp spawn registers:
+     *  the harness command plus the model override the same precedence resolved. */
+    static AcpLaunch resolveAcpLaunch(JsonObject args) {
+        var requested = requestedModel(args);
+        var modelId = requested.modelId();
+        var model = modelId == null || modelId.isBlank() ? null : resolveHarnessModel(requested.provider(), modelId);
+        return new AcpLaunch(resolveAcpCommand(), model);
+    }
+
+    /** A model-only override when {@code provider} is blank; otherwise the named JClaw
+     *  provider's endpoint and key, left null when no such provider is configured. */
+    private static HarnessModel resolveHarnessModel(@Nullable String provider, String modelId) {
+        if (provider == null || provider.isBlank()) {
+            return new HarnessModel(null, null, null, modelId.strip());
+        }
+        var name = provider.strip();
+        var resolved = ProviderRegistry.get(name);
+        if (resolved == null) return new HarnessModel(name, null, null, modelId.strip());
+        return new HarnessModel(name, resolved.config().baseUrl(), resolved.config().apiKey(), modelId.strip());
+    }
+
+    /** JCLAW-659: configured harness id, normalized and falling back to
+     *  {@link SubagentSpawnTool#DEFAULT_ACP_HARNESS} when unset or unrecognized. */
+    static String resolveHarnessId() {
+        var configured = ConfigService.get(SubagentSpawnTool.ACP_HARNESS_KEY, SubagentSpawnTool.DEFAULT_ACP_HARNESS);
+        if (configured == null || configured.isBlank()) return SubagentSpawnTool.DEFAULT_ACP_HARNESS;
+        var id = configured.strip().toLowerCase(Locale.ROOT);
+        return ACP_HARNESS_IDS.contains(id) ? id : SubagentSpawnTool.DEFAULT_ACP_HARNESS;
+    }
+
+    /** JCLAW-659: configured acp mode, normalized and falling back to
+     *  {@link SubagentSpawnTool#DEFAULT_ACP_MODE} when unset or unrecognized. */
+    static String resolveAcpMode() {
+        var configured = ConfigService.get(SubagentSpawnTool.ACP_MODE_KEY, SubagentSpawnTool.DEFAULT_ACP_MODE);
+        if (configured == null || configured.isBlank()) return SubagentSpawnTool.DEFAULT_ACP_MODE;
+        var mode = configured.strip().toLowerCase(Locale.ROOT);
+        return ACP_MODES.contains(mode) ? mode : SubagentSpawnTool.DEFAULT_ACP_MODE;
+    }
+
+    /** JCLAW-659: the {@link HarnessAdapter} for the configured harness, falling
+     *  back to the {@link SubagentSpawnTool#DEFAULT_ACP_HARNESS} adapter. JCLAW-660
+     *  wires this into {@link #runAcpStreaming} for the json/rpc modes; returns
+     *  {@code null} only if no adapter is registered for the configured harness. */
+    static @Nullable HarnessAdapter resolveAdapter() {
+        var adapter = HARNESS_ADAPTERS.get(resolveHarnessId());
+        if (adapter == null) {
+            adapter = HARNESS_ADAPTERS.get(SubagentSpawnTool.DEFAULT_ACP_HARNESS);
+        }
+        return adapter;
+    }
+}

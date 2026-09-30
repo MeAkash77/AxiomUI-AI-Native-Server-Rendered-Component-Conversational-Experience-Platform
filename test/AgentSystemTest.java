@@ -1,0 +1,1202 @@
+import agents.SkillLoader;
+import agents.SystemPromptAssembler;
+import jobs.DefaultConfigJob;
+import models.Agent;
+import models.Config;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import play.test.Fixtures;
+import play.test.UnitTest;
+import services.AgentService;
+import services.ConfigService;
+import services.ConversationService;
+import services.Tx;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+
+class AgentSystemTest extends UnitTest {
+
+    private static final String[] TEST_AGENTS = {
+            "test-agent", "ws-agent", "missing-agent", "enabled-1", "disabled-1",
+            "skill-agent", "xml-agent", "convo-agent", "msg-agent", "prompt-agent",
+            "minimal-agent", "no-skills", "main", "window-agent", "delete-agent",
+            "soul-boot-agent", "breakdown-agent", "cascade-raw-parent", "cascade-raw-child"
+    };
+
+    @BeforeEach
+    void setup() {
+        Fixtures.deleteDatabase();
+        ConfigService.clearCache();
+        cleanupTestAgents();
+    }
+
+    @AfterAll
+    static void cleanup() {
+        cleanupTestAgents();
+    }
+
+    // --- AgentService tests ---
+
+    @Test
+    void thinkingModeIsPersistedWhenModelAdvertisesLevel() {
+        // Seed an Ollama provider whose model declares all three levels, then
+        // verify the agent row captures the chosen level verbatim.
+        ConfigService.set("provider.ollama-cloud.baseUrl", "https://ollama.com/v1");
+        ConfigService.set("provider.ollama-cloud.apiKey", "test-key");
+        ConfigService.set("provider.ollama-cloud.models",
+                "[{\"id\":\"kimi-k2.5\",\"name\":\"Kimi K2.5\",\"supportsThinking\":true,"
+                + "\"thinkingLevels\":[\"low\",\"medium\",\"high\"]}]");
+        llm.ProviderRegistry.refresh();
+
+        var agent = AgentService.create("thinker", "ollama-cloud", "kimi-k2.5", "medium");
+        assertEquals("medium", agent.thinkingMode);
+    }
+
+    @Test
+    void thinkingModeUnknownLevelCollapsesToNull() {
+        // A level the model doesn't advertise must be silently dropped rather than
+        // persisted — we'd otherwise send a bogus value on every LLM call.
+        ConfigService.set("provider.ollama-cloud.baseUrl", "https://ollama.com/v1");
+        ConfigService.set("provider.ollama-cloud.apiKey", "test-key");
+        ConfigService.set("provider.ollama-cloud.models",
+                "[{\"id\":\"kimi-k2.5\",\"name\":\"Kimi K2.5\",\"supportsThinking\":true,"
+                + "\"thinkingLevels\":[\"low\",\"medium\",\"high\"]}]");
+        llm.ProviderRegistry.refresh();
+
+        var agent = AgentService.create("thinker", "ollama-cloud", "kimi-k2.5", "xhigh");
+        assertNull(agent.thinkingMode,
+                "Unknown thinking levels should collapse to null, not be persisted");
+    }
+
+    @Test
+    void createAgentCreatesWorkspace() {
+        var agent = AgentService.create("test-agent", "openrouter", "gpt-4.1");
+        assertNotNull(agent);
+        assertEquals("test-agent", agent.name);
+        assertFalse(agent.isMain());
+
+        var workspace = AgentService.workspacePath("test-agent");
+        assertTrue(Files.exists(workspace));
+        assertTrue(Files.exists(workspace.resolve("SOUL.md")));
+        assertTrue(Files.exists(workspace.resolve("IDENTITY.md")));
+        assertTrue(Files.exists(workspace.resolve("USER.md")));
+        assertTrue(Files.exists(workspace.resolve("BOOTSTRAP.md")));
+        assertTrue(Files.exists(workspace.resolve("AGENT.md")));
+        assertTrue(Files.isDirectory(workspace.resolve("skills")));
+    }
+
+    @Test
+    void readAndWriteWorkspaceFile() {
+        AgentService.create("ws-agent", "openrouter", "gpt-4.1");
+
+        AgentService.writeWorkspaceFile("ws-agent", "AGENT.md", "# Custom Instructions\nBe helpful.");
+        var content = AgentService.readWorkspaceFile("ws-agent", "AGENT.md");
+        assertNotNull(content);
+        assertTrue(content.contains("Custom Instructions"));
+    }
+
+    @Test
+    void readMissingWorkspaceFileReturnsNull() {
+        AgentService.create("missing-agent", "openrouter", "gpt-4.1");
+        var content = AgentService.readWorkspaceFile("missing-agent", "NONEXISTENT.md");
+        assertNull(content);
+    }
+
+    @Test
+    void listEnabledFiltersDisabled() {
+        var agent1 = AgentService.create("enabled-1", "openrouter", "gpt-4.1");
+        agent1.enabled = true;
+        agent1.save();
+        var agent2 = AgentService.create("disabled-1", "openrouter", "gpt-4.1");
+        agent2.enabled = false;
+        agent2.save();
+
+        var enabled = AgentService.listEnabled();
+        assertEquals(1, enabled.size());
+        assertEquals("enabled-1", enabled.getFirst().name);
+    }
+
+    // --- Main-agent invariants ---
+
+    @Test
+    void mainAgentIsCreatedEnabledEvenWithUnconfiguredProvider() {
+        // Use a provider that's definitely not configured in tests — main should
+        // still be created as enabled because the invariant is "main is always enabled."
+        var main = AgentService.create("main", "nonexistent-provider", "nonexistent-model");
+        assertTrue(main.isMain());
+        assertTrue(main.enabled,
+                "Main agent must be enabled at creation regardless of provider config");
+    }
+
+    @Test
+    void mainAgentUpdateForcesEnabledTrue() {
+        var main = AgentService.create("main", "openrouter", "gpt-4.1");
+        // Simulate a caller passing enabled=false — service layer must override it.
+        var updated = AgentService.update(main, "main", "openrouter", "gpt-4.1", false);
+        assertTrue(updated.enabled,
+                "AgentService.update must ignore enabled=false for the main agent");
+    }
+
+    @Test
+    void mainAgentSurvivesSyncEnabledStatesWithNoProvider() {
+        var main = AgentService.create("main", "nonexistent-provider", "nonexistent-model");
+        assertTrue(main.enabled); // created enabled per the invariant above
+
+        // syncEnabledStates would normally disable agents whose provider isn't
+        // configured — it must exempt main.
+        AgentService.syncEnabledStates();
+
+        var refreshed = Agent.findByName("main");
+        assertNotNull(refreshed);
+        assertTrue(refreshed.enabled,
+                "syncEnabledStates must never disable the main agent");
+    }
+
+    @Test
+    void mainAgentSyncHealsADisabledMainRow() {
+        // If main was ever persisted as disabled (e.g. by a pre-fix boot), sync
+        // must heal it on the next pass rather than leave it broken.
+        var main = AgentService.create("main", "openrouter", "gpt-4.1");
+        main.enabled = false;
+        main.save();
+
+        AgentService.syncEnabledStates();
+
+        var refreshed = Agent.findByName("main");
+        assertTrue(refreshed.enabled, "sync must re-enable a rogue disabled main row");
+    }
+
+    @Test
+    void mainAgentWorkspaceEditsSurviveSeedPass() {
+        // Regression for the boot-time clobber of user-edited main workspace
+        // files. Before the fix, seedDefaultAgent called resetWorkspace("main"),
+        // rewriting every workspace .md with hardcoded Java defaults on each
+        // boot. The fix switched to createWorkspace (overwrite=false) so edits
+        // persist. Simulate the boot sequence directly: pre-seed the agent,
+        // write user content, run the workspace pass, and confirm the content
+        // is unchanged.
+        AgentService.create("main", "openrouter", "gpt-4.1");
+        AgentService.writeWorkspaceFile("main", "SOUL.md",
+                "# Soul\nPragmatic realism. Intellectual integrity.");
+        AgentService.writeWorkspaceFile("main", "USER.md",
+                "# User Information\nName: Alice\nTitle: Founder");
+
+        // This is the same call seedDefaultAgent now makes on every boot.
+        AgentService.createWorkspace("main");
+
+        assertEquals("# Soul\nPragmatic realism. Intellectual integrity.",
+                AgentService.readWorkspaceFile("main", "SOUL.md"),
+                "SOUL.md edits must survive a seed-pass call");
+        assertEquals("# User Information\nName: Alice\nTitle: Founder",
+                AgentService.readWorkspaceFile("main", "USER.md"),
+                "USER.md edits must survive a seed-pass call");
+    }
+
+    @Test
+    void mainAgentWorkspaceSeedFillsMissingFiles() {
+        // createWorkspace must still populate any file that's missing on disk,
+        // so a file accidentally deleted post-boot gets recreated with the
+        // Java-literal fallback on the next seed pass.
+        AgentService.create("main", "openrouter", "gpt-4.1");
+        var bootstrap = AgentService.workspacePath("main").resolve("BOOTSTRAP.md");
+        try { Files.deleteIfExists(bootstrap); } catch (IOException e) { fail(e); }
+        assertFalse(Files.exists(bootstrap), "precondition: BOOTSTRAP.md is absent");
+
+        AgentService.createWorkspace("main");
+
+        assertTrue(Files.exists(bootstrap),
+                "createWorkspace must recreate a missing workspace file");
+        var content = AgentService.readWorkspaceFile("main", "BOOTSTRAP.md");
+        assertNotNull(content);
+        assertTrue(content.contains("Bootstrap"),
+                "recreated BOOTSTRAP.md must carry the Java-literal default content");
+    }
+
+    // --- SkillLoader tests ---
+
+    @Test
+    void loadSkillsFromFilesystem() {
+        AgentService.create("skill-agent", "openrouter", "gpt-4.1");
+
+        // Create a skill file in the agent's workspace
+        var skillDir = AgentService.workspacePath("skill-agent").resolve("skills").resolve("coding");
+        try {
+            Files.createDirectories(skillDir);
+            Files.writeString(skillDir.resolve("SKILL.md"), """
+                    ---
+                    name: coding
+                    description: Help with writing and reviewing code
+                    ---
+                    # Coding Skill
+                    Follow best practices when writing code.
+                    """);
+        } catch (IOException e) { fail(e); }
+
+        SkillLoader.clearCache();
+        var skills = SkillLoader.loadSkills("skill-agent");
+        assertEquals(1, skills.size());
+        assertEquals("coding", skills.getFirst().name());
+        assertEquals("Help with writing and reviewing code", skills.getFirst().description());
+    }
+
+    @Test
+    void loadSkillsReturnsEmptyForNoSkills() {
+        AgentService.create("no-skills", "openrouter", "gpt-4.1");
+        SkillLoader.clearCache();
+        var skills = SkillLoader.loadSkills("no-skills");
+        assertTrue(skills.isEmpty());
+    }
+
+    @Test
+    void formatSkillsXmlContainsSkillData() {
+        AgentService.create("xml-agent", "openrouter", "gpt-4.1");
+
+        // Create a skill file in the agent's workspace
+        var skillDir = AgentService.workspacePath("xml-agent").resolve("skills").resolve("research");
+        try {
+            Files.createDirectories(skillDir);
+            Files.writeString(skillDir.resolve("SKILL.md"), """
+                    ---
+                    name: research
+                    description: Deep web research with citations
+                    ---
+                    Research instructions here.
+                    """);
+        } catch (IOException e) { fail(e); }
+
+        SkillLoader.clearCache();
+        var skills = SkillLoader.loadSkills("xml-agent");
+        var xml = SkillLoader.formatSkillsXml(skills);
+        assertTrue(xml.contains("<available_skills>"));
+        assertTrue(xml.contains("<name>research</name>"));
+        assertTrue(xml.contains("Deep web research with citations"));
+    }
+
+    @Test
+    void yamlFrontmatterParsing() {
+        assertEquals("my-skill", SkillLoader.extractYamlValue("name: my-skill", "name"));
+        assertEquals("A description", SkillLoader.extractYamlValue("description: A description", "description"));
+        assertNull(SkillLoader.extractYamlValue("other: value", "name"));
+        assertEquals("quoted", SkillLoader.extractYamlValue("name: \"quoted\"", "name"));
+    }
+
+    @Test
+    void extractYamlValueReturnsNullForEmptyAfterStrip() {
+        assertNull(SkillLoader.extractYamlValue("name: ", "name"));
+        assertNull(SkillLoader.extractYamlValue("name:    ", "name"));
+    }
+
+    @Test
+    void extractYamlValueHandlesArbitraryKey() {
+        // Default switch arm — anything other than name/description/tools/version.
+        assertEquals("MIT", SkillLoader.extractYamlValue("license: MIT", "license"));
+        assertNull(SkillLoader.extractYamlValue("foo: bar", "license"));
+    }
+
+    @Test
+    void extractYamlListInlineEmpty() {
+        // tools: [] should resolve to an empty list, not the missing-key default.
+        assertEquals(java.util.List.of(), SkillLoader.extractYamlList("tools: []", "tools"));
+    }
+
+    @Test
+    void extractYamlListInlineMultiValue() {
+        var result = SkillLoader.extractYamlList("tools: [a, \"b\", 'c']", "tools");
+        assertEquals(3, result.size());
+        assertTrue(result.contains("a"));
+        assertTrue(result.contains("b"));
+        assertTrue(result.contains("c"));
+    }
+
+    @Test
+    void extractYamlListBlockForm() {
+        var yaml = "tools:\n  - filesystem\n  - exec\n";
+        var result = SkillLoader.extractYamlList(yaml, "tools");
+        assertEquals(2, result.size());
+        assertEquals("filesystem", result.get(0));
+        assertEquals("exec", result.get(1));
+    }
+
+    @Test
+    void extractYamlListReturnsEmptyWhenKeyMissing() {
+        assertEquals(java.util.List.of(),
+                SkillLoader.extractYamlList("other: value", "tools"));
+    }
+
+    @Test
+    void extractYamlListHandlesCustomKey() {
+        // Default key path — anything other than "tools".
+        var yaml = "tags: [alpha, beta]";
+        var result = SkillLoader.extractYamlList(yaml, "tags");
+        assertEquals(2, result.size());
+    }
+
+    @Test
+    void extractYamlListCommandsInlineAndBlock() {
+        // JCLAW-408: the pre-compiled COMMANDS_* patterns must parse identically
+        // to the dynamic default they replaced, in both inline and block form.
+        assertEquals(java.util.List.of("deploy", "rollback"),
+                SkillLoader.extractYamlList("commands: [deploy, rollback]", "commands"));
+        var block = "commands:\n  - deploy\n  - rollback\n";
+        assertEquals(java.util.List.of("deploy", "rollback"),
+                SkillLoader.extractYamlList(block, "commands"));
+    }
+
+    @Test
+    void extractYamlListMcpServersInlineAndBlock() {
+        // JCLAW-408: same parity check for the pre-compiled MCP_SERVERS_* patterns.
+        assertEquals(java.util.List.of("filesystem", "context7"),
+                SkillLoader.extractYamlList("mcp_servers: [filesystem, context7]", "mcp_servers"));
+        var block = "mcp_servers:\n  - filesystem\n  - context7\n";
+        assertEquals(java.util.List.of("filesystem", "context7"),
+                SkillLoader.extractYamlList(block, "mcp_servers"));
+    }
+
+    @Test
+    void formatSkillsXmlReturnsEmptyStringForEmptyList() {
+        // Early-return branch at line 303 of SkillLoader.
+        assertEquals("", SkillLoader.formatSkillsXml(java.util.List.of()));
+    }
+
+    @Test
+    void isTextFileDetectsByExtension() {
+        assertTrue(SkillLoader.isTextFile("README.md"));
+        assertTrue(SkillLoader.isTextFile("code.py"));
+        assertTrue(SkillLoader.isTextFile("style.css"));
+    }
+
+    @Test
+    void isTextFileDetectsExtensionlessKnownNames() {
+        assertTrue(SkillLoader.isTextFile("Makefile"));
+        assertTrue(SkillLoader.isTextFile("Dockerfile"));
+        assertTrue(SkillLoader.isTextFile("LICENSE"));
+    }
+
+    @Test
+    void isTextFileRejectsBinaryExtensions() {
+        assertFalse(SkillLoader.isTextFile("image.png"));
+        assertFalse(SkillLoader.isTextFile("archive.tar.gz"));
+        assertFalse(SkillLoader.isTextFile("noextension"));
+    }
+
+    /** A stand-in is classified as the name underneath it, so the skill file tree offers
+     *  ".env.example" for viewing instead of greying it out as a binary. */
+    @Test
+    void isTextFileSeesThroughAStandInSuffix() {
+        assertTrue(SkillLoader.isTextFile("nas.env.example"));
+        assertTrue(SkillLoader.isTextFile("config.yaml.sample"));
+        assertTrue(SkillLoader.isTextFile("settings.json.template"));
+        assertTrue(SkillLoader.isTextFile("app.conf.dist"));
+        assertTrue(SkillLoader.isTextFile("Makefile.template"), "the extensionless names see through it too");
+    }
+
+    /** The marker must not become a way past the malware scanner, which is handed exactly
+     *  the files this returns false for. */
+    @Test
+    void isTextFileKeepsABinaryStandInBinary() {
+        assertFalse(SkillLoader.isTextFile("payload.exe.example"));
+        assertFalse(SkillLoader.isTextFile("image.png.sample"));
+        assertFalse(SkillLoader.isTextFile("archive.tar.gz.dist"));
+        assertFalse(SkillLoader.isTextFile(".example"), "the bare marker names nothing underneath");
+    }
+
+    @Test
+    void isTextFileStripsDirectoryFromBasenameLookup() {
+        // Path-style input: the base-name fallback only considers the final
+        // segment, so "src/Makefile" still matches the known-file map.
+        assertTrue(SkillLoader.isTextFile("src/Makefile"));
+        assertTrue(SkillLoader.isTextFile("deep/nested/dir/Dockerfile"));
+    }
+
+    @Test
+    void parseSkillContentRequiresNameField() {
+        // Missing name → parseSkillContent returns null (caller falls back to
+        // directory-name path).
+        var info = SkillLoader.parseSkillContent(
+                "---\ndescription: no name here\n---\nbody",
+                java.nio.file.Path.of("/tmp/no-name.md"));
+        assertNull(info, "missing name must yield null");
+    }
+
+    @Test
+    void parseSkillContentHandlesToolsInlineList() {
+        var content = """
+                ---
+                name: with-tools
+                description: Has explicit tools
+                tools: [filesystem, exec]
+                ---
+                # body
+                """;
+        var info = SkillLoader.parseSkillContent(content, java.nio.file.Path.of("/tmp/tools.md"));
+        assertNotNull(info);
+        assertEquals("with-tools", info.name());
+        assertTrue(info.toolsDeclared(), "tools key present means declared=true");
+        assertEquals(2, info.tools().size());
+    }
+
+    @Test
+    void parseSkillContentTreatsMissingToolsKeyAsNotDeclared() {
+        var content = "---\nname: no-tools\ndescription: skill without tools key\n---\n# body\n";
+        var info = SkillLoader.parseSkillContent(content, java.nio.file.Path.of("/tmp/no-tools.md"));
+        assertNotNull(info);
+        assertFalse(info.toolsDeclared(),
+                "absence of tools: line means toolsDeclared=false");
+    }
+
+    @Test
+    void formatSkillsXmlSwitchesToCompactWhenOverflow() {
+        // MAX_SKILLS_CHARS is 30_000. Construct 4 skills whose full entries
+        // collectively blow past that so formatSkillsXml falls back to the
+        // compact variant. The compact entries should still fit and produce
+        // an <available_skills> envelope.
+        var skills = new java.util.ArrayList<SkillLoader.SkillInfo>();
+        // A 12KB description guarantees the full entry is > 12KB on its own.
+        var bigDesc = "x".repeat(12_000);
+        for (int i = 0; i < 4; i++) {
+            skills.add(new SkillLoader.SkillInfo(
+                    "skill-" + i, bigDesc, java.nio.file.Path.of("/tmp/skill-" + i)));
+        }
+        var xml = SkillLoader.formatSkillsXml(skills);
+        assertTrue(xml.startsWith("<available_skills>"),
+                "envelope opens correctly: " + xml.substring(0, Math.min(60, xml.length())));
+        assertTrue(xml.endsWith("</available_skills>"),
+                "envelope closes correctly: " + xml.substring(Math.max(0, xml.length() - 60)));
+        // Overflow path: ANSI total length is capped, so the result must be ≤
+        // ~30K + envelope tags. If the full-fat branch had won, we'd see
+        // closer to 48K (4 × 12K + framing).
+        assertTrue(xml.length() < 35_000,
+                "compact fallback must keep output bounded: length=" + xml.length());
+    }
+
+    @Test
+    void formatSkillsXmlIncludesRichMetadataInFullEntry() {
+        // formatSkillsXml indirectly tests formatSkillEntry's full-entry
+        // branches (icon, author, commands list). A single skill with all
+        // fields populated → the rich block surfaces in the response.
+        var skill = new SkillLoader.SkillInfo(
+                "rich-skill", "Has rich metadata", java.nio.file.Path.of("/tmp/rich"),
+                java.util.List.of("filesystem"), true, "1.0.0",
+                java.util.List.of("ls", "cat"), "alice", "🎉",
+                java.util.List.of());
+        var xml = SkillLoader.formatSkillsXml(java.util.List.of(skill));
+        assertTrue(xml.contains("rich-skill"));
+        assertTrue(xml.contains("🎉"), "icon must surface: " + xml);
+        assertTrue(xml.contains("filesystem"), "tools must surface: " + xml);
+    }
+
+    // --- ConversationService tests ---
+
+    @Test
+    void findOrCreateConversation() {
+        var agent = AgentService.create("convo-agent", "openrouter", "gpt-4.1");
+        var convo1 = ConversationService.findOrCreate(agent, "web", "admin");
+        assertNotNull(convo1);
+
+        var convo2 = ConversationService.findOrCreate(agent, "web", "admin");
+        assertEquals(convo1.id, convo2.id);
+    }
+
+    @Test
+    void appendAndLoadMessages() {
+        var agent = AgentService.create("msg-agent", "openrouter", "gpt-4.1");
+        var convo = ConversationService.findOrCreate(agent, "web", "admin");
+
+        ConversationService.appendUserMessage(convo, "Hello");
+        ConversationService.appendAssistantMessage(convo, "Hi there!", null);
+        ConversationService.appendUserMessage(convo, "How are you?");
+
+        var messages = ConversationService.loadRecentMessages(convo);
+        assertEquals(3, messages.size());
+        assertEquals("user", messages.getFirst().role);
+        assertEquals("Hello", messages.getFirst().content);
+        assertEquals("assistant", messages.get(1).role);
+        assertEquals("user", messages.get(2).role);
+    }
+
+    @Test
+    void loadRecentMessagesRespectsChatMaxContextMessages() {
+        ConfigService.set("chat.maxContextMessages", "3");
+        var agent = AgentService.create("window-agent", "openrouter", "gpt-4.1");
+        var convo = ConversationService.findOrCreate(agent, "web", "admin");
+
+        for (int i = 1; i <= 5; i++) {
+            ConversationService.appendUserMessage(convo, "msg-" + i);
+        }
+
+        var messages = ConversationService.loadRecentMessages(convo);
+        assertEquals(3, messages.size());
+        // ASC / chronological order — should be the LAST 3
+        assertEquals("msg-3", messages.getFirst().content);
+        assertEquals("msg-4", messages.get(1).content);
+        assertEquals("msg-5", messages.get(2).content);
+    }
+
+    // --- DefaultConfigJob OpenAI seeding (JCLAW-160) ---
+
+    @Test
+    void seedProvidersWritesOpenAiDefaultsAndIsIdempotent() throws Exception {
+        // JCLAW-160 AC #2: seedProviders must write provider.openai.{baseUrl,apiKey}
+        // on a fresh install with the documented defaults. Re-running mustn't
+        // clobber operator-set values — the seedIfAbsent guard is what protects
+        // a real apiKey across upgrades and dev-server reloads.
+        var job = new DefaultConfigJob();
+        var seed = DefaultConfigJob.class.getDeclaredMethod("seedProviders");
+        seed.setAccessible(true);
+        seed.invoke(job);
+
+        assertEquals("https://api.openai.com/v1",
+                ConfigService.get("provider.openai.baseUrl"));
+        assertEquals("", ConfigService.get("provider.openai.apiKey"));
+
+        // Operator pastes a real key, then a re-seed must preserve it.
+        ConfigService.set("provider.openai.apiKey", "sk-operator");
+        seed.invoke(job);
+        assertEquals("sk-operator", ConfigService.get("provider.openai.apiKey"),
+                "seedIfAbsent must not overwrite an operator-supplied value");
+    }
+
+    // --- DefaultConfigJob rename migration ---
+
+    @Test
+    void renameMigratesAgentKeyToChatKey() throws Exception {
+        // Pre-seed the legacy key as if an earlier build had written it
+        ConfigService.set("agent.maxToolRounds", "25");
+        ConfigService.clearCache();
+
+        // Invoke the private rename helper reflectively — it's the smallest surface
+        // that exercises the migration without spinning up the full @OnApplicationStart job
+        var job = new DefaultConfigJob();
+        var rename = DefaultConfigJob.class.getDeclaredMethod("renameKeyIfPresent", String.class, String.class);
+        rename.setAccessible(true);
+        rename.invoke(job, "agent.maxToolRounds", "chat.maxToolRounds");
+
+        assertEquals("25", ConfigService.get("chat.maxToolRounds"));
+        Tx.run(() -> assertNull(Config.findByKey("agent.maxToolRounds")));
+
+        // Idempotency: a second run is a no-op and doesn't clobber the new value
+        rename.invoke(job, "agent.maxToolRounds", "chat.maxToolRounds");
+        assertEquals("25", ConfigService.get("chat.maxToolRounds"));
+    }
+
+    // --- Cascade delete ---
+
+    @Test
+    void deleteAgentCascadesChildRows() {
+        // Seed an agent plus one row in every FK-constrained child table so the delete
+        // path has to clear each one. Creation itself writes an AgentToolConfig (the
+        // seeded "browser=disabled" for non-main agents), so that table is pre-populated.
+        var agent = AgentService.create("delete-agent", "openrouter", "gpt-4.1");
+
+        var skillConfig = new models.AgentSkillConfig();
+        skillConfig.agent = agent;
+        skillConfig.skillName = "test-skill";
+        skillConfig.enabled = true;
+        skillConfig.save();
+
+        var binding = new models.AgentBinding();
+        binding.agent = agent;
+        binding.channelType = "web";
+        binding.peerId = "test-peer";
+        binding.save();
+
+        var convo = new models.Conversation();
+        convo.agent = agent;
+        convo.channelType = "web";
+        convo.peerId = "test-peer";
+        convo.save();
+
+        var msg = new models.Message();
+        msg.conversation = convo;
+        msg.role = "user";
+        msg.content = "hello";
+        msg.save();
+
+        var task = new models.Task();
+        task.agent = agent;
+        task.name = "test-task";
+        task.type = models.Task.Type.IMMEDIATE;
+        task.save();
+
+        var mem = new models.Memory();
+        // Memory references the agent via a real FK (JCLAW-537, formerly JCLAW-531).
+        mem.agent = agent;
+        mem.text = "remember this";
+        mem.save();
+
+        // JCLAW-541: the four dependents that used to be missing from the sweep.
+        var slack = new models.SlackBinding();
+        slack.agent = agent;
+        slack.botToken = "xoxb-delete-agent";
+        slack.signingSecret = "sec";
+        slack.save();
+
+        var wa = new models.WhatsAppBinding();
+        wa.agent = agent;
+        wa.transport = models.WhatsAppTransport.CLOUD_API;
+        wa.phoneNumberId = "pn-delete-agent";
+        wa.accessToken = "tok";
+        wa.enabled = true;
+        wa.save();
+
+        var compaction = new models.SessionCompaction();
+        compaction.conversation = convo;
+        compaction.turnCount = 2;
+        compaction.summaryTokens = 10;
+        compaction.model = "openrouter/gpt-4.1";
+        compaction.summary = "test compaction";
+        compaction.compactedAt = java.time.Instant.now();
+        compaction.save();
+
+        var run = new models.TaskRun();
+        run.task = task;
+        run.startedAt = java.time.Instant.now();
+        run.status = models.TaskRun.Status.COMPLETED;
+        run.save();
+
+        var runMsg = new models.TaskRunMessage();
+        runMsg.taskRun = run;
+        runMsg.turnIndex = 0;
+        runMsg.role = models.MessageRole.ASSISTANT;
+        runMsg.content = "run output";
+        runMsg.save();
+
+        ConfigService.set("agent.delete-agent.shell.bypassAllowlist", "true");
+        ConfigService.set("agent.delete-agent.queue.mode", "queue");
+
+        var workspace = AgentService.workspacePath("delete-agent");
+        assertTrue(Files.exists(workspace), "precondition: workspace directory exists");
+
+        // Capture ids before delete — after AgentService.delete() the Java references are
+        // detached and Hibernate will reject them in parameterized queries. Counting by id
+        // keeps the assertions independent of the now-transient entities.
+        var agentId = agent.id;
+        var convoId = convo.id;
+        var taskId = task.id;
+        var runId = run.id;
+
+        // Act
+        AgentService.delete(agent);
+
+        // Assert: agent itself and every child row are gone
+        assertNull(Agent.findByName("delete-agent"));
+        assertEquals(0L, models.AgentToolConfig.count("agent.id = ?1", agentId));
+        assertEquals(0L, models.AgentSkillConfig.count("agent.id = ?1", agentId));
+        assertEquals(0L, models.AgentBinding.count("agent.id = ?1", agentId));
+        assertEquals(0L, models.Conversation.count("agent.id = ?1", agentId));
+        assertEquals(0L, models.Message.count("conversation.id = ?1", convoId));
+        assertEquals(0L, models.Task.count("agent.id = ?1", agentId));
+        assertEquals(0L, models.Memory.count("agent.id = ?1", agentId));
+        // JCLAW-541: the previously-unswept dependents.
+        assertEquals(0L, models.SlackBinding.count("agent.id = ?1", agentId));
+        assertEquals(0L, models.WhatsAppBinding.count("agent.id = ?1", agentId));
+        assertEquals(0L, models.SessionCompaction.count("conversation.id = ?1", convoId));
+        assertEquals(0L, models.TaskRun.count("task.id = ?1", taskId));
+        assertEquals(0L, models.TaskRunMessage.count("taskRun.id = ?1", runId));
+        assertNull(ConfigService.get("agent.delete-agent.shell.bypassAllowlist"));
+        assertNull(ConfigService.get("agent.delete-agent.queue.mode"));
+        assertFalse(Files.exists(workspace), "workspace directory should be removed");
+    }
+
+    @Test
+    void deleteAgentCascadesSubagentSubtree() {
+        // JCLAW-542: deleting a parent agent removes its whole sub-agent subtree
+        // via the Agent self-FK ON DELETE CASCADE (replacing the old recursive
+        // sweep), plus each descendant's FK-linked child rows and its out-of-band
+        // resources (workspace dir + agent.<name>.* config).
+        var parent = AgentService.create("subtree-parent", "openrouter", "gpt-4.1");
+        var child = AgentService.create("subtree-child", "openrouter", "gpt-4.1");
+        child.parentAgent = parent;
+        child.save();
+        var grandchild = AgentService.create("subtree-grandchild", "openrouter", "gpt-4.1");
+        grandchild.parentAgent = child;
+        grandchild.save();
+
+        // A subagent-run linking parent->child needs a conversation on each side.
+        var pconv = new models.Conversation();
+        pconv.agent = parent;
+        pconv.channelType = "web";
+        pconv.peerId = "p";
+        pconv.save();
+        var cconv = new models.Conversation();
+        cconv.agent = child;
+        cconv.channelType = "web";
+        cconv.peerId = "c";
+        cconv.save();
+
+        var run = new models.SubagentRun();
+        run.parentAgent = parent;
+        run.childAgent = child;
+        run.parentConversation = pconv;
+        run.childConversation = cconv;
+        run.startedAt = java.time.Instant.now();
+        run.status = models.SubagentRun.Status.RUNNING;
+        run.save();
+
+        ConfigService.set("agent.subtree-child.shell.bypassAllowlist", "true");
+
+        var parentId = parent.id;
+        var childId = child.id;
+        var runId = run.id;
+        var childWorkspace = AgentService.workspacePath("subtree-child");
+        assertTrue(Files.exists(childWorkspace), "precondition: child workspace exists");
+
+        AgentService.delete(parent);
+
+        // Whole subtree of Agent rows gone (self-FK cascade replaces recursion).
+        assertNull(Agent.findByName("subtree-parent"));
+        assertNull(Agent.findByName("subtree-child"), "child sub-agent must cascade");
+        assertNull(Agent.findByName("subtree-grandchild"), "grandchild must cascade");
+        // FK-linked children of the descendants cascade too.
+        assertEquals(0L, models.SubagentRun.count("id = ?1", runId));
+        assertEquals(0L, models.Conversation.count("agent.id = ?1", childId));
+        assertEquals(0L, models.Conversation.count("agent.id = ?1", parentId));
+        // Out-of-band cleanup reached the descendant.
+        assertNull(ConfigService.get("agent.subtree-child.shell.bypassAllowlist"),
+                "descendant config keys must be purged");
+        assertFalse(Files.exists(childWorkspace), "descendant workspace must be removed");
+    }
+
+    @Test
+    void rawAgentDeleteCascadesEveryFkLinkedTable() {
+        // JCLAW-135 AC: prove the DB-level ON DELETE CASCADE (JCLAW-542) end to
+        // end — a raw native "DELETE FROM agent" (NOT AgentService.delete, and
+        // NOT an entity remove) must clear every FK-linked descendant, including
+        // chat_message_attachment (whose FK once carried the now-false "no ON
+        // DELETE CASCADE" comment) and the subagent-run / self-agent subtree.
+        var parent = AgentService.create("cascade-raw-parent", "openrouter", "gpt-4.1");
+        var child = AgentService.create("cascade-raw-child", "openrouter", "gpt-4.1");
+        child.parentAgent = parent;
+        child.save();
+
+        var skillConfig = new models.AgentSkillConfig();
+        skillConfig.agent = parent;
+        skillConfig.skillName = "test-skill";
+        skillConfig.enabled = true;
+        skillConfig.save();
+
+        var binding = new models.AgentBinding();
+        binding.agent = parent;
+        binding.channelType = "web";
+        binding.peerId = "raw-peer";
+        binding.save();
+
+        var slack = new models.SlackBinding();
+        slack.agent = parent;
+        slack.botToken = "xoxb-cascade-raw";
+        slack.signingSecret = "sec";
+        slack.save();
+
+        var wa = new models.WhatsAppBinding();
+        wa.agent = parent;
+        wa.transport = models.WhatsAppTransport.CLOUD_API;
+        wa.phoneNumberId = "pn-cascade-raw";
+        wa.accessToken = "tok";
+        wa.enabled = true;
+        wa.save();
+
+        var grant = new models.ToolApprovalGrant();
+        grant.agent = parent;
+        grant.toolName = "shell";
+        grant.save();
+
+        var convo = new models.Conversation();
+        convo.agent = parent;
+        convo.channelType = "web";
+        convo.peerId = "raw-peer";
+        convo.save();
+
+        var childConvo = new models.Conversation();
+        childConvo.agent = child;
+        childConvo.channelType = "subagent";
+        childConvo.peerId = "raw-child-peer";
+        childConvo.parentConversation = convo;
+        childConvo.save();
+
+        var msg = new models.Message();
+        msg.conversation = convo;
+        msg.role = "user";
+        msg.content = "hello";
+        msg.save();
+
+        // The headline addition: a chat_message_attachment row hanging off the message.
+        var attachment = new models.MessageAttachment();
+        attachment.message = msg;
+        attachment.uuid = java.util.UUID.randomUUID().toString();
+        attachment.originalFilename = "note.txt";
+        attachment.storagePath = "workspace/x/attachments/1/note.txt";
+        attachment.mimeType = "text/plain";
+        attachment.sizeBytes = 12L;
+        attachment.kind = models.MessageAttachment.KIND_FILE;
+        attachment.save();
+
+        var compaction = new models.SessionCompaction();
+        compaction.conversation = convo;
+        compaction.turnCount = 2;
+        compaction.summaryTokens = 10;
+        compaction.model = "openrouter/gpt-4.1";
+        compaction.summary = "test compaction";
+        compaction.compactedAt = java.time.Instant.now();
+        compaction.save();
+
+        var task = new models.Task();
+        task.agent = parent;
+        task.name = "raw-task";
+        task.type = models.Task.Type.IMMEDIATE;
+        task.save();
+
+        var run = new models.TaskRun();
+        run.task = task;
+        run.startedAt = java.time.Instant.now();
+        run.status = models.TaskRun.Status.COMPLETED;
+        run.save();
+
+        var runMsg = new models.TaskRunMessage();
+        runMsg.taskRun = run;
+        runMsg.turnIndex = 0;
+        runMsg.role = models.MessageRole.ASSISTANT;
+        runMsg.content = "run output";
+        runMsg.save();
+
+        var subrun = new models.SubagentRun();
+        subrun.parentAgent = parent;
+        subrun.childAgent = child;
+        subrun.parentConversation = convo;
+        subrun.childConversation = childConvo;
+        subrun.startedAt = java.time.Instant.now();
+        subrun.status = models.SubagentRun.Status.RUNNING;
+        subrun.save();
+
+        var mem = new models.Memory();
+        mem.agent = parent;
+        mem.text = "remember this";
+        mem.save();
+
+        var parentId = parent.id;
+        var childId = child.id;
+        var convoId = convo.id;
+        var childConvoId = childConvo.id;
+        var msgId = msg.id;
+        var taskId = task.id;
+        var runId = run.id;
+        var subrunId = subrun.id;
+
+        // Flush seeded rows to the DB, then a RAW NATIVE SQL delete of the root
+        // agent — no JPQL, no entity remove, so no @PostRemove / JPA cascade
+        // fires; only the database's ON DELETE CASCADE does the work. Clear the
+        // stale first-level cache so the count assertions re-read from the DB.
+        var em = play.db.jpa.JPA.em();
+        em.flush();
+        em.createNativeQuery("DELETE FROM agent WHERE id = ?1")
+                .setParameter(1, parentId).executeUpdate();
+        em.clear();
+
+        // Root agent and its self-FK subtree child are both gone.
+        assertNull(Agent.findByName("cascade-raw-parent"));
+        assertNull(Agent.findByName("cascade-raw-child"), "self-FK subtree child must cascade");
+        // Every FK-linked table is empty for the deleted subtree.
+        assertEquals(0L, models.AgentToolConfig.count("agent.id = ?1", parentId));
+        assertEquals(0L, models.AgentSkillConfig.count("agent.id = ?1", parentId));
+        assertEquals(0L, models.AgentBinding.count("agent.id = ?1", parentId));
+        assertEquals(0L, models.SlackBinding.count("agent.id = ?1", parentId));
+        assertEquals(0L, models.WhatsAppBinding.count("agent.id = ?1", parentId));
+        assertEquals(0L, models.ToolApprovalGrant.count("agent.id = ?1", parentId));
+        assertEquals(0L, models.Conversation.count("agent.id = ?1", parentId));
+        assertEquals(0L, models.Conversation.count("agent.id = ?1", childId));
+        assertEquals(0L, models.Message.count("conversation.id = ?1", convoId));
+        assertEquals(0L, models.MessageAttachment.count("message.id = ?1", msgId),
+                "chat_message_attachment must cascade off the message delete");
+        assertEquals(0L, models.SessionCompaction.count("conversation.id = ?1", convoId));
+        assertEquals(0L, models.SessionCompaction.count("conversation.id = ?1", childConvoId));
+        assertEquals(0L, models.Task.count("agent.id = ?1", parentId));
+        assertEquals(0L, models.TaskRun.count("task.id = ?1", taskId));
+        assertEquals(0L, models.TaskRunMessage.count("taskRun.id = ?1", runId));
+        assertEquals(0L, models.SubagentRun.count("id = ?1", subrunId));
+        assertEquals(0L, models.Memory.count("agent.id = ?1", parentId));
+    }
+
+    // --- SystemPromptAssembler tests ---
+
+    @Test
+    void assembleIncludesWorkspaceFiles() {
+        var agent = AgentService.create("prompt-agent", "openrouter", "gpt-4.1");
+        AgentService.writeWorkspaceFile("prompt-agent", "AGENT.md", "# Be helpful and concise");
+
+        var assembled = SystemPromptAssembler.assemble(agent, "test query");
+        assertNotNull(assembled.systemPrompt());
+        assertTrue(assembled.systemPrompt().contains("Be helpful and concise"));
+        // Current date/time is no longer in the system prompt at all — it rides
+        // the last user message now (CurrentTimeInjector), so the whole prompt
+        // stays byte-stable across turns.
+        assertFalse(assembled.systemPrompt().contains("## Current Date and Time"));
+        assertTrue(assembled.systemPrompt().contains("Platform:"));
+    }
+
+    /**
+     * Prompt-prefix stability is the precondition for LLM provider prompt caching:
+     * every byte of the system prompt is hashed into the cache key, so any per-request
+     * variance (timestamps, UUIDs, non-deterministic tool/skill ordering, etc.) causes
+     * every turn to miss the cache. This test is the guardrail — it fails the build if
+     * anyone accidentally re-introduces dynamic content into the cacheable region of
+     * the system prompt. Recalled memories legitimately vary per turn and sit at the
+     * tail, so we check stability with the same user message across both calls.
+     */
+    @Test
+    void assembleIsStableAcrossCallsWithSameInputs() {
+        var agent = AgentService.create("prompt-agent", "openrouter", "gpt-4.1");
+        AgentService.writeWorkspaceFile("prompt-agent", "AGENT.md", "# Be stable");
+
+        var first = SystemPromptAssembler.assemble(agent, "same user message");
+        var second = SystemPromptAssembler.assemble(agent, "same user message");
+
+        assertEquals(first.systemPrompt(), second.systemPrompt(),
+                "System prompt must be byte-identical for identical inputs, otherwise "
+                        + "LLM provider prompt caching will miss on every request. "
+                        + "Likely culprit: a timestamp, UUID, or non-deterministic ordering "
+                        + "(tools, skills, memories) was added to the prompt.");
+    }
+
+    @Test
+    void assembleSkipsOptionalFiles() {
+        var agent = AgentService.create("minimal-agent", "openrouter", "gpt-4.1");
+        // Delete optional files — SOUL, IDENTITY, USER, and BOOTSTRAP are all
+        // optional; only AGENT.md is the load-bearing instruction file.
+        var dir = AgentService.workspacePath("minimal-agent");
+        try {
+            Files.deleteIfExists(dir.resolve("SOUL.md"));
+            Files.deleteIfExists(dir.resolve("IDENTITY.md"));
+            Files.deleteIfExists(dir.resolve("USER.md"));
+            Files.deleteIfExists(dir.resolve("BOOTSTRAP.md"));
+        } catch (IOException _) {}
+
+        var assembled = SystemPromptAssembler.assemble(agent, "test");
+        assertNotNull(assembled.systemPrompt());
+        // Should still have AGENT.md content and environment info
+        assertTrue(assembled.systemPrompt().contains("Environment"));
+    }
+
+    @Test
+    void assembleIncludesSoulAndBootstrapWhenPopulated() {
+        var agent = AgentService.create("soul-boot-agent", "openrouter", "gpt-4.1");
+        AgentService.writeWorkspaceFile("soul-boot-agent", "SOUL.md", "# Soul\nPragmatic realism.");
+        AgentService.writeWorkspaceFile("soul-boot-agent", "BOOTSTRAP.md", "# Bootstrap\nPrime with caffeine.");
+        AgentService.writeWorkspaceFile("soul-boot-agent", "IDENTITY.md", "# Identity\nName: Soul Boot");
+        AgentService.writeWorkspaceFile("soul-boot-agent", "AGENT.md", "# Agent\nDo the thing.");
+
+        var prompt = SystemPromptAssembler.assemble(agent, "hello").systemPrompt();
+        assertTrue(prompt.contains("Pragmatic realism."), "SOUL.md content must appear in the prompt");
+        assertTrue(prompt.contains("Prime with caffeine."), "BOOTSTRAP.md content must appear in the prompt");
+
+        // Narrative ordering invariant: SOUL → IDENTITY → USER → BOOTSTRAP → AGENT.
+        // Assert on the two new files relative to each other and to AGENT.md so the
+        // intended sequence can't silently regress.
+        int soulIdx = prompt.indexOf("Pragmatic realism.");
+        int identIdx = prompt.indexOf("Name: Soul Boot");
+        int bootIdx = prompt.indexOf("Prime with caffeine.");
+        int agentIdx = prompt.indexOf("Do the thing.");
+        assertTrue(soulIdx >= 0 && identIdx >= 0 && bootIdx >= 0 && agentIdx >= 0,
+                "all four section bodies must be present");
+        assertTrue(soulIdx < identIdx, "SOUL must appear before IDENTITY");
+        assertTrue(identIdx < bootIdx, "IDENTITY must appear before BOOTSTRAP");
+        assertTrue(bootIdx < agentIdx, "BOOTSTRAP must appear before AGENT");
+    }
+
+    @Test
+    void breakdownExposesSoulAndBootstrapSections() {
+        var agent = AgentService.create("breakdown-agent", "openrouter", "gpt-4.1");
+        var breakdown = SystemPromptAssembler.breakdown(agent, null, "web");
+        var names = breakdown.sections().stream()
+                .map(SystemPromptAssembler.PromptBreakdown.Entry::name).toList();
+        assertTrue(names.contains("SOUL.md"), "SOUL.md section must be present in breakdown");
+        assertTrue(names.contains("BOOTSTRAP.md"), "BOOTSTRAP.md section must be present in breakdown");
+    }
+
+    @Test
+    void assembleIncludesSafetyAndExecutionBias() {
+        var agent = AgentService.create("prompt-agent", "openrouter", "gpt-4.1");
+        var prompt = SystemPromptAssembler.assemble(agent, "test").systemPrompt();
+        assertTrue(prompt.contains("## Safety"), "must include Safety section");
+        assertTrue(prompt.contains("no self-preservation interest"),
+                "Safety section must cover self-preservation");
+        assertTrue(prompt.contains("## Execution Bias"), "must include Execution Bias section");
+        assertTrue(prompt.contains("Do the work rather than narrating"),
+                "Execution Bias section must carry its core guidance");
+    }
+
+    @Test
+    void assembleEnvironmentIncludesModelAndRuntime() {
+        var agent = AgentService.create("prompt-agent", "openrouter", "gpt-4.1-new");
+        var prompt = SystemPromptAssembler.assemble(agent, "test").systemPrompt();
+        assertTrue(prompt.contains("Model: gpt-4.1-new"), "must expose the agent model id");
+        assertTrue(prompt.contains("JClaw version:"), "must expose the app version");
+        assertTrue(prompt.contains("Runtime: Java"), "must expose the Java runtime version");
+    }
+
+    /**
+     * Sanity check for the Settings UI introspection dialog: the breakdown numbers must
+     * actually match the real assembled prompt. If the build sequence in `buildPrompt`
+     * ever drifts from `assemble`, this test fails — which is the whole point of
+     * routing both through the shared private helper.
+     */
+    @Test
+    void breakdownMatchesAssembledPrompt() {
+        var agent = AgentService.create("prompt-agent", "openrouter", "gpt-4.1");
+        AgentService.writeWorkspaceFile("prompt-agent", "AGENT.md", "# Be helpful");
+
+        // "web" chosen arbitrarily — the symmetry check holds for any channel,
+        // and the introspection dialog defaults to web, so the numbers match
+        // what an operator sees in the UI.
+        var assembled = SystemPromptAssembler.assemble(agent, null, null, "web").systemPrompt();
+        var breakdown = SystemPromptAssembler.breakdown(agent, null, "web");
+
+        // Sum of section chars equals the real prompt length. If this drifts, the
+        // build sequences have forked.
+        int sectionSum = breakdown.sections().stream().mapToInt(SystemPromptAssembler.PromptBreakdown.Entry::chars).sum();
+        assertEquals(assembled.length(), sectionSum,
+                "sum of per-section chars must equal the full prompt length");
+
+        // Every section name we know must appear. Use a subset to avoid making this
+        // test fragile against future section additions.
+        var names = breakdown.sections().stream().map(SystemPromptAssembler.PromptBreakdown.Entry::name).toList();
+        assertTrue(names.contains("AGENT.md"), "AGENT.md section must be present");
+        assertTrue(names.contains("Environment"), "Environment section must be present");
+        assertTrue(names.contains("Safety"), "Safety section must be present");
+        assertTrue(names.contains("Execution Bias"), "Execution Bias section must be present");
+        assertTrue(names.contains("Cache Boundary"), "Cache Boundary section must be present");
+
+        // Prefix + suffix must span the whole prompt (±the marker length itself).
+        assertEquals(
+                assembled.length(),
+                breakdown.cacheablePrefixChars() + SystemPromptAssembler.CACHE_BOUNDARY_MARKER.length() + breakdown.variableSuffixChars(),
+                "prefix + marker + suffix must equal the full prompt length");
+
+        // Totals are sane: at least as large as the prompt (tool schemas add more).
+        assertTrue(breakdown.totalChars() >= assembled.length(),
+                "total chars must include the prompt");
+        assertTrue(breakdown.totalTokenEstimate() > 0, "token estimate must be positive");
+    }
+
+    // --- Channel-aware prompt sections (JCLAW-17) ---
+
+    @Test
+    void assembleWithNullChannelSkipsChannelGuidance() {
+        var agent = AgentService.create("channel-null-agent", "openrouter", "gpt-4.1");
+        var prompt = SystemPromptAssembler.assemble(agent, null, null, null).systemPrompt();
+        assertFalse(prompt.contains("## Channel Guidance"),
+                "null channel must not inject a Channel Guidance section");
+    }
+
+    @Test
+    void assembleWithWebChannelInjectsWebGuidance() {
+        var agent = AgentService.create("channel-web-agent", "openrouter", "gpt-4.1");
+        var prompt = SystemPromptAssembler.assemble(agent, null, null, "web").systemPrompt();
+        assertTrue(prompt.contains("## Channel Guidance (web)"),
+                "web channel must inject a header");
+        assertTrue(prompt.contains("JClaw web admin chat UI"),
+                "web guidance body must mention the admin chat UI");
+        // Channel section sits in the stable prefix (above the cache boundary marker).
+        var markerIdx = prompt.indexOf(SystemPromptAssembler.CACHE_BOUNDARY_MARKER);
+        var guidanceIdx = prompt.indexOf("## Channel Guidance");
+        assertTrue(markerIdx > 0, "marker must be present");
+        assertTrue(guidanceIdx > 0 && guidanceIdx < markerIdx,
+                "Channel Guidance must live above the cache boundary so it contributes to the cacheable prefix");
+    }
+
+    @Test
+    void assembleWithTelegramChannelInjectsTelegramGuidance() {
+        var agent = AgentService.create("channel-tg-agent", "openrouter", "gpt-4.1");
+        var prompt = SystemPromptAssembler.assemble(agent, null, null, "telegram").systemPrompt();
+        assertTrue(prompt.contains("## Channel Guidance (telegram)"),
+                "telegram channel must inject a header");
+        assertTrue(prompt.contains("responding via a Telegram bot"),
+                "telegram guidance body must identify the channel");
+        assertTrue(prompt.contains("Markdown tables"),
+                "telegram guidance must call out the table limitation explicitly");
+    }
+
+    @Test
+    void assembleWithChannelTypeCaseInsensitive() {
+        var agent = AgentService.create("channel-case-agent", "openrouter", "gpt-4.1");
+        var upper = SystemPromptAssembler.assemble(agent, null, null, "TELEGRAM").systemPrompt();
+        var lower = SystemPromptAssembler.assemble(agent, null, null, "telegram").systemPrompt();
+        assertTrue(upper.contains("responding via a Telegram bot"),
+                "uppercase channelType must resolve the same guidance as lowercase");
+        // Headers are lowercased for consistency with the channel_type DB convention.
+        assertTrue(upper.contains("## Channel Guidance (telegram)"),
+                "header channel label must be lowercased regardless of input case");
+        assertEquals(upper, lower,
+                "channelType resolution must be case-insensitive end-to-end");
+    }
+
+    @Test
+    void assembleWithUnregisteredChannelSkipsSection() {
+        // Slack and WhatsApp have no registered guidance yet — they should produce
+        // the same prompt as a null channelType (no section at all).
+        var agent = AgentService.create("channel-unregistered-agent", "openrouter", "gpt-4.1");
+        var slack = SystemPromptAssembler.assemble(agent, null, null, "slack").systemPrompt();
+        var whatsapp = SystemPromptAssembler.assemble(agent, null, null, "whatsapp").systemPrompt();
+        var baseline = SystemPromptAssembler.assemble(agent, null, null, null).systemPrompt();
+        assertEquals(baseline, slack,
+                "slack has no registered guidance yet; prompt should match the null baseline");
+        assertEquals(baseline, whatsapp,
+                "whatsapp has no registered guidance yet; prompt should match the null baseline");
+    }
+
+    @Test
+    void breakdownReportsChannelGuidanceAsItsOwnSection() {
+        var agent = AgentService.create("channel-breakdown-agent", "openrouter", "gpt-4.1");
+        var breakdown = SystemPromptAssembler.breakdown(agent, null, "telegram");
+        var names = breakdown.sections().stream()
+                .map(SystemPromptAssembler.PromptBreakdown.Entry::name)
+                .toList();
+        assertTrue(names.stream().anyMatch(n -> n.startsWith("Channel Guidance")),
+                "breakdown must expose the channel section so the UI can show it");
+    }
+
+    /**
+     * The cache-boundary marker separates the byte-stable prefix from the per-turn-variable
+     * tail. This test asserts (1) the marker is present, (2) nothing above it varies even
+     * when the *user message* changes (which triggers different memory recall results), and
+     * (3) the memories section sits below the marker, not above.
+     */
+    @Test
+    void assembleCacheBoundaryKeepsPrefixStable() {
+        var agent = AgentService.create("prompt-agent", "openrouter", "gpt-4.1");
+
+        var first = SystemPromptAssembler.assemble(agent, "first user message").systemPrompt();
+        var second = SystemPromptAssembler.assemble(agent, "entirely different request").systemPrompt();
+
+        var firstIdx = first.indexOf(SystemPromptAssembler.CACHE_BOUNDARY_MARKER);
+        var secondIdx = second.indexOf(SystemPromptAssembler.CACHE_BOUNDARY_MARKER);
+        assertTrue(firstIdx > 0, "cache boundary marker must be present");
+        assertTrue(secondIdx > 0, "cache boundary marker must be present");
+
+        var firstPrefix = first.substring(0, firstIdx);
+        var secondPrefix = second.substring(0, secondIdx);
+        assertEquals(firstPrefix, secondPrefix,
+                "everything above the cache boundary must be byte-identical regardless of "
+                        + "the user message — otherwise the LLM provider prompt cache will miss "
+                        + "on every turn. Something variable was appended above the boundary.");
+    }
+
+    // --- Helpers ---
+
+    private static void cleanupTestAgents() {
+        for (var name : TEST_AGENTS) {
+            deleteDir(AgentService.workspacePath(name));
+        }
+    }
+
+    private static void deleteDir(Path dir) {
+        if (!Files.exists(dir)) return;
+        try (var walk = Files.walk(dir)) {
+            walk.sorted(java.util.Comparator.reverseOrder())
+                    .forEach(p -> {
+                        try { Files.delete(p); } catch (IOException _) {}
+                    });
+        } catch (IOException _) {}
+    }
+}

@@ -1,0 +1,142 @@
+import { describe, it, expect } from 'vitest'
+import { mountSuspended } from '@nuxt/test-utils/runtime'
+import ApiErrorAlert from '~/components/ApiErrorAlert.vue'
+import type { ApiErrorDetails } from '~/types/api'
+
+// JCLAW-1131: one renderer for every API error — the headline plus what broke, what to
+// check and how to retry.
+describe('ApiErrorAlert', () => {
+  const refused: ApiErrorDetails = {
+    code: 'forbidden',
+    message: 'voice.endpoint.baseSilenceMs must not exceed voice.endpoint.maxSilenceMs (1500).',
+    template: {
+      whatBroke: 'You are signed in, but not allowed to do this.',
+      whatToCheck: 'Check whether the operation is operator-only.',
+      howToRetry: 'Make the change yourself in the admin UI.',
+    },
+  }
+
+  it('renders nothing when there is no error', async () => {
+    const c = await mountSuspended(ApiErrorAlert, { props: { error: null } })
+    expect(c.find('[data-testid="api-error"]').exists()).toBe(false)
+  })
+
+  it('renders the message and all three parts', async () => {
+    const c = await mountSuspended(ApiErrorAlert, { props: { error: refused } })
+
+    const text = c.find('[role="alert"]').text()
+    expect(text).toContain('must not exceed')
+    expect(text).toContain('What broke')
+    expect(text).toContain('You are signed in, but not allowed to do this.')
+    expect(text).toContain('What to check')
+    expect(text).toContain('How to retry')
+    expect(text).toContain('Make the change yourself in the admin UI.')
+  })
+
+  it('omits the retry section when the failure has no retry path', async () => {
+    const noRetry = { ...refused, template: { ...refused.template!, howToRetry: null } }
+    const c = await mountSuspended(ApiErrorAlert, { props: { error: noRetry } })
+
+    const text = c.find('[role="alert"]').text()
+    expect(text).toContain('What to check')
+    expect(text).not.toContain('How to retry')
+  })
+
+  it('renders the message alone when the server sent no template', async () => {
+    const c = await mountSuspended(ApiErrorAlert, {
+      props: { error: { code: null, message: 'Save failed', template: null } },
+    })
+
+    const text = c.find('[role="alert"]').text()
+    expect(text).toContain('Save failed')
+    expect(text).not.toContain('What broke')
+  })
+
+  // JCLAW-61 tuned --danger to ≥4.5:1 on --muted and --surface-elevated in both themes;
+  // the raw text-red-700/dark:text-red-400 pair most panels use is not that token.
+  it('colours itself with the semantic danger token and no raw red utility', async () => {
+    const c = await mountSuspended(ApiErrorAlert, { props: { error: refused } })
+
+    expect(c.find('[data-testid="api-error"]').classes()).toContain('text-danger')
+    expect(c.html()).not.toContain('text-red-')
+  })
+
+  describe('headline', () => {
+    it('replaces the message and keeps the server\'s own beneath it', async () => {
+      const c = await mountSuspended(ApiErrorAlert, {
+        props: {
+          error: { code: 'upstream_error', message: 'Provider returned HTTP 401', template: null },
+          headline: 'Could not reach openrouter.',
+        },
+      })
+
+      const text = c.find('[role="alert"]').text()
+      expect(text).toContain('Could not reach openrouter.')
+      expect(text).toContain('Provider returned HTTP 401')
+    })
+
+    // With no code the envelope never parsed, so the message is $fetch's raw status line.
+    it('drops the message when the failure carried no code', async () => {
+      const c = await mountSuspended(ApiErrorAlert, {
+        props: {
+          error: { code: null, message: '[POST] "/api/x": 502 Bad Gateway', template: null },
+          headline: 'Could not reach openrouter.',
+        },
+      })
+
+      const text = c.find('[role="alert"]').text()
+      expect(text).toContain('Could not reach openrouter.')
+      expect(text).not.toContain('502 Bad Gateway')
+    })
+  })
+
+  /**
+   * JCLAW-1213: contrast must be a property of the component, not of where a caller drops it.
+   * Measured live, the alert rendered at 4.64:1 inside the providers panel's bg-blue-50 container
+   * — passing, but on a background nobody tuned against, and jsdom cannot see composed contrast
+   * so no other test here can catch it drifting. Owning a tuned surface is what makes the
+   * docstring's >=4.5:1 claim true wherever it is placed; this pins that it keeps owning one.
+   */
+  it('supplies its own tuned background rather than inheriting the container', async () => {
+    const component = await mountSuspended(ApiErrorAlert, {
+      props: { error: { code: 'not_found', message: 'gone', template: null } },
+    })
+    expect(component.get('[data-testid="api-error"]').classes()).toContain('bg-surface-elevated')
+  })
+
+  // --- JCLAW-1137: retry is opt-in per call ---
+
+  const ERR = { code: 'internal_error', message: 'boom', template: null }
+
+  /** Default is no button: only the caller knows whether the failed request is safe to repeat. */
+  it('renders no retry control unless the caller supplies one', async () => {
+    const component = await mountSuspended(ApiErrorAlert, { props: { error: ERR } })
+    expect(component.find('[data-testid="api-error-retry"]').exists()).toBe(false)
+  })
+
+  it('renders a retry control that re-runs the call when one is supplied', async () => {
+    let calls = 0
+    const component = await mountSuspended(ApiErrorAlert, {
+      props: { error: ERR, retry: () => { calls++ } } })
+    await component.get('[data-testid="api-error-retry"]').trigger('click')
+    expect(calls).toBe(1)
+  })
+
+  /** A second click while the first retry is in flight must not fire a second request. */
+  it('disables the retry control while the retry is in flight', async () => {
+    let calls = 0
+    const component = await mountSuspended(ApiErrorAlert, {
+      props: { error: ERR, retry: () => { calls++ }, retrying: true } })
+    const button = component.get('[data-testid="api-error-retry"]')
+    expect(button.attributes('disabled')).toBeDefined()
+    expect(button.text()).toBe('Retrying…')
+    await button.trigger('click')
+    expect(calls, 'a disabled button must not re-run the call').toBe(0)
+  })
+
+  it('renders nothing at all — including no retry — when there is no error', async () => {
+    const component = await mountSuspended(ApiErrorAlert, {
+      props: { error: null, retry: () => {} } })
+    expect(component.find('[data-testid="api-error-retry"]').exists()).toBe(false)
+  })
+})

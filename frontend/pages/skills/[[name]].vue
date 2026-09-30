@@ -1,0 +1,1808 @@
+<script setup lang="ts">
+import {
+  ArrowPathIcon,
+  ChevronRightIcon,
+  CodeBracketIcon,
+  Cog6ToothIcon,
+  CommandLineIcon,
+  DocumentTextIcon,
+  EyeIcon,
+  FolderIcon,
+  MagnifyingGlassIcon,
+  TrashIcon,
+} from '@heroicons/vue/24/outline'
+import { marked } from 'marked'
+import DOMPurify from 'dompurify'
+import type {
+  Agent,
+  AgentSkill,
+  CatalogInfo,
+  CatalogPage,
+  CatalogSkill,
+  CategoryFacet,
+  Skill,
+  SkillFile,
+  SkillFileContent,
+  SkillFilesResponse,
+  SkillToolRef,
+} from '~/types/api'
+
+marked.setOptions({ breaks: true, gfm: true })
+
+// Tool-pill color map (shared with agents.vue) — keeps per-tool color coding
+// consistent between the Agent detail page and these skill cards.
+const { getPillClass } = useToolMeta()
+
+// Fetched together, not in sequence: three awaits in a row make the page wait out
+// three round trips for data none of which depends on the others.
+const [
+  { data: skills, refresh: refreshSkills },
+  { data: agents },
+  { data: agentSkillsSeed, refresh: refreshAgentSkills },
+] = await Promise.all([
+  useFetch<Skill[]>('/api/skills'),
+  useFetch<Agent[]>('/api/agents'),
+  // Awaited, so the agent rows paint at full height instead of expanding into place.
+  useFetch<Record<string, AgentSkill[]>>('/api/skills/by-agent'),
+])
+
+// One page instance across /skills and /skills/<name>. NuxtPage keys by path by
+// default, so opening a skill would otherwise unmount and remount the whole page —
+// refetching every panel, and letting the outgoing instance's onUnmounted null the
+// breadcrumb the incoming one had already set.
+definePageMeta({ key: () => '/skills' })
+
+const route = useRoute()
+const router = useRouter()
+
+/** JSON object keys are strings; the template indexes by the numeric agent id. */
+function toSkillsMap(seed: Record<string, AgentSkill[]> | null | undefined): Record<number, AgentSkill[]> {
+  return Object.fromEntries(Object.entries(seed ?? {}).map(([id, list]) => [Number(id), list]))
+}
+
+const agentSkillsMap = ref<Record<number, AgentSkill[]>>(toSkillsMap(agentSkillsSeed.value))
+const loadingAgents = ref(false)
+
+async function loadAllAgentSkills() {
+  loadingAgents.value = true
+  await refreshAgentSkills()
+  agentSkillsMap.value = toSkillsMap(agentSkillsSeed.value)
+  loadingAgents.value = false
+}
+
+// Not immediate: the seed above already covers the first render.
+watch(agents, () => loadAllAgentSkills())
+
+// --- Importable-skills catalogs (static dump + dynamic registry) ---
+// Two catalog TYPES, browsed one at a time via a selector:
+//  - static (Mastra/GitHub): local index → topical facets + jump-to-page.
+//  - dynamic (ClawHub): live API proxy → cursor Next/Prev, no global facets.
+// $fetch (not useFetch) keeps each request imperative + uncached.
+const CATALOG_PAGE_SIZE = 20
+const catalogOpen = ref(false)
+const catalogs = ref<CatalogInfo[]>([])
+const selectedCatalog = ref('')
+const catalogType = computed(() =>
+  catalogs.value.find(c => c.id === selectedCatalog.value)?.type ?? 'static')
+
+const catalogQuery = ref('')
+const catalogSort = ref<'installs' | 'name'>('installs')
+const catalogLoading = ref(false)
+const catalogError = ref<string | null>(null)
+const catalogResults = ref<CatalogSkill[]>([])
+const catalogSize = ref<number | null>(null)
+const catalogScrapedAt = ref<string | null>(null)
+// Static nav: facets + page-jump.
+const catalogCategory = ref('All')
+const catalogPage = ref(0)
+const catalogTotal = ref(0)
+const catalogFacets = ref<CategoryFacet[]>([])
+// Dynamic nav: cursor stack (each entry produced that page; [null] = page 0).
+const cursorStack = ref<(string | null)[]>([null])
+const nextCursor = ref<string | null>(null)
+// Monotonic guard so a slow in-flight request can't overwrite a newer one.
+let catalogSeq = 0
+
+const catalogTotalPages = computed(() =>
+  Math.max(1, Math.ceil(catalogTotal.value / CATALOG_PAGE_SIZE)))
+const hasNextPage = computed(() =>
+  catalogType.value === 'dynamic' ? !!nextCursor.value : catalogPage.value < catalogTotalPages.value - 1)
+const hasPrevPage = computed(() =>
+  catalogType.value === 'dynamic' ? cursorStack.value.length > 1 : catalogPage.value > 0)
+
+async function runCatalogSearch() {
+  const seq = ++catalogSeq
+  catalogLoading.value = true
+  catalogError.value = null
+  const dynamic = catalogType.value === 'dynamic'
+  try {
+    const res = await $fetch<CatalogPage>('/api/skills/catalog/search', {
+      params: {
+        catalog: selectedCatalog.value,
+        q: catalogQuery.value,
+        category: catalogCategory.value,
+        page: catalogPage.value,
+        pageSize: CATALOG_PAGE_SIZE,
+        cursor: dynamic ? (cursorStack.value[cursorStack.value.length - 1] ?? '') : '',
+        sort: catalogSort.value,
+      },
+    })
+    if (seq !== catalogSeq) return
+    if (!res.ready) {
+      catalogError.value = 'Could not load this catalog. Check connectivity and try again.'
+      catalogResults.value = []
+      return
+    }
+    catalogResults.value = res.results
+    catalogSize.value = res.catalogSize
+    catalogScrapedAt.value = res.scrapedAt
+    catalogTotal.value = res.total
+    catalogFacets.value = res.facets
+    nextCursor.value = res.nextCursor
+  }
+  catch {
+    if (seq !== catalogSeq) return
+    catalogError.value = 'Catalog request failed.'
+    catalogResults.value = []
+  }
+  finally {
+    if (seq === catalogSeq) catalogLoading.value = false
+  }
+}
+
+// Reset nav (used on a new query, facet change, or catalog switch).
+function resetCatalogNav() {
+  catalogCategory.value = 'All'
+  catalogPage.value = 0
+  cursorStack.value = [null]
+  nextCursor.value = null
+}
+
+function searchCatalog() {
+  resetCatalogNav()
+  runCatalogSearch()
+}
+
+// Snapshot age for static catalogs (dynamic returns null scrapedAt).
+const catalogScrapedLabel = computed(() => {
+  if (!catalogScrapedAt.value) return ''
+  const d = new Date(catalogScrapedAt.value)
+  return Number.isNaN(d.getTime()) ? '' : d.toLocaleDateString()
+})
+
+// Catalog, rename and delete writes whose failure is only logged; none reads the error back.
+const { mutate: mutateSkill } = useApiMutation()
+
+// Re-download a static catalog's snapshot from its source, then re-browse.
+const catalogRefreshing = ref(false)
+async function refreshCatalog() {
+  if (catalogType.value !== 'static' || catalogRefreshing.value) return
+  catalogRefreshing.value = true
+  const refreshed = await mutateSkill('/api/skills/catalog/refresh', { method: 'POST', body: { catalog: selectedCatalog.value } })
+  // On failure the prior results stay; the user can retry.
+  if (refreshed !== null) {
+    catalogResults.value = []
+    resetCatalogNav()
+    await runCatalogSearch() // re-downloads + re-indexes lazily
+  }
+  catalogRefreshing.value = false
+}
+
+function selectCatalog(id: string) {
+  if (selectedCatalog.value === id) return
+  selectedCatalog.value = id
+  catalogQuery.value = ''
+  catalogResults.value = []
+  resetCatalogNav()
+  runCatalogSearch()
+}
+
+// Changing the sort restarts paging (page 0 / first cursor), keeping query + facet.
+function changeSort() {
+  catalogPage.value = 0
+  cursorStack.value = [null]
+  nextCursor.value = null
+  runCatalogSearch()
+}
+
+// Static only: selecting a facet re-paginates within it from page 0.
+function selectFacet(category: string) {
+  if (catalogCategory.value === category) return
+  catalogCategory.value = category
+  catalogPage.value = 0
+  runCatalogSearch()
+}
+
+// Static: jump page. Dynamic: cursor Next/Prev via the stack.
+function nextPage() {
+  if (!hasNextPage.value) return
+  if (catalogType.value === 'dynamic') cursorStack.value.push(nextCursor.value)
+  else catalogPage.value += 1
+  runCatalogSearch()
+}
+
+function prevPage() {
+  if (!hasPrevPage.value) return
+  if (catalogType.value === 'dynamic') cursorStack.value.pop()
+  else catalogPage.value -= 1
+  runCatalogSearch()
+}
+
+async function openCatalog() {
+  catalogOpen.value = true
+  if (!catalogs.value.length) {
+    try {
+      catalogs.value = await $fetch<CatalogInfo[]>('/api/skills/catalogs')
+      if (catalogs.value.length && !selectedCatalog.value) selectedCatalog.value = catalogs.value[0]!.id
+    }
+    catch { /* selector stays empty; search still hits the default catalog */ }
+  }
+  if (!catalogResults.value.length && !catalogLoading.value) runCatalogSearch()
+}
+
+// Import is only wired for the static GitHub catalog (clawhub import is a follow-up).
+const canImport = (s: CatalogSkill) => s.provider === 'mastra' || s.provider === 'clawhub'
+const catalogKey = (s: CatalogSkill) => `${s.provider}/${s.skillId}`
+const importingKey = ref<string | null>(null)
+const importedKeys = ref<Set<string>>(new Set())
+const importMessage = ref<string | null>(null)
+
+async function importSkill(s: CatalogSkill) {
+  const key = catalogKey(s)
+  importingKey.value = key
+  importMessage.value = null
+  const res = await mutateSkill<{ status: string, message?: string, skillName?: string }>(
+    '/api/skills/catalog/import',
+    { method: 'POST', body: { source: s.source, skillId: s.skillId, provider: s.provider, owner: s.owner } },
+  )
+  if (res?.status === 'imported') {
+    importedKeys.value.add(key)
+    await refreshSkills() // the new skill appears in the Global Skills panel
+  }
+  else {
+    importMessage.value = `${s.displayName || s.skillId}: ${res?.message || 'import failed'}`
+  }
+  importingKey.value = null
+}
+
+// Panel filters — case-insensitive substring match against the displayed name.
+// Skills filter on the canonical folderName (falling back to name); agents on
+// `agent.name`. Both lists are alphabetized by display name first so that newly
+// added items land in their correct slot rather than at the end.
+const globalFilter = ref('')
+const agentFilter = ref('')
+
+// Per-agent collapse state for the skill list — keyed by agent id, true =
+// collapsed. The header (name / model / count) stays visible; only the skill
+// rows fold away so a long list (e.g. main's 15) doesn't bury the agents below.
+const collapsedAgents = ref<Record<number, boolean>>({})
+function isAgentCollapsed(id: number): boolean {
+  return !!collapsedAgents.value[id]
+}
+function toggleAgentCollapse(id: number) {
+  collapsedAgents.value[id] = !collapsedAgents.value[id]
+}
+
+// Locale-aware, case-insensitive comparator — matches user expectations across
+// mixed-case names without surprising ASCII-order placements (e.g. "Z" before "a").
+const byName = (a: string, b: string) => a.localeCompare(b, undefined, { sensitivity: 'base' })
+
+// Structural skills are pre-installed and undeletable — they ship with JClaw
+// rather than arriving via promotion. They pin to the top of the global list
+// (above the "CUSTOM SKILLS" divider) in a fixed canonical order: skill-creator
+// is the seed every other skill promotes through, jclaw-api wraps the in-process
+// JClaw-API tool that's main-agent-only by backend policy (AgentService disables
+// the embedded tool on non-main agents at creation time). Single source of truth
+// for the check + ordering so the sort, the trash-hide, and the divider's v-if
+// can't drift apart. Lower number sorts first; Infinity falls into the
+// alphabetical tail.
+const STRUCTURAL_SKILL_ORDER: Record<string, number> = {
+  'skill-creator': 0,
+  'jclaw-api': 1,
+}
+// Duck-typed param so the same predicate covers Skill (global list), AgentSkill
+// (per-agent cards), and the edit modal's union of both. AgentSkill's
+// `[key: string]: unknown` index signature would otherwise force the call sites
+// to narrow before passing — only `folderName || name` is needed and both shapes
+// supply (or are willing to default) those.
+type SkillNameRef = { folderName?: string, name?: string } | null
+const structuralOrder = (s?: SkillNameRef) => STRUCTURAL_SKILL_ORDER[(s?.folderName || s?.name) ?? ''] ?? Infinity
+const isStructuralSkill = (s?: SkillNameRef) => structuralOrder(s) !== Infinity
+
+const filteredSkills = computed(() => {
+  const q = globalFilter.value.trim().toLowerCase()
+  const matched = q
+    ? (skills.value ?? []).filter(s => (s.folderName || s.name).toLowerCase().includes(q))
+    : (skills.value ?? [])
+  return [...matched].sort((a, b) => {
+    const oa = structuralOrder(a)
+    const ob = structuralOrder(b)
+    if (oa !== ob) return oa - ob
+    return byName(a.folderName || a.name, b.folderName || b.name)
+  })
+})
+
+// Agents listing: main agent always first (when it survives the filter), then
+// the remaining agents alphabetically. The main-first rule is structural — it
+// reflects "this is the agent the user converses with by default" — so it sits
+// outside the alphabetical ordering rather than being a special case for
+// names starting with 'm'.
+const filteredAgents = computed(() => {
+  const q = agentFilter.value.trim().toLowerCase()
+  const matched = q
+    ? (agents.value ?? []).filter(a => a.name.toLowerCase().includes(q))
+    : (agents.value ?? [])
+  return [...matched].sort((a, b) => {
+    if (a.isMain !== b.isMain) return a.isMain ? -1 : 1
+    return byName(a.name, b.name)
+  })
+})
+
+// Per-agent skill list, alphabetized by skill name. Memoized via computed so
+// the sort doesn't run on every render — only when the underlying map changes.
+const sortedAgentSkillsMap = computed<Record<number, AgentSkill[]>>(() => {
+  const out: Record<number, AgentSkill[]> = {}
+  for (const [agentId, list] of Object.entries(agentSkillsMap.value)) {
+    out[Number(agentId)] = [...list].sort((a, b) => byName(a.name, b.name))
+  }
+  return out
+})
+
+// Confirm dialog (replaces native window.confirm for destructive actions)
+const { confirm } = useConfirm()
+
+// A skill being dragged can originate from either the global list or an agent
+// card; the union here keeps drag metadata readable without threading two refs.
+type DraggingSkill = Skill | AgentSkill
+
+// Drag state — supports both directions
+const dragging = ref<DraggingSkill | null>(null)
+const dragSource = ref<'global' | 'agent' | null>(null)
+const dragSourceAgentId = ref<number | null>(null)
+const dropTarget = ref<number | null>(null)
+const dropTargetGlobal = ref(false)
+
+// Error banner for drag-drop failures (e.g. missing tools on target agent)
+const dragError = ref<string | null>(null)
+let dragErrorTimer: ReturnType<typeof setTimeout> | null = null
+function showDragError(msg: string) {
+  dragError.value = msg
+  if (dragErrorTimer) clearTimeout(dragErrorTimer)
+  dragErrorTimer = setTimeout(() => {
+    dragError.value = null
+  }, 8000)
+}
+
+// Info banner for non-error events (e.g. promote no-op when workspace matches global)
+const infoBanner = ref<string | null>(null)
+let infoBannerTimer: ReturnType<typeof setTimeout> | null = null
+function showInfo(msg: string) {
+  infoBanner.value = msg
+  if (infoBannerTimer) clearTimeout(infoBannerTimer)
+  infoBannerTimer = setTimeout(() => {
+    infoBanner.value = null
+  }, 6000)
+}
+
+onUnmounted(() => {
+  if (dragErrorTimer) clearTimeout(dragErrorTimer)
+  if (infoBannerTimer) clearTimeout(infoBannerTimer)
+})
+
+// Track multiple concurrent promotions by skill name (survives navigation via useState)
+const promotingSkills = useState<Set<string>>('promotingSkills', () => new Set())
+
+// Reconcile: clear any "promoting" indicators for skills that already exist globally.
+// Handles SSE events missed due to timing, reconnect, or component remount.
+watch(skills, (globalSkills) => {
+  if (!globalSkills || promotingSkills.value.size === 0) return
+  const globalNames = new Set(globalSkills.map(s => s.folderName || s.name))
+  const stillPromoting = new Set<string>()
+  for (const name of promotingSkills.value) {
+    if (!globalNames.has(name)) stillPromoting.add(name)
+  }
+  if (stillPromoting.size !== promotingSkills.value.size) {
+    promotingSkills.value = stillPromoting
+  }
+}, { immediate: true })
+
+// SSE events from the skill-promotion pipeline carry the skill's folder name
+// and optional status text. Narrowing at each handler avoids an `any` leak.
+interface SkillPromoteEvent {
+  skillName: string
+  error?: string
+  reason?: string
+}
+
+function asSkillPromoteEvent(data: unknown): SkillPromoteEvent {
+  const d = (data ?? {}) as Partial<SkillPromoteEvent>
+  return {
+    skillName: typeof d.skillName === 'string' ? d.skillName : '',
+    error: typeof d.error === 'string' ? d.error : undefined,
+    reason: typeof d.reason === 'string' ? d.reason : undefined,
+  }
+}
+
+// Listen for promotion completion via SSE
+const { onEvent } = useEventBus()
+onEvent('skill.promoted', (data) => {
+  const evt = asSkillPromoteEvent(data)
+  refreshSkills()
+  loadAllAgentSkills()
+  const s = new Set(promotingSkills.value)
+  s.delete(evt.skillName)
+  promotingSkills.value = s
+})
+onEvent('skill.promote_failed', (data) => {
+  const evt = asSkillPromoteEvent(data)
+  console.error('Skill promotion failed:', evt.skillName, evt.error)
+  showDragError(evt.error || `Failed to promote '${evt.skillName}'`)
+  const s = new Set(promotingSkills.value)
+  s.delete(evt.skillName)
+  promotingSkills.value = s
+})
+onEvent('skill.promote_noop', (data) => {
+  const evt = asSkillPromoteEvent(data)
+  showInfo(evt.reason || `Nothing to promote for '${evt.skillName}'`)
+  const s = new Set(promotingSkills.value)
+  s.delete(evt.skillName)
+  promotingSkills.value = s
+})
+
+// Look up the current global version of a skill by folder name
+function globalVersionOf(folderName: string): string | null {
+  const s = skills.value?.find(x => (x.folderName || x.name) === folderName)
+  return s?.version ?? null
+}
+
+// Simple semver compare: returns negative/0/positive
+function compareVersions(a: string, b: string): number {
+  const pa = (a || '0.0.0').split('.').map(n => Number.parseInt(n) || 0)
+  const pb = (b || '0.0.0').split('.').map(n => Number.parseInt(n) || 0)
+  for (let i = 0; i < 3; i++) {
+    const x = pa[i] || 0
+    const y = pb[i] || 0
+    if (x !== y) return x - y
+  }
+  return 0
+}
+
+// Returns the global version if an update is available, else null
+function updateAvailable(skill: AgentSkill): string | null {
+  const gv = globalVersionOf(skill.folderName as string || skill.name)
+  if (gv == null) return null
+  return compareVersions(skill.version as string || '0.0.0', gv) < 0 ? gv : null
+}
+
+// Extract a human-readable message from a $fetch error, which may carry the
+// server-rendered text on either `.response._data` or `.data`.
+function asFetchErrorMessage(err: unknown, fallback: string): string {
+  const e = err as { response?: { status?: number, _data?: unknown }, data?: unknown, message?: string } | undefined
+  const msg = e?.response?._data ?? e?.data ?? e?.message
+  return typeof msg === 'string' ? msg : fallback
+}
+
+// copyToAgent answers 400 and 500 with renderText, a body apiErrorDetails cannot read; keep it as the message.
+function rethrowPlainText(err: unknown, fallback: string): never {
+  throw new Error(asFetchErrorMessage(err, fallback))
+}
+
+// Drag-and-drop writes; a failure is shown on the drag banner.
+const dragSave = useSaveAttempt()
+
+async function updateAgentSkillFromGlobal(agentId: number, skill: AgentSkill) {
+  const skillName = (skill.folderName as string) || skill.name
+  const ok = await dragSave.attempt(async () => {
+    await $fetch(`/api/agents/${agentId}/skills/${skillName}/copy`, { method: 'POST' })
+      .catch(err => rethrowPlainText(err, 'Failed to update skill from global'))
+    agentSkillsMap.value[agentId] = await $fetch<AgentSkill[]>(`/api/agents/${agentId}/skills`)
+  })
+  if (ok) showInfo(`Updated '${skillName}' for this agent`)
+  else showDragError(dragSave.saveError.value!.message)
+}
+
+// --- Global skill → Agent card (copy to workspace) ---
+
+function onGlobalDragStart(e: DragEvent, skill: Skill) {
+  dragging.value = skill
+  dragSource.value = 'global'
+  dragSourceAgentId.value = null
+  if (e.dataTransfer) {
+    e.dataTransfer.effectAllowed = 'copy'
+    e.dataTransfer.setData('text/plain', skill.name)
+  }
+}
+
+function onAgentSkillDragStart(e: DragEvent, skill: AgentSkill, agentId: number) {
+  dragging.value = skill
+  dragSource.value = 'agent'
+  dragSourceAgentId.value = agentId
+  if (e.dataTransfer) {
+    e.dataTransfer.effectAllowed = 'copy'
+    e.dataTransfer.setData('text/plain', skill.name)
+  }
+}
+
+function onDragEnd() {
+  dragging.value = null
+  dragSource.value = null
+  dragSourceAgentId.value = null
+  dropTarget.value = null
+  dropTargetGlobal.value = false
+}
+
+function onAgentDragOver(e: DragEvent, agentId: number) {
+  if (dragSource.value !== 'global') return
+  e.preventDefault()
+  if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy'
+  dropTarget.value = agentId
+}
+
+function onAgentDragLeave(agentId: number) {
+  if (dropTarget.value === agentId) dropTarget.value = null
+}
+
+async function onAgentDrop(e: DragEvent, agent: Agent) {
+  e.preventDefault()
+  dropTarget.value = null
+  if (!dragging.value || dragSource.value !== 'global') return
+
+  const dragged = dragging.value
+  const skillName = (dragged.folderName as string) || dragged.name
+  const globalVersion = (dragged.version as string) || '0.0.0'
+  const existing = agentSkillsMap.value[agent.id]?.find(s => s.name === dragged.name)
+
+  // If the agent already has this skill at the same or newer version, just ensure it's
+  // enabled and move on — no point overwriting identical content.
+  if (existing) {
+    const cmp = compareVersions((existing.version as string) || '0.0.0', globalVersion)
+    if (cmp >= 0) {
+      if (!existing.enabled) {
+        const ok = await dragSave.attempt(async () => {
+          await $fetch(`/api/agents/${agent.id}/skills/${skillName}`, {
+            method: 'PUT', body: { enabled: true },
+          })
+          agentSkillsMap.value[agent.id] = await $fetch<AgentSkill[]>(`/api/agents/${agent.id}/skills`)
+        })
+        if (!ok) showDragError(dragSave.saveError.value!.message)
+      }
+      dragging.value = null
+      return
+    }
+    // Existing is older — confirm replacement
+    const ok = await confirm({
+      title: 'Replace skill',
+      message:
+        `Agent '${agent.name}' has '${skillName}' at version ${existing.version || '0.0.0'}.\n`
+        + `Replace with global version ${globalVersion}?`,
+      confirmText: 'Replace',
+    })
+    if (!ok) {
+      dragging.value = null
+      return
+    }
+  }
+
+  const ok = await dragSave.attempt(async () => {
+    await $fetch(`/api/agents/${agent.id}/skills/${skillName}/copy`, { method: 'POST' })
+      .catch(err => rethrowPlainText(err, 'Failed to add skill to agent.'))
+    agentSkillsMap.value[agent.id] = await $fetch<AgentSkill[]>(`/api/agents/${agent.id}/skills`)
+  })
+  if (!ok) showDragError(dragSave.saveError.value!.message)
+  else if (existing) showInfo(`Updated '${skillName}' on agent '${agent.name}' to version ${globalVersion}`)
+  dragging.value = null
+}
+
+// --- Agent skill → Global section (promote with LLM sanitization) ---
+
+function onGlobalSectionDragOver(e: DragEvent) {
+  if (dragSource.value !== 'agent') return
+  e.preventDefault()
+  if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy'
+  dropTargetGlobal.value = true
+}
+
+function onGlobalSectionDragLeave() {
+  dropTargetGlobal.value = false
+}
+
+async function onGlobalSectionDrop(e: DragEvent) {
+  e.preventDefault()
+  dropTargetGlobal.value = false
+  if (!dragging.value || dragSource.value !== 'agent' || dragSourceAgentId.value === null) return
+
+  const skillName = (dragging.value.folderName as string) || dragging.value.name
+  const agentId = dragSourceAgentId.value
+  dragging.value = null
+
+  // Skip if already promoting this skill
+  if (promotingSkills.value.has(skillName)) return
+
+  // If a global skill with this name already exists, confirm replacement before
+  // firing the promote — the backend will overwrite it in place.
+  const existingGlobal = skills.value?.find(s => (s.folderName || s.name) === skillName)
+  if (existingGlobal) {
+    const ok = await confirm({
+      title: 'Replace global skill',
+      message:
+        `A global skill named '${skillName}' already exists.\n\n`
+        + `Promoting will replace it with the sanitized version from the agent workspace. Continue?`,
+      confirmText: 'Promote',
+    })
+    if (!ok) return
+  }
+
+  // Add to in-progress set and run in background (non-blocking)
+  promotingSkills.value = new Set([...promotingSkills.value, skillName])
+
+  // Send promote request — returns immediately, SSE event will notify on completion
+  void mutateSkill('/api/skills/promote', {
+    method: 'POST',
+    body: { agentId, skillName },
+  }).then((accepted) => {
+    if (accepted !== null) return
+    const s = new Set(promotingSkills.value)
+    s.delete(skillName)
+    promotingSkills.value = s
+  })
+}
+
+// --- Global skill inline rename ---
+
+const renamingSkill = ref<string | null>(null)
+const renameValue = ref('')
+
+function startRename(skill: Skill) {
+  renamingSkill.value = skill.folderName || skill.name
+  renameValue.value = skill.folderName || skill.name
+}
+
+function cancelRename() {
+  renamingSkill.value = null
+  renameValue.value = ''
+}
+
+async function commitRename(skill: Skill) {
+  const oldName = skill.folderName || skill.name
+  const newName = renameValue.value.trim()
+  if (!newName || newName === oldName) {
+    cancelRename()
+    return
+  }
+  const renamed = await mutateSkill(`/api/skills/${oldName}/rename`, {
+    method: 'PUT', body: { newName },
+  })
+  if (renamed !== null) refreshSkills()
+  renamingSkill.value = null
+  renameValue.value = ''
+}
+
+// --- Skill editing (create / edit form) ---
+
+// The editing target is whichever skill was clicked — global Skill or per-agent
+// AgentSkill. Both flows set `folderName` explicitly so the API path is stable.
+const editing = ref<(Skill | AgentSkill) & { folderName?: string } | null>(null)
+const editingAgentId = ref<number | null>(null) // null = global skill, number = agent workspace skill
+
+// Feed the layout breadcrumb: show "Skills > {name}" when a skill is open;
+// reverse direction closes the viewer when the layout clears the extra (user
+// clicked the "Skills" crumb while already on /skills).
+const breadcrumbExtra = useBreadcrumbExtra()
+watch(editing, (skill) => {
+  breadcrumbExtra.value = skill ? (skill.folderName ?? skill.name) : null
+}, { immediate: true })
+watch(breadcrumbExtra, (value) => {
+  // Only an agent skill needs this. It has no URL of its own, so a click on the
+  // "Skills" crumb is a same-route click NuxtLink skips, and this ref is the only
+  // signal it should close. A global skill closes through the route instead — that
+  // crumb genuinely changes path, and closing it from here would fight the watcher.
+  if (value === null && editing.value && editingAgentId.value !== null) clearViewer()
+})
+onUnmounted(() => {
+  breadcrumbExtra.value = null
+})
+
+// File browser state for view mode — skill file contents are read-only; authoring
+// happens exclusively via the skill-creator skill (using the filesystem tool).
+const skillFiles = ref<SkillFile[]>([])
+const skillTools = ref<SkillToolRef[]>([])
+// Shell commands this skill contributes to an installing agent's allowlist.
+// Populated from the SKILL.md `commands:` frontmatter via the files API.
+const skillCommands = ref<string[]>([])
+// Agent name recorded in the SKILL.md `author:` frontmatter. Empty string for
+// legacy skills that predate the field — the header suppresses the attribution
+// rather than guessing.
+const skillAuthor = ref<string>('')
+const activeFile = ref<string | null>(null)
+const fileContent = ref('')
+const fileViewMode = ref<'raw' | 'rendered'>('rendered')
+
+const isMarkdownFile = computed(() => activeFile.value?.endsWith('.md') ?? false)
+
+const renderedMarkdown = computed(() => {
+  if (!isMarkdownFile.value || !fileContent.value) return ''
+  return DOMPurify.sanitize(marked.parse(fileContent.value) as string)
+})
+
+// The viewer follows the route and the file list; a slow load for the previous skill or file
+// must not land in the current one.
+const viewerLoads = useLatestRequest()
+
+async function editSkill(skill: Skill) {
+  const request = viewerLoads.begin()
+  try {
+    const folderName = skill.folderName || skill.name
+    editing.value = { ...skill, folderName }
+
+    // Load file listing and tool dependencies
+    const res = await $fetch<SkillFilesResponse>(`/api/skills/${folderName}/files`)
+    if (!viewerLoads.isCurrent(request)) return
+    skillFiles.value = res.files || []
+    skillTools.value = res.tools || []
+    skillCommands.value = res.commands || []
+    skillAuthor.value = res.author || ''
+
+    // Auto-select SKILL.md
+    const skillMd = skillFiles.value.find(f => f.path === 'SKILL.md')
+    if (skillMd) {
+      await selectFile(skillMd)
+    }
+    else if (skillFiles.value.length > 0 && skillFiles.value[0]!.isText) {
+      await selectFile(skillFiles.value[0]!)
+    }
+    else {
+      activeFile.value = null
+      fileContent.value = ''
+    }
+  }
+  catch (e) {
+    console.error('Failed to load skill:', e)
+  }
+}
+
+/** Navigate to a skill's own URL; the route watcher below opens the viewer. */
+function openSkill(skill: Skill) {
+  router.push(`/skills/${encodeURIComponent(skill.folderName || skill.name)}`)
+}
+
+// The route is the source of truth for which global skill is open: /skills lists,
+// /skills/<name> opens that one. Agent workspace skills are deliberately absent from
+// this namespace — they are scoped to an agent, so they open through editAgentSkill
+// without touching the URL.
+watch(() => route.params.name, (raw) => {
+  const slug = Array.isArray(raw) ? raw[0] : raw
+  if (!slug) {
+    clearViewer()
+    return
+  }
+  // Case-insensitive so a hand-typed /skills/OReilly-Books still lands; the stored
+  // folder name is what the breadcrumb shows and the API path uses.
+  const wanted = decodeURIComponent(slug).toLowerCase()
+  const skill = (skills.value ?? []).find(s => (s.folderName || s.name).toLowerCase() === wanted)
+  // A name matching no skill falls back to the list rather than stranding the page
+  // on an empty viewer.
+  if (skill) void editSkill(skill)
+  else router.replace('/skills')
+}, { immediate: true })
+
+function skillFileApiBase() {
+  const folderName = editing.value?.folderName || editing.value?.name
+  if (editingAgentId.value != null) {
+    return `/api/agents/${editingAgentId.value}/skills/${folderName}/files`
+  }
+  return `/api/skills/${folderName}/files`
+}
+
+async function selectFile(file: SkillFile) {
+  if (!file.isText) return
+  const request = viewerLoads.begin()
+  try {
+    const res = await $fetch<SkillFileContent>(`${skillFileApiBase()}/${file.path}`)
+    if (!viewerLoads.isCurrent(request)) return
+    activeFile.value = file.path
+    fileContent.value = res.content
+  }
+  catch (e) {
+    console.error('Failed to read file:', e)
+  }
+}
+
+async function deleteSkill(skill: Skill | AgentSkill) {
+  const folderName = (skill.folderName as string) || skill.name
+  if (await mutateSkill(`/api/skills/${folderName}`, { method: 'DELETE' }) === null) return
+  editing.value = null
+  skillFiles.value = []
+  activeFile.value = null
+  refreshSkills()
+  loadAllAgentSkills()
+}
+
+async function editAgentSkill(agentId: number, skill: AgentSkill) {
+  const request = viewerLoads.begin()
+  try {
+    const name = (skill.folderName as string) || skill.name
+    editing.value = { ...skill, folderName: name }
+    editingAgentId.value = agentId
+
+    const res = await $fetch<SkillFilesResponse>(`/api/agents/${agentId}/skills/${name}/files`)
+    if (!viewerLoads.isCurrent(request)) return
+    skillFiles.value = res.files || []
+    skillTools.value = res.tools || []
+    skillCommands.value = res.commands || []
+    skillAuthor.value = res.author || ''
+
+    const skillMd = skillFiles.value.find(f => f.path === 'SKILL.md')
+    if (skillMd) {
+      await selectFile(skillMd)
+    }
+    else if (skillFiles.value.length > 0 && skillFiles.value[0]!.isText) {
+      await selectFile(skillFiles.value[0]!)
+    }
+    else {
+      activeFile.value = null
+      fileContent.value = ''
+    }
+  }
+  catch (e) {
+    console.error('Failed to load agent skill:', e)
+  }
+}
+
+async function deleteAgentSkill(agentId: number, skill: Skill | AgentSkill) {
+  const name = (skill.folderName as string) || skill.name
+  if (await mutateSkill(`/api/agents/${agentId}/skills/${name}/delete`, { method: 'DELETE' }) === null) return
+  editing.value = null
+  editingAgentId.value = null
+  skillFiles.value = []
+  skillTools.value = []
+  skillCommands.value = []
+  skillAuthor.value = ''
+  activeFile.value = null
+  loadAllAgentSkills()
+}
+
+function clearViewer() {
+  editing.value = null
+  editingAgentId.value = null
+  skillFiles.value = []
+  skillTools.value = []
+  activeFile.value = null
+}
+
+function cancel() {
+  clearViewer()
+  // Only a global skill has a URL of its own; an agent skill closes in place.
+  if (route.params.name) router.push('/skills')
+}
+
+type FileNode = {
+  name: string
+  isDir: boolean
+  path?: string
+  file?: SkillFile
+  children?: FileNode[]
+}
+
+const fileTree = computed<FileNode[]>(() => {
+  const root: FileNode = { name: '', isDir: true, children: [] }
+  for (const file of skillFiles.value) {
+    const parts = (file.path ?? '').split('/').filter(Boolean)
+    if (!parts.length) continue
+    let node = root
+    for (let i = 0; i < parts.length; i++) {
+      const part = parts[i]!
+      const isLast = i === parts.length - 1
+      if (isLast) {
+        node.children!.push({ name: part, isDir: false, path: file.path, file })
+      }
+      else {
+        let dir = node.children!.find(c => c.isDir && c.name === part)
+        if (!dir) {
+          dir = { name: part, isDir: true, children: [] }
+          node.children!.push(dir)
+        }
+        node = dir
+      }
+    }
+  }
+  const sortNode = (n: FileNode) => {
+    if (!n.children) return
+    n.children.sort((a, b) => {
+      if (a.isDir !== b.isDir) return a.isDir ? -1 : 1
+      return a.name.localeCompare(b.name)
+    })
+    n.children.forEach(sortNode)
+  }
+  sortNode(root)
+  return root.children!
+})
+
+function enabledSkillCount(agentId: number) {
+  return agentSkillsMap.value[agentId]?.filter(s => s.enabled).length ?? 0
+}
+
+function totalSkillCount(agentId: number) {
+  return agentSkillsMap.value[agentId]?.length ?? 0
+}
+</script>
+
+<template>
+  <div class="h-full flex flex-col">
+    <div class="flex items-center justify-between mb-6 shrink-0">
+      <h1 class="text-lg font-semibold text-fg-strong">
+        Skills
+      </h1>
+      <button
+        class="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium border border-border bg-surface-elevated text-fg-strong hover:bg-muted transition-colors"
+        @click="openCatalog"
+      >
+        <MagnifyingGlassIcon class="w-4 h-4" />
+        Browse catalog
+      </button>
+    </div>
+
+    <div
+      v-if="dragError"
+      class="mb-4 px-3 py-2 bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-900/60 text-red-700 dark:text-red-300 text-xs flex items-start justify-between gap-3 shrink-0"
+    >
+      <span>{{ dragError }}</span>
+      <button
+        class="text-red-700 dark:text-red-400 hover:text-red-800 dark:hover:text-red-200 shrink-0"
+        title="Dismiss"
+        @click="dragError = null"
+      >
+        ×
+      </button>
+    </div>
+
+    <div
+      v-if="infoBanner"
+      class="mb-4 px-3 py-2 bg-blue-50 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-900/60 text-blue-700 dark:text-blue-300 text-xs flex items-start justify-between gap-3 shrink-0"
+    >
+      <span>{{ infoBanner }}</span>
+      <button
+        class="text-blue-700 dark:text-blue-400 hover:text-blue-800 dark:hover:text-blue-200 shrink-0"
+        title="Dismiss"
+        @click="infoBanner = null"
+      >
+        ×
+      </button>
+    </div>
+
+    <template v-if="!editing">
+      <!--
+        Two-column layout: Global Skills (left) | Agents (right).
+        Both columns are flex-1 within a min-h-0 grid so each panel grows to
+        consume the layout's available height; their inner bodies own the
+        vertical scroll, keeping the page header and column headers fixed.
+        Drag-and-drop directions are unchanged from the prior grid layout — a
+        global skill drops onto an agent (assign), an agent skill drops onto
+        the left panel (promote).
+      -->
+      <div class="flex-1 min-h-0 grid grid-cols-1 md:grid-cols-2 gap-4">
+        <!-- LEFT: Global Skills (draggable + drop target for promotion) -->
+        <!-- eslint-disable-next-line vuejs-accessibility/no-static-element-interactions -- drop target for drag-to-promote; HTML5 drag events have no keyboard equivalent -->
+        <section
+          data-tour="global-skills"
+          :class="[
+            'flex flex-col bg-surface-elevated border min-h-0 transition-all duration-150',
+            dropTargetGlobal ? 'border-emerald-600 dark:border-emerald-500/60 bg-emerald-500/5 ring-1 ring-emerald-500/20' : 'border-border',
+          ]"
+          @dragover="onGlobalSectionDragOver"
+          @dragleave="onGlobalSectionDragLeave"
+          @drop="onGlobalSectionDrop"
+        >
+          <!-- Header: title + filter -->
+          <div class="px-3 py-2.5 border-b border-border flex flex-col gap-2 shrink-0">
+            <div class="flex items-center justify-between gap-2">
+              <div class="flex items-center gap-2 min-w-0">
+                <span class="text-xs text-fg-muted uppercase tracking-wider">Global Skills</span>
+                <div
+                  v-if="promotingSkills.size"
+                  class="flex items-center gap-1 text-xs text-emerald-700 dark:text-emerald-400"
+                >
+                  <ArrowPathIcon
+                    class="w-3 h-3 animate-spin"
+                    aria-hidden="true"
+                  />
+                  Promoting {{ promotingSkills.size }}
+                </div>
+              </div>
+              <span class="text-xs text-fg-muted shrink-0 tabular-nums">
+                {{ filteredSkills.length }}{{ globalFilter ? ` / ${skills?.length ?? 0}` : '' }}
+              </span>
+            </div>
+            <div class="flex items-center gap-2 px-2 py-1 bg-muted border border-input">
+              <MagnifyingGlassIcon
+                class="w-3.5 h-3.5 text-fg-muted shrink-0"
+                aria-hidden="true"
+              />
+              <input
+                v-model="globalFilter"
+                placeholder="Filter skills..."
+                aria-label="Filter global skills by name"
+                class="flex-1 bg-transparent text-xs text-fg-strong placeholder-fg-muted focus:outline-hidden"
+              >
+              <button
+                v-if="globalFilter"
+                class="text-xs text-fg-muted hover:text-fg-strong shrink-0"
+                title="Clear filter"
+                @click="globalFilter = ''"
+              >
+                ×
+              </button>
+            </div>
+          </div>
+
+          <!-- Drop hint when dragging an agent skill over the panel -->
+          <div
+            v-if="dragSource === 'agent' && dropTargetGlobal"
+            class="mx-3 mt-3 border border-dashed border-emerald-600 dark:border-emerald-500/40 py-2 text-center text-xs text-emerald-700 dark:text-emerald-400 shrink-0"
+          >
+            Release to promote (secrets will be stripped)
+          </div>
+
+          <!-- Empty state: no globals at all -->
+          <div
+            v-if="!skills?.length && !promotingSkills.size"
+            class="flex-1 flex items-center justify-center px-4 py-6 text-center text-xs text-fg-muted"
+          >
+            No global skills. Create one via the skill-creator skill in an agent workspace, then drag it here to promote.
+          </div>
+
+          <!-- Skills list (compact rows, scrollable) -->
+          <div
+            v-else
+            class="flex-1 overflow-y-auto"
+          >
+            <template
+              v-for="(skill, index) in filteredSkills"
+              :key="skill.folderName || skill.name"
+            >
+              <!-- eslint-disable-next-line vuejs-accessibility/no-static-element-interactions -- drag source for skill assignment; HTML5 drag events have no keyboard equivalent -->
+              <div
+                draggable="true"
+                :class="[
+                  'group flex items-start gap-2 px-3 py-2 cursor-grab active:cursor-grabbing select-none transition-colors',
+                  index > 0 && !isStructuralSkill(filteredSkills[index - 1]) ? 'border-t border-border' : '',
+                  dragging?.name === skill.name && dragSource === 'global' ? 'opacity-50' : 'hover:bg-muted',
+                ]"
+                @dragstart="onGlobalDragStart($event, skill)"
+                @dragend="onDragEnd"
+              >
+                <div class="min-w-0 flex-1">
+                  <div class="flex items-center gap-2">
+                    <span
+                      v-if="skill.icon"
+                      aria-hidden="true"
+                      class="shrink-0 text-xs leading-none"
+                    >{{ skill.icon }}</span>
+                    <template v-if="renamingSkill === (skill.folderName || skill.name)">
+                      <input
+                        ref="renameInput"
+                        v-model="renameValue"
+                        :aria-label="`Rename skill ${skill.folderName || skill.name}`"
+                        class="text-xs text-fg-strong font-mono bg-muted border border-input px-1.5 py-0.5 flex-1 focus:outline-hidden focus:border-emerald-600 dark:focus:border-emerald-500"
+                        @keydown.enter="commitRename(skill)"
+                        @keydown.escape="cancelRename"
+                        @blur="commitRename(skill)"
+                        @click.stop
+                        @mousedown.stop
+                      >
+                    </template>
+                    <template v-else>
+                      <!-- eslint-disable-next-line vuejs-accessibility/no-static-element-interactions -- double-click to rename is a desktop-style affordance; dblclick has no keyboard equivalent -->
+                      <span
+                        class="text-xs text-fg-strong font-mono truncate min-w-0 flex-1"
+                        @dblclick.stop="startRename(skill)"
+                      >{{ skill.folderName || skill.name }}</span>
+                    </template>
+                    <span class="text-xs text-emerald-700 dark:text-emerald-300 font-mono font-semibold shrink-0 bg-emerald-100 dark:bg-emerald-900/30 border border-emerald-200 dark:border-emerald-800/50 px-1 py-0.5">v{{ skill.version || '0.0.0' }}</span>
+                  </div>
+                  <div
+                    v-if="skill.description"
+                    class="text-xs text-fg-muted truncate mt-0.5"
+                  >
+                    {{ skill.description }}
+                  </div>
+                  <div
+                    v-if="skill.tools?.length || skill.commands?.length"
+                    class="flex items-center gap-2 mt-1 text-xs text-fg-muted"
+                  >
+                    <span v-if="skill.tools?.length">{{ skill.tools.length }} tool{{ skill.tools.length !== 1 ? 's' : '' }}</span>
+                    <span v-if="skill.commands?.length">{{ skill.commands.length }} cmd{{ skill.commands.length !== 1 ? 's' : '' }}</span>
+                  </div>
+                </div>
+                <div class="flex items-center gap-0.5 shrink-0 opacity-0 group-hover:opacity-100 transition-opacity">
+                  <button
+                    class="p-1 text-fg-muted hover:text-fg-strong transition-colors"
+                    title="View skill"
+                    @click.stop="openSkill(skill)"
+                  >
+                    <EyeIcon
+                      class="w-3.5 h-3.5"
+                      aria-hidden="true"
+                    />
+                  </button>
+                  <button
+                    v-if="!isStructuralSkill(skill)"
+                    class="p-1 text-fg-muted hover:text-red-700 dark:hover:text-red-400 transition-colors"
+                    title="Delete skill"
+                    @click.stop="deleteSkill(skill)"
+                  >
+                    <TrashIcon
+                      class="w-3.5 h-3.5"
+                      aria-hidden="true"
+                    />
+                  </button>
+                  <!-- Same-geometry spacer when the trash button is suppressed,
+                       so the version-pill column aligns across all rows
+                       regardless of how many actions the skill carries. -->
+                  <span
+                    v-else
+                    aria-hidden="true"
+                    class="p-1 inline-block"
+                  >
+                    <span class="block w-3.5 h-3.5" />
+                  </span>
+                </div>
+              </div>
+
+              <!-- Section divider after the last structural skill: same
+                   labeled-rule pattern as the agents panel ("CUSTOM AGENTS"),
+                   here naming the alphabetical group below "CUSTOM SKILLS".
+                   Renders once, after the boundary between the pinned
+                   structural skills and the user-promoted ones — i.e. when
+                   the current row is structural and the next one isn't.
+                   Decorative only — `aria-hidden` keeps it out of the
+                   accessibility tree since the order is already conveyed
+                   by the rendered list. -->
+              <div
+                v-if="isStructuralSkill(skill) && index < filteredSkills.length - 1 && !isStructuralSkill(filteredSkills[index + 1])"
+                class="flex items-center gap-3 px-3 py-2.5 select-none"
+                aria-hidden="true"
+              >
+                <span class="h-px flex-1 bg-input" />
+                <span class="text-[10px] font-mono uppercase tracking-[0.15em] text-fg-muted">CUSTOM SKILLS</span>
+                <span class="h-px flex-1 bg-input" />
+              </div>
+            </template>
+
+            <!-- Empty filter result -->
+            <div
+              v-if="!filteredSkills.length && skills?.length"
+              class="px-4 py-6 text-center text-xs text-fg-muted italic"
+            >
+              No skills match "{{ globalFilter }}"
+            </div>
+          </div>
+        </section>
+
+        <!-- RIGHT: Agents (drop targets for skill assignment) -->
+        <section class="flex flex-col bg-surface-elevated border border-border min-h-0">
+          <!-- Header: title + filter -->
+          <div class="px-3 py-2.5 border-b border-border flex flex-col gap-2 shrink-0">
+            <div class="flex items-center justify-between gap-2">
+              <span class="text-xs text-fg-muted uppercase tracking-wider">Agent Skills</span>
+              <span class="text-xs text-fg-muted shrink-0 tabular-nums">
+                {{ filteredAgents.length }}{{ agentFilter ? ` / ${agents?.length ?? 0}` : '' }}
+              </span>
+            </div>
+            <div class="flex items-center gap-2 px-2 py-1 bg-muted border border-input">
+              <MagnifyingGlassIcon
+                class="w-3.5 h-3.5 text-fg-muted shrink-0"
+                aria-hidden="true"
+              />
+              <input
+                v-model="agentFilter"
+                placeholder="Filter agents..."
+                aria-label="Filter agents by name"
+                class="flex-1 bg-transparent text-xs text-fg-strong placeholder-fg-muted focus:outline-hidden"
+              >
+              <button
+                v-if="agentFilter"
+                class="text-xs text-fg-muted hover:text-fg-strong shrink-0"
+                title="Clear filter"
+                @click="agentFilter = ''"
+              >
+                ×
+              </button>
+            </div>
+          </div>
+
+          <!-- Empty state -->
+          <div
+            v-if="!agents?.length"
+            class="flex-1 flex items-center justify-center px-4 py-6 text-sm text-fg-muted"
+          >
+            No agents configured
+          </div>
+
+          <!-- Agent list (each agent stacked vertically, scrollable). The main
+               agent is followed by a labeled section divider — a small
+               monospaced "CUSTOM AGENTS" caption flanked by thin rules — that reads as
+               a typographic section break rather than yet another row
+               separator. The row immediately after the divider skips its own
+               top border so the divider's right-hand rule isn't doubled. -->
+          <div
+            v-else
+            class="flex-1 overflow-y-auto"
+          >
+            <template
+              v-for="(agent, index) in filteredAgents"
+              :key="agent.id"
+            >
+              <!-- eslint-disable-next-line vuejs-accessibility/no-static-element-interactions -- drop target for skill assignment; HTML5 drag events have no keyboard equivalent -->
+              <div
+                :class="[
+                  'p-3 transition-all duration-150',
+                  index > 0 && !filteredAgents[index - 1]?.isMain ? 'border-t border-border' : '',
+                  dropTarget === agent.id ? 'bg-emerald-500/5 ring-1 ring-emerald-500/20 ring-inset' : '',
+                ]"
+                @dragover="onAgentDragOver($event, agent.id)"
+                @dragleave="onAgentDragLeave(agent.id)"
+                @drop="onAgentDrop($event, agent)"
+              >
+                <!-- Agent header — click to collapse/expand the skill list. The
+                     name / model / count stay visible while collapsed. -->
+                <button
+                  type="button"
+                  class="w-full flex items-center justify-between gap-2 mb-1 text-left bg-transparent border-0 cursor-pointer"
+                  :aria-expanded="!isAgentCollapsed(agent.id)"
+                  @click="toggleAgentCollapse(agent.id)"
+                >
+                  <div class="flex items-center gap-2 min-w-0">
+                    <ChevronRightIcon
+                      class="w-3.5 h-3.5 text-fg-muted shrink-0 transition-transform duration-150"
+                      :class="isAgentCollapsed(agent.id) ? '' : 'rotate-90'"
+                      aria-hidden="true"
+                    />
+                    <span class="text-sm font-medium text-fg-strong truncate">{{ agent.name }}</span>
+                    <span
+                      v-if="agent.isMain"
+                      class="text-xs text-fg-muted border border-input px-1 shrink-0"
+                    >main</span>
+                  </div>
+                  <span class="text-xs text-fg-muted shrink-0 tabular-nums">
+                    {{ enabledSkillCount(agent.id) }}/{{ totalSkillCount(agent.id) }}
+                  </span>
+                </button>
+                <div class="text-xs text-fg-muted mb-2 truncate">
+                  {{ agent.modelProvider }} / {{ agent.modelId }}
+                </div>
+
+                <!-- Agent's skills (draggable for promotion). Enable/disable
+                   toggling lives on the Agents page; this panel is read-only
+                   for the enabled state. -->
+                <div
+                  v-if="!isAgentCollapsed(agent.id) && sortedAgentSkillsMap[agent.id]?.length"
+                  class="space-y-1"
+                >
+                  <!-- eslint-disable-next-line vuejs-accessibility/no-static-element-interactions -- drag source for skill promotion; HTML5 drag events have no keyboard equivalent -->
+                  <div
+                    v-for="skill in sortedAgentSkillsMap[agent.id]"
+                    :key="skill.name"
+                    draggable="true"
+                    class="flex items-center justify-between px-2 py-1 bg-muted cursor-grab active:cursor-grabbing select-none group/skill"
+                    @dragstart="onAgentSkillDragStart($event, skill, agent.id)"
+                    @dragend="onDragEnd"
+                  >
+                    <div class="flex items-center gap-2 min-w-0 flex-1">
+                      <span
+                        v-if="skill.icon"
+                        aria-hidden="true"
+                        class="shrink-0 text-xs leading-none"
+                      >{{ skill.icon }}</span>
+                      <span class="text-xs text-fg-strong font-mono truncate">{{ skill.name }}</span>
+                      <button
+                        v-if="updateAvailable(skill)"
+                        class="text-xs text-amber-700 dark:text-amber-400 border border-amber-300 dark:border-amber-700/40 bg-amber-50 dark:bg-amber-900/20 px-1.5 py-0.5 font-mono hover:bg-amber-100 dark:hover:bg-amber-900/40 transition-colors shrink-0"
+                        :title="`Update to v${updateAvailable(skill)}`"
+                        @click.stop="updateAgentSkillFromGlobal(agent.id, skill)"
+                      >
+                        → v{{ updateAvailable(skill) }}
+                      </button>
+                    </div>
+                    <div class="flex items-center gap-1 shrink-0">
+                      <span class="text-xs text-emerald-700 dark:text-emerald-300 font-mono font-semibold shrink-0 bg-emerald-100 dark:bg-emerald-900/30 border border-emerald-200 dark:border-emerald-800/50 px-1 py-0.5">v{{ skill.version || '0.0.0' }}</span>
+                      <button
+                        class="p-1 text-fg-muted hover:text-fg-strong transition-colors opacity-0 group-hover/skill:opacity-100"
+                        title="View skill"
+                        @click.stop="editAgentSkill(agent.id, skill)"
+                      >
+                        <EyeIcon
+                          class="w-3.5 h-3.5"
+                          aria-hidden="true"
+                        />
+                      </button>
+                      <button
+                        class="p-1 text-fg-muted hover:text-red-700 dark:hover:text-red-400 transition-colors opacity-0 group-hover/skill:opacity-100"
+                        title="Delete skill"
+                        @click.stop="deleteAgentSkill(agent.id, skill)"
+                      >
+                        <TrashIcon
+                          class="w-3.5 h-3.5"
+                          aria-hidden="true"
+                        />
+                      </button>
+                    </div>
+                  </div>
+                </div>
+                <div
+                  v-else-if="!isAgentCollapsed(agent.id)"
+                  class="text-xs text-fg-muted italic"
+                >
+                  {{ loadingAgents ? 'Loading...' : 'No skills assigned' }}
+                </div>
+
+                <!-- Drop hint (global → agent). Only shown while a global skill is
+                   being dragged AND this agent isn't already the active drop target. -->
+                <div
+                  v-if="dragging && dragSource === 'global' && dropTarget !== agent.id"
+                  class="mt-2 border border-dashed border-input py-1.5 text-center text-xs text-fg-muted"
+                >
+                  Drop skill here
+                </div>
+                <div
+                  v-if="dropTarget === agent.id"
+                  class="mt-2 border border-dashed border-emerald-600 dark:border-emerald-500/40 py-1.5 text-center text-xs text-emerald-700 dark:text-emerald-400"
+                >
+                  Release to assign
+                </div>
+              </div>
+
+              <!-- Section divider after the main agent: a small monospaced
+                   "CUSTOM AGENTS" label flanked by 1px rules in the same neutral
+                   `bg-input` shade as the badge borders elsewhere on the
+                   page. Decorative-only (`aria-hidden`) — the screen-reader
+                   experience already conveys ordering through the rendered
+                   list itself. -->
+              <div
+                v-if="agent.isMain && index < filteredAgents.length - 1"
+                class="flex items-center gap-3 px-3 py-2.5 select-none"
+                aria-hidden="true"
+              >
+                <span class="h-px flex-1 bg-input" />
+                <span class="text-[10px] font-mono uppercase tracking-[0.15em] text-fg-muted">CUSTOM AGENTS</span>
+                <span class="h-px flex-1 bg-input" />
+              </div>
+            </template>
+
+            <!-- Empty filter result -->
+            <div
+              v-if="!filteredAgents.length && agents?.length"
+              class="px-4 py-6 text-center text-xs text-fg-muted italic"
+            >
+              No agents match "{{ agentFilter }}"
+            </div>
+          </div>
+        </section>
+      </div>
+    </template>
+
+    <!-- Skill viewer — read-only file browser. Skills are created and updated via
+         the skill-creator skill, not through this page. -->
+    <div
+      v-if="editing"
+      class="space-y-4"
+    >
+      <div class="flex items-center justify-between">
+        <button
+          class="text-xs text-fg-muted hover:text-fg-strong transition-colors"
+          @click="cancel"
+        >
+          &larr; Back to skills
+        </button>
+        <button
+          v-if="!isStructuralSkill(editing)"
+          class="p-1.5 text-red-700/70 dark:text-red-400/70 hover:text-red-400 transition-colors"
+          title="Delete skill"
+          @click="editingAgentId != null ? deleteAgentSkill(editingAgentId, editing) : deleteSkill(editing)"
+        >
+          <TrashIcon
+            class="w-5 h-5"
+            aria-hidden="true"
+          />
+        </button>
+      </div>
+
+      <!-- Skill header -->
+      <div class="bg-surface-elevated border border-border px-4 py-3">
+        <div class="flex items-center gap-3">
+          <div class="w-8 h-8 bg-emerald-100 dark:bg-emerald-900/30 border border-emerald-200 dark:border-emerald-800/40 rounded flex items-center justify-center">
+            <FolderIcon
+              class="w-4 h-4 text-emerald-700 dark:text-emerald-400"
+              aria-hidden="true"
+            />
+          </div>
+          <div>
+            <div class="flex items-center gap-2">
+              <span class="text-sm font-medium text-fg-strong font-mono">{{ editing.folderName || editing.name }}</span>
+              <span
+                v-if="editingAgentId != null"
+                class="text-xs text-blue-700 dark:text-blue-400 border border-blue-400/30 px-1"
+              >
+                {{ agents?.find((a: any) => a.id === editingAgentId)?.name ?? 'agent' }}
+              </span>
+              <span
+                v-else
+                class="text-xs text-green-700 dark:text-green-400 border border-green-400/30 px-1"
+              >global</span>
+            </div>
+            <div class="text-xs text-fg-muted">
+              {{ skillFiles.length }} file{{ skillFiles.length !== 1 ? 's' : '' }}
+              <span
+                v-if="skillAuthor"
+                class="ml-2"
+              >
+                · by <span class="font-mono text-fg-muted">{{ skillAuthor }}</span>
+              </span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Tool dependencies -->
+      <div
+        v-if="skillTools.length"
+        class="bg-surface-elevated border border-border px-4 py-3"
+      >
+        <div class="flex items-center gap-2 mb-3">
+          <Cog6ToothIcon
+            class="w-4 h-4 text-amber-700 dark:text-amber-400"
+            aria-hidden="true"
+          />
+          <span class="text-xs font-medium text-fg-muted uppercase tracking-wider">Required Tools</span>
+        </div>
+        <div class="flex flex-wrap gap-2">
+          <span
+            v-for="tool in skillTools"
+            :key="tool.name"
+            class="inline-flex items-center px-2.5 py-1 border rounded text-xs font-mono leading-none"
+            :class="getPillClass(tool.name)"
+          >
+            {{ tool.name }}
+          </span>
+        </div>
+      </div>
+
+      <!--
+        Shell commands this skill contributes to an installing agent's
+        effective allowlist (from the `commands:` frontmatter). Rendered below
+        Required Tools because tools are the dependencies the skill consumes
+        while commands are the binaries it *provides* — consume-before-provide
+        matches the reading order a reviewer uses to trust the skill.
+      -->
+      <div
+        v-if="skillCommands.length"
+        class="bg-surface-elevated border border-border px-4 py-3"
+      >
+        <div class="flex items-center gap-2 mb-3">
+          <CommandLineIcon
+            class="w-4 h-4 text-cyan-700 dark:text-cyan-400"
+            aria-hidden="true"
+          />
+          <span class="text-xs font-medium text-fg-muted uppercase tracking-wider">Commands</span>
+          <span class="text-xs text-fg-muted normal-case tracking-normal">
+            added to the agent's shell allowlist when this skill is installed
+          </span>
+        </div>
+        <div class="flex flex-wrap gap-2">
+          <span
+            v-for="cmd in skillCommands"
+            :key="cmd"
+            class="inline-flex items-center px-2.5 py-1 bg-cyan-50 dark:bg-cyan-900/20 border border-cyan-200 dark:border-cyan-800/40 rounded text-xs font-mono text-cyan-700 dark:text-cyan-300 leading-none"
+          >
+            {{ cmd }}
+          </span>
+        </div>
+      </div>
+
+      <div
+        class="flex max-sm:flex-col gap-4"
+        style="min-height: 500px;"
+      >
+        <!-- File sidebar -->
+        <div class="w-52 max-sm:w-full shrink-0 bg-surface-elevated border border-border overflow-y-auto">
+          <div class="px-3 py-2 border-b border-border">
+            <span class="text-[10px] font-medium text-fg-muted uppercase tracking-wider">Files</span>
+          </div>
+          <SkillFileTree
+            :nodes="fileTree"
+            :active-path="activeFile"
+            @select="selectFile"
+          />
+        </div>
+
+        <!-- File editor -->
+        <div class="flex-1 flex flex-col bg-surface-elevated border border-border min-w-0">
+          <template v-if="activeFile">
+            <div class="px-4 py-2 border-b border-border flex max-sm:flex-wrap items-center gap-2">
+              <span class="text-xs font-mono text-fg-muted max-sm:min-w-0 max-sm:truncate">{{ activeFile }}</span>
+              <span class="text-xs text-fg-muted">(read-only — edit via skill-creator)</span>
+              <div
+                v-if="isMarkdownFile"
+                class="ml-auto flex items-center gap-0.5"
+              >
+                <button
+                  :class="fileViewMode === 'rendered' ? 'text-fg-strong bg-muted' : 'text-fg-muted hover:text-fg-strong'"
+                  class="p-1 rounded transition-colors"
+                  title="Rendered markdown"
+                  @click="fileViewMode = 'rendered'"
+                >
+                  <DocumentTextIcon
+                    class="w-3.5 h-3.5"
+                    aria-hidden="true"
+                  />
+                </button>
+                <button
+                  :class="fileViewMode === 'raw' ? 'text-fg-strong bg-muted' : 'text-fg-muted hover:text-fg-strong'"
+                  class="p-1 rounded transition-colors"
+                  title="Raw text"
+                  @click="fileViewMode = 'raw'"
+                >
+                  <CodeBracketIcon
+                    class="w-3.5 h-3.5"
+                    aria-hidden="true"
+                  />
+                </button>
+              </div>
+            </div>
+            <!-- eslint-disable vue/no-v-html -- renderedMarkdown runs the file through DOMPurify.sanitize (see computed above) before returning. -->
+            <div
+              v-if="isMarkdownFile && fileViewMode === 'rendered'"
+              class="prose-skill flex-1 overflow-y-auto px-6 py-4 text-sm text-fg-primary"
+              v-html="renderedMarkdown"
+            />
+            <!-- eslint-enable vue/no-v-html -->
+            <textarea
+              v-else
+              :value="fileContent"
+              readonly
+              aria-label="Skill file contents"
+              class="flex-1 w-full px-4 py-3 bg-transparent text-sm text-fg-primary font-mono resize-none focus:outline-hidden cursor-default opacity-80"
+              spellcheck="false"
+            />
+          </template>
+          <template v-else>
+            <div class="flex-1 flex items-center justify-center text-sm text-fg-muted">
+              Select a file to view
+            </div>
+          </template>
+        </div>
+      </div>
+    </div>
+    <!-- Importable-skills catalog browser (skills.sh / mastra-ai snapshot) -->
+    <Teleport to="body">
+      <!-- eslint-disable-next-line vuejs-accessibility/no-static-element-interactions, vuejs-accessibility/click-events-have-key-events -- backdrop click-to-close is a convenience; the × button is the accessible close path -->
+      <div
+        v-if="catalogOpen"
+        class="fixed inset-0 z-50 flex items-start justify-center p-4 sm:p-8 bg-black/40"
+        @click.self="catalogOpen = false"
+      >
+        <div class="w-full max-w-2xl max-h-full flex flex-col bg-surface-elevated border border-border shadow-xl">
+          <div class="flex items-center justify-between px-4 py-3 border-b border-border shrink-0">
+            <div class="flex flex-col">
+              <span class="text-sm font-semibold text-fg-strong">Browse importable skills</span>
+              <span
+                v-if="catalogSize && catalogSize > 0"
+                class="text-xs text-fg-muted"
+              >
+                {{ catalogSize.toLocaleString() }} skills<span v-if="catalogScrapedLabel"> · snapshot {{ catalogScrapedLabel }}</span>
+              </span>
+            </div>
+            <div class="flex items-center gap-2">
+              <button
+                v-if="catalogType === 'static'"
+                :disabled="catalogRefreshing || catalogLoading"
+                class="text-xs px-2 py-1 border border-border text-fg-muted hover:text-fg-strong hover:bg-muted disabled:opacity-50"
+                title="Re-download the catalog snapshot from its source"
+                @click="refreshCatalog"
+              >
+                {{ catalogRefreshing ? 'Refreshing…' : 'Refresh' }}
+              </button>
+              <button
+                class="text-fg-muted hover:text-fg-strong text-lg leading-none"
+                title="Close"
+                @click="catalogOpen = false"
+              >
+                ×
+              </button>
+            </div>
+          </div>
+
+          <!-- Catalog selector: each is a self-contained source (static dump or live registry) -->
+          <div
+            v-if="catalogs.length > 1"
+            class="px-4 pt-2 flex gap-1 shrink-0 border-b border-border"
+          >
+            <button
+              v-for="c in catalogs"
+              :key="c.id"
+              :class="[
+                'px-3 py-1.5 text-xs border-b-2 -mb-px transition-colors',
+                selectedCatalog === c.id
+                  ? 'border-ring text-fg-strong font-medium'
+                  : 'border-transparent text-fg-muted hover:text-fg-strong',
+              ]"
+              @click="selectCatalog(c.id)"
+            >
+              {{ c.displayName }}<span
+                v-if="c.type === 'dynamic'"
+                class="ml-1 text-fg-muted"
+              >· live</span>
+            </button>
+          </div>
+
+          <div
+            v-if="catalogType === 'static' && catalogFacets.length"
+            class="px-3 py-2 border-b border-border flex flex-wrap gap-1.5 shrink-0"
+          >
+            <button
+              v-for="f in catalogFacets"
+              :key="f.category"
+              :class="[
+                'inline-flex items-center gap-1 px-2 py-0.5 text-xs border transition-colors',
+                catalogCategory === f.category
+                  ? 'border-ring bg-muted text-fg-strong font-medium'
+                  : 'border-border text-fg-muted hover:bg-muted',
+              ]"
+              @click="selectFacet(f.category)"
+            >
+              <span v-if="f.icon">{{ f.icon }}</span>
+              <span>{{ f.category }}</span>
+              <span class="text-fg-muted">{{ f.count.toLocaleString() }}</span>
+            </button>
+          </div>
+
+          <div class="px-4 py-3 border-b border-border shrink-0 flex items-center gap-2">
+            <div class="relative flex-1">
+              <MagnifyingGlassIcon class="w-4 h-4 absolute left-2.5 top-1/2 -translate-y-1/2 text-fg-muted" />
+              <input
+                v-model="catalogQuery"
+                type="text"
+                placeholder="Search skills by name…"
+                aria-label="Search importable skills"
+                class="w-full pl-8 pr-3 py-2 bg-muted border border-input text-sm text-fg-strong focus:outline-hidden focus:border-ring"
+                @keyup.enter="searchCatalog"
+              >
+            </div>
+            <select
+              v-model="catalogSort"
+              aria-label="Sort skills"
+              class="py-2 px-2 bg-muted border border-input text-sm text-fg-strong focus:outline-hidden focus:border-ring"
+              @change="changeSort"
+            >
+              <option value="installs">
+                Most installs
+              </option>
+              <option value="name">
+                Name (A–Z)
+              </option>
+            </select>
+          </div>
+
+          <div class="flex-1 min-h-0 overflow-y-auto">
+            <div
+              v-if="catalogLoading"
+              class="px-4 py-8 text-center text-sm text-fg-muted"
+            >
+              {{ catalogType === 'static' ? 'Loading catalog… the first search downloads the snapshot.' : 'Loading…' }}
+            </div>
+            <div
+              v-else-if="catalogError"
+              class="px-4 py-8 text-center text-sm text-red-700 dark:text-red-400"
+            >
+              {{ catalogError }}
+            </div>
+            <div
+              v-else-if="!catalogResults.length"
+              class="px-4 py-8 text-center text-sm text-fg-muted"
+            >
+              No skills match your search.
+            </div>
+            <ul
+              v-else
+              class="divide-y divide-border"
+            >
+              <li
+                v-for="s in catalogResults"
+                :key="`${s.provider}/${s.skillId}`"
+                class="px-4 py-2.5 flex items-center justify-between gap-3"
+              >
+                <div class="min-w-0">
+                  <a
+                    :href="s.url"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    :title="s.url"
+                    class="block text-sm text-fg-strong hover:underline truncate"
+                  >{{ s.displayName || s.skillId }}</a>
+                  <div class="text-xs text-fg-muted truncate">
+                    {{ s.source }} · {{ s.category }}
+                  </div>
+                </div>
+                <div class="flex items-center gap-3 shrink-0">
+                  <span class="text-xs text-fg-muted">{{ s.installs.toLocaleString() }} installs</span>
+                  <template v-if="canImport(s)">
+                    <span
+                      v-if="importedKeys.has(catalogKey(s))"
+                      class="text-xs text-emerald-700 dark:text-emerald-400"
+                    >Imported ✓</span>
+                    <button
+                      v-else
+                      :disabled="importingKey === catalogKey(s)"
+                      class="text-xs px-2 py-1 border border-border text-fg-strong hover:bg-muted disabled:opacity-50"
+                      @click="importSkill(s)"
+                    >
+                      {{ importingKey === catalogKey(s) ? 'Importing…' : 'Import' }}
+                    </button>
+                  </template>
+                </div>
+              </li>
+            </ul>
+          </div>
+
+          <div
+            v-if="!catalogLoading && !catalogError && catalogResults.length"
+            class="px-4 py-2 border-t border-border flex items-center justify-between gap-3 text-xs text-fg-muted shrink-0"
+          >
+            <span v-if="catalogType === 'static'">{{ catalogTotal.toLocaleString() }} result{{ catalogTotal === 1 ? '' : 's' }}</span>
+            <span v-else>live results</span>
+            <div class="flex items-center gap-2">
+              <button
+                :disabled="!hasPrevPage"
+                class="px-2 py-1 border border-border hover:bg-muted disabled:opacity-40"
+                @click="prevPage"
+              >
+                Prev
+              </button>
+              <span v-if="catalogType === 'static'">Page {{ catalogPage + 1 }} of {{ catalogTotalPages }}</span>
+              <span v-else>Page {{ cursorStack.length }}</span>
+              <button
+                :disabled="!hasNextPage"
+                class="px-2 py-1 border border-border hover:bg-muted disabled:opacity-40"
+                @click="nextPage"
+              >
+                Next
+              </button>
+            </div>
+          </div>
+
+          <div
+            v-if="importMessage"
+            class="px-4 py-2 border-t border-border text-xs text-red-700 dark:text-red-400 shrink-0"
+          >
+            {{ importMessage }}
+          </div>
+        </div>
+      </div>
+    </Teleport>
+  </div>
+</template>
+
+<style>
+.prose-skill { overflow-wrap: anywhere; line-height: 1.7; }
+.prose-skill p { margin: 0.6em 0; }
+.prose-skill p:first-child { margin-top: 0; }
+.prose-skill p:last-child { margin-bottom: 0; }
+.prose-skill ul, .prose-skill ol { padding-left: 1.5em; margin: 0.5em 0; }
+.prose-skill ul { list-style-type: disc; }
+.prose-skill ol { list-style-type: decimal; }
+.prose-skill li { margin: 0.25em 0; }
+.prose-skill h1, .prose-skill h2, .prose-skill h3 { font-weight: 600; margin: 1em 0 0.4em; }
+.prose-skill h1 { font-size: 1.4em; }
+.prose-skill h2 { font-size: 1.2em; }
+.prose-skill h3 { font-size: 1.05em; }
+.prose-skill pre { padding: 0.75em 1em; margin: 0.5em 0; overflow-x: auto; background: var(--color-muted); border: 1px solid var(--color-border); border-radius: 0.375rem; }
+.prose-skill pre code { background: none; padding: 0; font-size: max(0.85em, 0.75rem); }
+.prose-skill code { background: var(--color-muted); padding: 0.15em 0.35em; border-radius: 0.25rem; font-size: max(0.85em, 0.75rem); }
+.prose-skill a { color: var(--color-fg-muted); text-decoration: underline; }
+.prose-skill a:hover { color: var(--color-fg-strong); }
+.prose-skill blockquote { border-left: 2px solid var(--color-border); padding-left: 1em; margin: 0.5em 0; color: var(--color-fg-muted); }
+.prose-skill hr { border: none; border-top: 1px solid var(--color-border); margin: 1em 0; }
+.prose-skill strong { font-weight: 600; color: var(--color-fg-strong); }
+.prose-skill table { width: 100%; border-collapse: collapse; margin: 0.5em 0; font-size: 0.9em; }
+.prose-skill th, .prose-skill td { padding: 0.4em 0.75em; text-align: left; border-bottom: 1px solid var(--color-border); }
+.prose-skill th { font-weight: 600; color: var(--color-fg-strong); border-bottom-width: 2px; }
+</style>

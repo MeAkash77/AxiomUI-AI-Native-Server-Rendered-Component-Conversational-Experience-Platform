@@ -1,0 +1,380 @@
+import agents.MessageDeduplicator;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import play.test.UnitTest;
+
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * Unit tests for {@link MessageDeduplicator#buildImagePrefix} and
+ * {@link MessageDeduplicator#extractImageUrls}, the tool-result image dedup pair.
+ *
+ * <p>Guards the contract that lets {@code PlaywrightBrowserTool.screenshot()}
+ * and {@code ShellExecTool}'s QR-code renderer show images exactly once in the
+ * chat — the runner prepends rendered images to the assistant message, but
+ * only if the LLM reply doesn't already reference them by filename.
+ */
+class AgentRunnerDedupTest extends UnitTest {
+
+    // ==================== extractImageUrls ====================
+
+    @Test
+    void extractImageUrlsPicksUpScreenshotMarkdown() {
+        var collected = new ArrayList<String>();
+        MessageDeduplicator.extractImageUrls(
+                "![Screenshot](/api/agents/1/files/screenshot-1713100000000.png)\n"
+                        + "[Screenshot captured and displayed above...]",
+                collected);
+        assertEquals(1, collected.size());
+        assertEquals("![Screenshot](/api/agents/1/files/screenshot-1713100000000.png)",
+                collected.getFirst());
+    }
+
+    @Test
+    void extractImageUrlsPicksUpMultipleMarkdownImages() {
+        var collected = new ArrayList<String>();
+        MessageDeduplicator.extractImageUrls(
+                "Here: ![QR Code](/api/agents/1/files/terminal-image-1.png) "
+                        + "and also ![Another](/api/agents/1/files/terminal-image-2.png)",
+                collected);
+        assertEquals(2, collected.size());
+    }
+
+    @Test
+    void extractImageUrlsIgnoresNonApiMarkdownImages() {
+        // The regex is intentionally limited to /api/ URLs — external images
+        // the LLM references should not be collected as "rendered by a tool."
+        var collected = new ArrayList<String>();
+        MessageDeduplicator.extractImageUrls(
+                "![External](https://example.com/image.png)",
+                collected);
+        assertEquals(0, collected.size());
+    }
+
+    @Test
+    void extractImageUrlsHandlesNullAndEmpty() {
+        var collected = new ArrayList<String>();
+        MessageDeduplicator.extractImageUrls(null, collected);
+        MessageDeduplicator.extractImageUrls("", collected);
+        MessageDeduplicator.extractImageUrls("no markdown here", collected);
+        assertEquals(0, collected.size());
+    }
+
+    // ==================== buildImagePrefix: dedup paths ====================
+
+    @Test
+    void dedupsWhenUrlIsExactMatch() {
+        // The LLM echoed the exact same markdown image tag — no prefix needed.
+        List<String> collected = List.of(
+                "![Screenshot](/api/agents/1/files/screenshot-1000.png)");
+        var content = "Here's the screenshot: ![Screenshot](/api/agents/1/files/screenshot-1000.png)";
+        assertEquals("", MessageDeduplicator.buildImagePrefix(collected, content));
+    }
+
+    /**
+     * Three re-embed shapes that all dedup against the same collected
+     * screenshot (so buildImagePrefix returns ""): the LLM rewrote the URL
+     * but kept the filename, re-embedded as an HTML img tag (double-quoted
+     * src), and the same with a single-quoted src. Each must suppress the
+     * prepend so the image isn't shown twice.
+     */
+    @ParameterizedTest(name = "dedups[{0}]")
+    @CsvSource(delimiter = '|', value = {
+            "OnlyFilenameMatches      | Here's the screenshot: ![Screenshot](./workspace/screenshot-1000.png)",
+            "HtmlImgTagDoubleQuotes   | Here: <img src=\"/api/agents/1/files/screenshot-1000.png\" alt=\"\">",
+            "HtmlImgTagSingleQuotes   | <img alt='shot' src='./workspace/screenshot-1000.png'>"
+    })
+    void dedupsWhenLlmReembedsImage(String label, String content) {
+        List<String> collected = List.of(
+                "![Screenshot](/api/agents/1/files/screenshot-1000.png)");
+        assertEquals("", MessageDeduplicator.buildImagePrefix(collected, content),
+                label + " must suppress the prepend (dedup against the collected image)");
+    }
+
+    @Test
+    void prependsWhenFilenameIsMentionedAsPlainTextOnly() {
+        // Intentional behavior change: a plain-text mention of the filename is
+        // NOT an image embed — the user expects both the inline image AND the
+        // textual link reference, so the prepend still fires. Previously this
+        // case suppressed the prepend under a filename-substring dedup, which
+        // conflicted with the PlaywrightBrowserTool guidance that now asks the
+        // LLM to include the screenshot URL as a plain link in its reply.
+        List<String> collected = List.of(
+                "![Screenshot](/api/agents/1/files/screenshot-1000.png)");
+        var content = "I saved the screenshot as screenshot-1000.png in your workspace.";
+        var prefix = MessageDeduplicator.buildImagePrefix(collected, content);
+        assertTrue(prefix.contains("![Screenshot](/api/agents/1/files/screenshot-1000.png)"),
+                "Plain-text filename mention must NOT suppress the inline-image prepend");
+    }
+
+    @Test
+    void prependsWhenUrlIsMentionedAsMarkdownLinkOnly() {
+        // A markdown link (not an image embed) — same rule as plain text.
+        // User sees both: the prepended inline image AND the LLM's clickable link.
+        List<String> collected = List.of(
+                "![Screenshot](/api/agents/1/files/screenshot-1000.png)");
+        var content = "Captured: [screenshot](/api/agents/1/files/screenshot-1000.png)";
+        var prefix = MessageDeduplicator.buildImagePrefix(collected, content);
+        // Stricter than a bare filename substring: the prefix MUST carry a
+        // well-formed image embed so the user actually sees an inline image,
+        // not just a text fragment that happens to contain the filename.
+        assertTrue(prefix.contains("![Screenshot](/api/agents/1/files/screenshot-1000.png)"),
+                "Regular markdown link must NOT suppress the inline-image prepend");
+    }
+
+    // dedupsWhenLlmReembedsAsHtmlImgTag and ...WithSingleQuotes merged into
+    // dedupsWhenLlmReembedsImage above.
+
+    // ==================== buildImagePrefix: prepend paths ====================
+
+    @Test
+    void prependsWhenFilenameDiffers() {
+        // LLM hallucinated a different filename — prepend the correct one so
+        // the user still sees the image.
+        List<String> collected = List.of(
+                "![Screenshot](/api/agents/1/files/screenshot-1000.png)");
+        var content = "Here's the screenshot: ![Screenshot](/api/agents/1/files/screenshot-9999.png)";
+        var prefix = MessageDeduplicator.buildImagePrefix(collected, content);
+        assertTrue(prefix.contains("![Screenshot](/api/agents/1/files/screenshot-1000.png)"),
+                "Prefix must include the collected image when the LLM referenced a different filename");
+        assertTrue(prefix.endsWith("\n\n"),
+                "Prefix must be separated from the LLM content by a blank line");
+    }
+
+    @Test
+    void prependsWhenContentIsEmpty() {
+        // LLM returned no text at all — the image is the entire assistant message.
+        List<String> collected = List.of(
+                "![Screenshot](/api/agents/1/files/screenshot-1000.png)");
+        var prefix = MessageDeduplicator.buildImagePrefix(collected, "");
+        assertTrue(prefix.contains("screenshot-1000.png"));
+    }
+
+    @Test
+    void prependsWhenContentIsNull() {
+        // Defensive: null content must not throw and must produce the prefix.
+        List<String> collected = List.of(
+                "![Screenshot](/api/agents/1/files/screenshot-1000.png)");
+        var prefix = MessageDeduplicator.buildImagePrefix(collected, null);
+        assertTrue(prefix.contains("screenshot-1000.png"));
+    }
+
+    @Test
+    void returnsEmptyWhenCollectedListIsEmpty() {
+        assertEquals("", MessageDeduplicator.buildImagePrefix(List.of(), "some content"));
+        assertEquals("", MessageDeduplicator.buildImagePrefix(null, "some content"));
+    }
+
+    @Test
+    void prependsOnlyTheMissingImagesFromAMixedList() {
+        // One image is referenced by the LLM (should be skipped) and another is not
+        // (should be prepended).
+        List<String> collected = List.of(
+                "![Screenshot](/api/agents/1/files/screenshot-A.png)",
+                "![QR](/api/agents/1/files/terminal-image-B.png)");
+        var content = "Here's the screenshot: ![Screenshot](/api/agents/1/files/screenshot-A.png). "
+                + "Then I printed a code.";
+        var prefix = MessageDeduplicator.buildImagePrefix(collected, content);
+        assertFalse(prefix.contains("screenshot-A.png"),
+                "screenshot-A was referenced in the content — should not be prepended");
+        assertTrue(prefix.contains("terminal-image-B.png"),
+                "terminal-image-B was not referenced — should be prepended");
+    }
+
+    // ==================== JCLAW-104: buildDownloadSuffix ====================
+
+    @Test
+    void buildDownloadSuffixAppendsDownloadLinkOnWeb() {
+        // Web-channel turns get a markdown download link — the frontend
+        // renders [text](url) as clickable against the same-origin API.
+        List<String> collected = List.of(
+                "![Screenshot](/api/agents/1/files/screenshot-A.png)");
+        var content = "Here's the homepage — it shows course categories.";
+        var suffix = MessageDeduplicator.buildDownloadSuffix(collected, content, "web");
+        assertTrue(suffix.contains("[download Screenshot](/api/agents/1/files/screenshot-A.png)"),
+                "suffix should contain a clickable download link on web: " + suffix);
+        assertTrue(suffix.startsWith("\n\n"),
+                "suffix should separate itself from the LLM content with a blank line");
+    }
+
+    @Test
+    void buildDownloadSuffixSkipsOnTelegram() {
+        // Telegram's HTML parser drops relative hrefs — a "[download](url)"
+        // would render as plain text, confusing users whose real download
+        // affordance is Telegram's native Save-Image on the uploaded photo.
+        // Skip the suffix entirely on non-web channels.
+        List<String> collected = List.of(
+                "![Screenshot](/api/agents/1/files/screenshot-A.png)");
+        var content = "Here's the homepage — course catalog.";
+        assertEquals("", MessageDeduplicator.buildDownloadSuffix(collected, content, "telegram"));
+        assertEquals("", MessageDeduplicator.buildDownloadSuffix(collected, content, "slack"));
+        assertEquals("", MessageDeduplicator.buildDownloadSuffix(collected, content, "whatsapp"));
+        assertEquals("", MessageDeduplicator.buildDownloadSuffix(collected, content, null),
+                "null channel should also skip — we only render when we're sure it works");
+        assertEquals("", MessageDeduplicator.buildDownloadSuffix(collected, content, ""),
+                "blank channel should also skip");
+    }
+
+    /**
+     * Three "LLM already mentioned the file" shapes that all suppress the
+     * download suffix on web: a markdown link, a re-embedded image, and an
+     * HTML anchor.
+     */
+    @ParameterizedTest(name = "{0}")
+    @CsvSource(delimiter = '|', value = {
+            "markdownLink | Here's the page [screenshot](/api/agents/1/files/screenshot-A.png).",
+            "imageReembed | ![Here you go](/api/agents/1/files/screenshot-A.png)",
+            "htmlAnchor   | <a href=\"/api/agents/1/files/screenshot-A.png\">here</a>"
+    })
+    void buildDownloadSuffixSkipsWhenLlmAlreadyReferencedFile(String label, String content) {
+        List<String> collected = List.of(
+                "![Screenshot](/api/agents/1/files/screenshot-A.png)");
+        var suffix = MessageDeduplicator.buildDownloadSuffix(collected, content, "web");
+        assertEquals("", suffix,
+                label + " counts as a link for filename dedup — no suffix needed");
+    }
+
+    @Test
+    void buildDownloadSuffixFallsBackToPlainDownloadWhenAltMissing() {
+        List<String> collected = List.of("![](/api/agents/1/files/screenshot-A.png)");
+        var content = "No image here in text.";
+        var suffix = MessageDeduplicator.buildDownloadSuffix(collected, content, "web");
+        assertTrue(suffix.contains("[download](/api/agents/1/files/screenshot-A.png)"),
+                "empty alt should produce bare \"download\" label: " + suffix);
+    }
+
+    @Test
+    void buildDownloadSuffixReturnsEmptyWhenNoImagesCollected() {
+        assertEquals("", MessageDeduplicator.buildDownloadSuffix(new ArrayList<>(), "some content", "web"));
+    }
+
+    @Test
+    void buildDownloadSuffixHandlesNullInputsGracefully() {
+        // Null collected list → empty suffix.
+        assertEquals("", MessageDeduplicator.buildDownloadSuffix(null, "content", "web"));
+        // Null content on web → treated as empty content, suffix fires.
+        var suffix = MessageDeduplicator.buildDownloadSuffix(List.of(
+                "![Screenshot](/api/agents/1/files/screenshot-A.png)"), null, "web");
+        assertTrue(suffix.contains("[download Screenshot](/api/agents/1/files/screenshot-A.png)"),
+                "null content should behave like empty content on web — suffix appends the link");
+    }
+
+    // ==================== JCLAW-104: accumulating across rounds ====================
+
+    @Test
+    void collectedImagesAccumulateAcrossSimulatedToolRounds() {
+        // JCLAW-104 sub-bug #1: pre-fix, handleToolCallsStreaming declared a
+        // fresh collectedImages at every recursion depth, so images captured
+        // in round 1 never reached the round-N buildImagePrefix call when
+        // the LLM chose not to re-embed them in the final synthesis.
+        //
+        // This test simulates the turn-scope accumulator the fix installs:
+        // one list, fed by extractImageUrls over multiple tool-result
+        // payloads, then consumed by buildImagePrefix against a final
+        // synthesis that makes no mention of the image. The image must
+        // still make it into the prefix.
+        var turnImages = new ArrayList<String>();
+        // Round 1: browser navigate — no image in the result
+        MessageDeduplicator.extractImageUrls(
+                "Page: Abundent Academy — HRDC IT Training...",
+                turnImages);
+        // Round 2: browser screenshot — emits the image markdown
+        MessageDeduplicator.extractImageUrls(
+                "![Screenshot](/api/agents/1/files/screenshot-1713100000000.png)\n"
+                        + "[Screenshot already displayed above. Do NOT re-embed...]",
+                turnImages);
+        // Round 3: browser close — no image
+        MessageDeduplicator.extractImageUrls("Browser session closed.", turnImages);
+
+        // Final LLM synthesis: the model obeyed the \"do not re-embed\"
+        // instruction so the content has no image markup at all.
+        var finalContent = "Is there anything else you'd like me to do with this website?";
+        var prefix = MessageDeduplicator.buildImagePrefix(turnImages, finalContent);
+
+        assertTrue(prefix.contains("screenshot-1713100000000.png"),
+                "screenshot from an intermediate round must survive to the final buildImagePrefix "
+                        + "call; prefix was: " + prefix);
+        assertTrue(prefix.startsWith("![Screenshot]"),
+                "prefix should lead with the markdown image so the frontend renders inline; "
+                        + "actual prefix: " + prefix);
+    }
+
+    // ==================== JCLAW-125: angle-bracket markdown URL form ====================
+
+    @Test
+    void buildImagePrefixDedupsAgainstAngleBracketImageForm() {
+        // CommonMark accepts [text](<url>) as a valid link form; marked parses
+        // it identically to [text](url). The LLM sometimes emits the angle-
+        // bracket form (observed with gemini-3-flash-preview). Pre-JCLAW-125
+        // the captured URL kept the angle brackets, so filename extraction
+        // produced "<foo.png>" which never matched the collected "foo.png".
+        var collected = new ArrayList<String>();
+        collected.add("![Screenshot](/api/agents/1/files/screenshot-xyz.png)");
+
+        // LLM content re-embeds the image in angle-bracket form. Dedup must
+        // still fire so the prefix returns empty.
+        var content = "![Screenshot](<screenshot-xyz.png>)\n\nCaptured the page.";
+        var prefix = MessageDeduplicator.buildImagePrefix(collected, content);
+        assertEquals("", prefix,
+                "angle-bracket form embedded in LLM content must dedup the collected image");
+    }
+
+    @Test
+    void buildDownloadSuffixDedupsAgainstAngleBracketLinkForm() {
+        // The production reproduction: LLM emits a plain markdown link with
+        // angle-bracket URL around a bare filename. The collected image has
+        // the canonical /api/agents/... URL. Both filename roots are
+        // "screenshot-xyz.png", so dedup should fire and no suffix should
+        // be emitted.
+        var collected = new ArrayList<String>();
+        collected.add("![Screenshot](/api/agents/1/files/screenshot-xyz.png)");
+
+        var content = "Here is the captured image:\n"
+                + "[screenshot-xyz.png](<screenshot-xyz.png>)";
+        var suffix = MessageDeduplicator.buildDownloadSuffix(collected, content, "web");
+        assertEquals("", suffix,
+                "angle-bracket link in LLM content must dedup the download suffix");
+    }
+
+    @Test
+    void buildDownloadSuffixDedupsAgainstAngleBracketAbsoluteUrl() {
+        // Same test but with the full /api/agents/... URL inside the angle
+        // brackets. Tests the extraction path for both relative and
+        // absolute URLs wrapped in <>.
+        var collected = new ArrayList<String>();
+        collected.add("![Screenshot](/api/agents/1/files/screenshot-xyz.png)");
+
+        var content = "Link: [screenshot-xyz.png](</api/agents/1/files/screenshot-xyz.png>)";
+        var suffix = MessageDeduplicator.buildDownloadSuffix(collected, content, "web");
+        assertEquals("", suffix,
+                "angle-bracket absolute URL must dedup the download suffix");
+    }
+
+    @Test
+    void buildDownloadSuffixStillFiresWhenLlmDidNotLinkTheFile() {
+        // Regression guard: dedup should NOT fire on plain prose with no
+        // file links. The suffix is the only affordance the user has in
+        // that case, so the runtime must still emit it.
+        var collected = new ArrayList<String>();
+        collected.add("![Screenshot](/api/agents/1/files/screenshot-xyz.png)");
+
+        var content = "I captured the page. Let me know if you need anything else.";
+        var suffix = MessageDeduplicator.buildDownloadSuffix(collected, content, "web");
+        assertFalse(suffix.isEmpty(), "suffix must still fire when LLM didn't link the file");
+        assertTrue(suffix.contains("download Screenshot"),
+                "suffix should contain the download label: " + suffix);
+    }
+
+    @Test
+    void extractFilenameStripsAngleBrackets() {
+        // Direct test of the extraction helper so the contract is pinned.
+        assertEquals("foo.png", MessageDeduplicator.extractFilename("<foo.png>"));
+        assertEquals("foo.png", MessageDeduplicator.extractFilename("</path/to/foo.png>"));
+        assertEquals("foo.png", MessageDeduplicator.extractFilename("foo.png"));
+        assertEquals("foo.png", MessageDeduplicator.extractFilename("/path/to/foo.png"));
+        assertEquals("", MessageDeduplicator.extractFilename(""));
+        assertEquals("", MessageDeduplicator.extractFilename(null));
+    }
+}

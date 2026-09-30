@@ -1,0 +1,457 @@
+package agents;
+
+import com.google.gson.Gson;
+import com.google.gson.JsonParser;
+import llm.LlmTypes.ChatMessage;
+import llm.LlmTypes.ToolCall;
+import models.Agent;
+import models.MessageAttachment;
+import org.jspecify.annotations.Nullable;
+import services.AttachmentService;
+import services.EventLogger;
+import services.SubagentRegistry;
+import services.Tx;
+import utils.LatencyTrace;
+
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.BooleanSupplier;
+import java.util.function.Consumer;
+
+import static utils.GsonHolder.GSON;
+
+/**
+ * Three-tier scheduler for a batch of tool calls. Extracted from
+ * {@link AgentRunner} as part of JCLAW-299; the class owns the
+ * {@code JCLAW-80 + JCLAW-81} dispatch policy plus the {@code JCLAW-281}
+ * MCP per-action log expansion, which are coupled by the per-call
+ * dispatch path.
+ *
+ * <h2>Scheduling model</h2>
+ * <ul>
+ *   <li><b>Parallel-safe tool</b> (opt-in via
+ *   {@link ToolRegistry.Tool#parallelSafe()}): each call gets its own
+ *   virtual thread — the pre-v0.7.13 behavior. Appropriate for stateless
+ *   HTTP clients ({@code web_fetch}, {@code web_search}), pure-compute
+ *   helpers ({@code date_time}), and validators ({@code checklist}).</li>
+ *   <li><b>Non-parallel-safe tool</b>: calls are grouped by
+ *   {@link ToolRegistry.Tool#serializationGroup()} into a single virtual
+ *   thread and run sequentially in declared order. The default group key
+ *   is the tool's own name, so multiple calls to the same tool serialize.
+ *   Tools that share DB or in-memory state with another tool override
+ *   {@code serializationGroup()} to return a shared key — for instance
+ *   {@code subagent_spawn} and {@code subagent_yield} both return
+ *   {@code "subagent_lifecycle"} so yield can't read before spawn has
+ *   committed its SubagentRun row. The JCLAW-80 fix in spirit: the LLM's
+ *   declared call order is the authoritative contract for stateful tools.</li>
+ *   <li><b>Across serialization groups</b> (whether safe or unsafe):
+ *   always parallel. Groups touch disjoint state by construction, so
+ *   there's no correctness reason to serialize across them.</li>
+ * </ul>
+ *
+ * <p>Single-tool batches skip the virtual-thread overhead and execute
+ * inline on the caller. Results are always committed in the LLM's
+ * declared order so {@code tool_call_id → tool_result} pairing matches
+ * the pre-parallel history exactly. Cancellation is honored — in-flight
+ * tools finish naturally (their results are discarded at commit time).
+ */
+public final class ParallelToolExecutor {
+
+    private static final Gson gson = GSON;
+
+    private ParallelToolExecutor() {}
+
+    /**
+     * Pure compute: dispatch one tool call and return its result. No side
+     * effects on shared state (message lists, image collector, DB). Safe
+     * to call from multiple virtual threads concurrently.
+     */
+    static ToolRegistry.ToolResult runToolCall(ToolCall toolCall, Agent agent,
+                                               @Nullable Long conversationId,
+                                               @Nullable Long taskRunId,
+                                               BooleanSupplier cancelled,
+                                               @Nullable Consumer<String> onStatus,
+                                               @Nullable Set<String> offeredTools) {
+        var rawName = toolCall.function().name();
+        var rawArgs = toolCall.function().arguments();
+        // JCLAW-281: when the model invokes a server-level mcp_<server> handle
+        // with {tool, args}, expand the log line to the underlying action
+        // form so operators see mcp_jira-confluence_create_issue <args> in
+        // the events stream — same shape as the pre-281 per-action logs,
+        // even though the wire-format tool name is just mcp_<server>.
+        var display = expandMcpCallForLogging(rawName, rawArgs);
+        var displayName = display.name();
+        var displayArgs = display.args();
+        if (onStatus != null) {
+            onStatus.accept("Using tool: " + displayName);
+        }
+        EventLogger.info("tool", agent.name, null,
+                "Executing tool '%s' (id: %s, args: %s)"
+                        .formatted(displayName, toolCall.id(),
+                                displayArgs.length() > 200
+                                        ? displayArgs.substring(0, 200) + "..."
+                                        : displayArgs));
+        // JCLAW-382: gate sensitive/irreversible actions (today: exec) behind
+        // an interactive Telegram approve/deny prompt when the agent is bound
+        // to a Telegram bot. No-op for non-dangerous tools and non-Telegram
+        // agents — DangerousActionGate returns PROCEED before any I/O in those
+        // cases. Uses the raw (wire-format) name so the gate's dangerous()
+        // lookup matches the registered tool.
+        if (DangerousActionGate.guard(agent, conversationId, rawName, rawArgs) == DangerousActionGate.Decision.ABORT) {
+            return ToolRegistry.ToolResult.text(DangerousActionGate.abortResult(displayName));
+        }
+        // JCLAW-170: use the rich-output path so search-style tools can emit a
+        // structured JSON payload alongside the LLM-visible text. Non-rich
+        // tools fall through the default and return a text-only ToolResult.
+        // JCLAW-462: expose the run scope (conversation id for chat, task-run
+        // id for task fires) to tools that need it (ccr_retrieve) via
+        // ToolContext, set on this tool's own VT.
+        var result = ToolContext.withScope(conversationId, taskRunId, cancelled,
+                () -> ToolRegistry.executeRich(rawName, rawArgs, agent, offeredTools));
+        var text = result.text();
+        var resultPreview = text.length() > 200
+                ? text.substring(0, 200) + "... (%d chars)".formatted(text.length()) : text;
+        EventLogger.info("tool", agent.name, null,
+                "Tool '%s' returned: %s".formatted(displayName, resultPreview));
+        return result;
+    }
+
+    private record McpCallDisplay(@Nullable String name, String args) {}
+
+    /**
+     * JCLAW-281: synthesize the human-friendly display name and args for a
+     * tool call. For native tools this is a pass-through. For MCP
+     * server-level handles ({@code mcp_<server>}) invoked with
+     * {@code {tool, args}}, returns the per-action display form
+     * ({@code mcp_<server>_<action>}, inner args) so operators can scan
+     * the event log without manually unpacking the parameterized envelope.
+     */
+    private static McpCallDisplay expandMcpCallForLogging(@Nullable String rawName,
+                                                          @Nullable String rawArgs) {
+        if (rawName == null || !rawName.startsWith("mcp_")) {
+            return new McpCallDisplay(rawName, rawArgs == null ? "" : rawArgs);
+        }
+        try {
+            var parsed = JsonParser.parseString(
+                    rawArgs == null || rawArgs.isBlank() ? "{}" : rawArgs);
+            if (!parsed.isJsonObject()) return new McpCallDisplay(rawName, rawArgs == null ? "" : rawArgs);
+            var obj = parsed.getAsJsonObject();
+            if (!obj.has("tool") || obj.get("tool").isJsonNull()) {
+                // Discovery call (no tool field) — display as-is.
+                return new McpCallDisplay(rawName, rawArgs == null ? "" : rawArgs);
+            }
+            var actionName = obj.get("tool").getAsString();
+            var actionArgs = obj.has("args") && obj.get("args").isJsonObject()
+                    ? obj.getAsJsonObject("args").toString()
+                    : "{}";
+            return new McpCallDisplay(rawName + "_" + actionName, actionArgs);
+        } catch (RuntimeException _) {
+            return new McpCallDisplay(rawName, rawArgs == null ? "" : rawArgs);
+        }
+    }
+
+    /**
+     * Execute a batch of tool calls under the three-tier scheduling model
+     * documented at the class level. Results are committed to
+     * {@code currentMessages} and persisted to the conversation in the
+     * LLM's declared order; {@code imageCollector} (when non-null)
+     * accumulates extracted image URLs for the synthesis-side download
+     * suffix; {@code onToolCall} (when non-null) fires once per completed
+     * call so the SSE chat UI can render a per-call row post-persist.
+     */
+    // Visible (public) for ToolCallLoopRunnerEdgeCasesTest in the default package
+    @SuppressWarnings("java:S107") // every parameter is required to schedule and surface tool results
+    public static void executeToolsParallel(List<ToolCall> toolCalls,
+                                      Agent agent, @Nullable Long conversationId,
+                                      List<ChatMessage> currentMessages,
+                                      @Nullable Consumer<String> onStatus,
+                                      @Nullable Consumer<AgentRunner.ToolCallEvent> onToolCall,
+                                      @Nullable List<String> imageCollector,
+                                      @Nullable AtomicBoolean isCancelled,
+                                      AgentExecutionSink sink,
+                                      @Nullable Set<String> offeredTools) {
+        int n = toolCalls.size();
+        if (n == 0) return;
+
+        // JCLAW-462: task fires carry no conversation id (stub Conversation,
+        // null id); their tool turns persist to task_run_message via
+        // TaskRunSink. Surface the task-run id so ccr_retrieve can scan that
+        // schema. null for the chat path (ConversationSink).
+        Long taskRunId = (sink instanceof TaskRunSink trs) ? trs.taskRunId() : null;
+        // A subagent's stop flag is bound to the child's own thread, which the work-unit threads below do not inherit.
+        var subagentRun = SubagentRegistry.currentRun();
+        BooleanSupplier cancelled = () -> (isCancelled != null && isCancelled.get())
+                || (subagentRun != null && subagentRun.stopRequested());
+
+        ToolRegistry.ToolResult[] results = new ToolRegistry.ToolResult[n];
+
+        if (n == 1) {
+            if (isCancelled == null || !isCancelled.get()) {
+                results[0] = runToolCall(toolCalls.getFirst(), agent, conversationId, taskRunId, cancelled, onStatus,
+                        offeredTools);
+            }
+        } else {
+            dispatchMultiToolCalls(toolCalls, agent, conversationId, taskRunId, results, onStatus, isCancelled,
+                    cancelled, offeredTools);
+        }
+
+        commitToolResults(toolCalls, results, currentMessages, onToolCall, imageCollector, sink);
+    }
+
+    /**
+     * Partition calls into work units and run them under the three-tier
+     * scheduling model:
+     * <ul>
+     *   <li>parallel-safe tools → one work unit per CALL (each races freely)</li>
+     *   <li>non-parallel-safe tools → one work unit per
+     *       {@link ToolRegistry.Tool#serializationGroup() group key}
+     *       (calls within it run sequentially in declared order)</li>
+     * </ul>
+     * Default group key is the tool's own name, so distinct tools still
+     * parallelize. Tools that share state across names (e.g.
+     * {@code subagent_spawn} + {@code subagent_yield} both return
+     * {@code "subagent_lifecycle"}) merge into one serial queue.
+     * LinkedHashMap preserves first-occurrence order so the unsafe groups,
+     * like the safe singletons, see their declared positions.
+     */
+    @SuppressWarnings("java:S107") // scheduling state; collapses into DispatchContext once the latch is known
+    private static void dispatchMultiToolCalls(List<ToolCall> toolCalls, Agent agent,
+                                               @Nullable Long conversationId,
+                                               @Nullable Long taskRunId,
+                                               ToolRegistry.ToolResult[] results,
+                                               @Nullable Consumer<String> onStatus,
+                                               @Nullable AtomicBoolean isCancelled,
+                                               BooleanSupplier cancelled,
+                                               @Nullable Set<String> offeredTools) {
+        var unsafeGroups = new LinkedHashMap<String, List<Integer>>();
+        var safeCalls = new ArrayList<Integer>();
+        for (int i = 0; i < toolCalls.size(); i++) {
+            var name = toolCalls.get(i).function().name();
+            var groupKey = ToolRegistry.serializationGroupFor(name);
+            if (groupKey == null) {
+                safeCalls.add(i);
+            } else {
+                unsafeGroups.computeIfAbsent(groupKey, _ -> new ArrayList<>()).add(i);
+            }
+        }
+
+        int workUnits = safeCalls.size() + unsafeGroups.size();
+        var latch = new CountDownLatch(workUnits);
+        var ctx = new DispatchContext(
+                toolCalls, agent, conversationId, taskRunId, onStatus, isCancelled, cancelled, latch, offeredTools);
+        // JCLAW-882: the work-unit threads below inherit nothing, so an LLM call
+        // a tool makes on its own (a subagent's bootstrap summary, a memory
+        // rerank) would dispatch unbound and go uncounted. Hand each unit the
+        // turn's binding so those calls bill the turn that caused them. Same
+        // set-on-the-tool's-own-thread shape as ToolContext.withScope.
+        var turnTrace = LatencyTrace.current();
+
+        // One virtual thread per parallel-safe call — full concurrency.
+        for (int idx : safeCalls) {
+            final int i = idx;
+            Thread.ofVirtual().name("agent-tool-parallel").start(() -> {
+                try (var _ = LatencyTrace.bind(turnTrace)) {
+                    runSafeCall(ctx, results, i);
+                }
+            });
+        }
+
+        // One virtual thread per non-parallel-safe tool-name group —
+        // calls within execute sequentially in declared order.
+        for (var group : unsafeGroups.values()) {
+            Thread.ofVirtual().name("agent-tool-serial").start(() -> {
+                try (var _ = LatencyTrace.bind(turnTrace)) {
+                    runSerialGroup(ctx, results, group);
+                }
+            });
+        }
+
+        try {
+            latch.await();
+        } catch (InterruptedException _) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    /**
+     * Fixed environment for one multi-call dispatch phase: the batch under
+     * execution plus the status callback, cancellation flag, the stop signal
+     * each tool reads, and completion latch. Threaded identically through every
+     * work unit; the shared result sink and the per-unit selector ({@code int}
+     * index or group) are passed separately.
+     */
+    private record DispatchContext(List<ToolCall> toolCalls, Agent agent,
+                                   @Nullable Long conversationId,
+                                   @Nullable Long taskRunId, @Nullable Consumer<String> onStatus,
+                                   @Nullable AtomicBoolean isCancelled, BooleanSupplier cancelled,
+                                   CountDownLatch latch, @Nullable Set<String> offeredTools) {}
+
+    /** Body of one parallel-safe work unit: dispatch a single call. */
+    private static void runSafeCall(DispatchContext ctx, ToolRegistry.ToolResult[] results, int i) {
+        try {
+            if (ctx.isCancelled() != null && ctx.isCancelled().get()) return;
+            results[i] = runToolCallSafely(
+                    ctx.toolCalls().get(i), ctx.agent(), ctx.conversationId(), ctx.taskRunId(), ctx.cancelled(),
+                    ctx.onStatus(), ctx.offeredTools());
+        } finally {
+            ctx.latch().countDown();
+        }
+    }
+
+    /** Body of one serial work unit: dispatch calls in declared order. */
+    private static void runSerialGroup(DispatchContext ctx, ToolRegistry.ToolResult[] results, List<Integer> group) {
+        try {
+            for (int idx : group) {
+                if (ctx.isCancelled() != null && ctx.isCancelled().get()) break;
+                results[idx] = runToolCallSafely(
+                        ctx.toolCalls().get(idx), ctx.agent(), ctx.conversationId(), ctx.taskRunId(), ctx.cancelled(),
+                        ctx.onStatus(), ctx.offeredTools());
+            }
+        } finally {
+            ctx.latch().countDown();
+        }
+    }
+
+    /**
+     * Dispatch one call and convert any thrown exception into an
+     * {@code Error executing tool} {@link ToolRegistry.ToolResult}.
+     */
+    private static ToolRegistry.ToolResult runToolCallSafely(ToolCall tc, Agent agent,
+                                                             @Nullable Long conversationId,
+                                                             @Nullable Long taskRunId,
+                                                             BooleanSupplier cancelled,
+                                                             @Nullable Consumer<String> onStatus,
+                                                             @Nullable Set<String> offeredTools) {
+        try {
+            return runToolCall(tc, agent, conversationId, taskRunId, cancelled, onStatus, offeredTools);
+        } catch (Exception e) {
+            EventLogger.error("tool", agent.name, null,
+                    "Tool '%s' threw: %s"
+                            .formatted(tc.function().name(), e.getMessage()));
+            return ToolRegistry.ToolResult.text("Error executing tool: " + e.getMessage());
+        }
+    }
+
+    /**
+     * JCLAW-836: record the verdict for one tool result. Failures are logged at
+     * INFO rather than WARN — a tool reporting an error is normal traffic the model
+     * is expected to handle, and logging it as a warning would train operators to
+     * ignore the category before the metric has said anything.
+     *
+     * <p>Never throws: a defect in verification must not cost the turn its tool
+     * result, which would turn an observability feature into an outage.
+     */
+    private static void verifyAndCount(@Nullable String toolName, ToolRegistry.ToolResult result) {
+        try {
+            var verification = ToolResultVerifier.verify(toolName, result);
+            if (verification.verdict() == ToolResultVerifier.Verdict.SKIPPED) return;
+            LatencyTrace.countToolVerification(verification.failed());
+            if (verification.failed()) {
+                EventLogger.info("tool",
+                        "Tool '%s' result flagged %s".formatted(toolName, verification.verdict()),
+                        verification.reason());
+            }
+        } catch (RuntimeException e) {
+            EventLogger.warn("tool", "Tool-result verification threw for '%s': %s".formatted(toolName, e));
+        }
+    }
+
+    /**
+     * Commit phase: append to message history and persist to DB in
+     * original order, preserving LLM tool_result ordering invariants.
+     *
+     * <p>The whole round persists in ONE transaction — dispatch runs on a
+     * background virtual thread with no ambient one, so a {@code Tx.run} per
+     * call cost a connection checkout, begin and commit per tool call.
+     */
+    private static void commitToolResults(List<ToolCall> toolCalls, ToolRegistry.ToolResult[] results,
+                                          List<ChatMessage> currentMessages,
+                                          @Nullable Consumer<AgentRunner.ToolCallEvent> onToolCall,
+                                          @Nullable List<String> imageCollector, AgentExecutionSink sink) {
+        var frames = new ArrayList<AgentRunner.ToolCallEvent>();
+        var frameSink = onToolCall != null ? frames : null;
+        Tx.run(() -> {
+            for (int i = 0; i < toolCalls.size(); i++) {
+                var result = results[i];
+                if (result == null) continue; // skipped due to cancellation
+                commitOneResult(toolCalls.get(i), result, currentMessages, imageCollector, sink, frameSink);
+            }
+        });
+        // JCLAW-170: surface the completed calls to the SSE stream so the
+        // chat UI can render a per-call row with the structured result
+        // payload (search-result chips, favicons). Fired post-commit so
+        // a reload mid-turn would still see the same rows.
+        if (onToolCall != null) frames.forEach(onToolCall);
+    }
+
+    /**
+     * Persist one tool call's result inside the caller's transaction, appending its SSE frame to
+     * {@code frameSink} when the caller wants frames ({@code null} skips the frame work entirely,
+     * as the inline version did).
+     */
+    private static void commitOneResult(ToolCall tc, ToolRegistry.ToolResult result,
+                                        List<ChatMessage> currentMessages,
+                                        @Nullable List<String> imageCollector,
+                                        AgentExecutionSink sink,
+                                        @Nullable List<AgentRunner.ToolCallEvent> frameSink) {
+        var text = result.text();
+        var structured = result.structuredJson();
+        // JCLAW-836 stage 1: judge the result, do not change it. The model still
+        // receives exactly what the tool returned — including its errors, which it
+        // needs in order to react — and the verdict becomes a per-turn metric so
+        // the failure rate is a number before anything acts on it. This is the
+        // single chokepoint for both the sync and streaming tool paths, and it
+        // runs on the turn's thread, so the LatencyTrace binding is in scope.
+        verifyAndCount(tc.function().name(), result);
+        currentMessages.add(ChatMessage.toolResult(tc.id(), tc.function().name(), text));
+        if (imageCollector != null) {
+            MessageDeduplicator.extractImageUrls(text, imageCollector);
+        }
+        // JCLAW-228/562: a tool result may carry produced attachments (generate_image's image,
+        // diarize_audio's per-speaker voice clips); the sink inlines them on the ONE assistant
+        // turn that called the tool (empty list for every ordinary tool) and returns the
+        // persisted rows so we can push them onto the live SSE tool_call frame.
+        List<MessageAttachment> persisted;
+        var videoJob = result.videoJob();
+        // JCLAW-235: a generate_video result carries a submitted-job ref instead of bytes — the
+        // sink creates a zero-byte placeholder linked to it; every other tool takes the
+        // attachments path (no-op for ordinary calls).
+        if (videoJob != null) {
+            var placeholder = sink.appendVideoPlaceholder(null, gson.toJson(tc), videoJob);
+            persisted = placeholder != null ? List.of(placeholder) : List.of();
+        } else {
+            persisted = sink.appendAssistantMessage(null, gson.toJson(tc), result.attachments());
+        }
+        sink.appendToolResult(tc.id(), text, structured);
+        // JCLAW-883: the sink already has the name (from the assistant turn
+        // above) and the text; this is the third fact — whether a tool ran.
+        sink.noteToolOutcome(tc.id(), result.outcome());
+        if (frameSink != null) {
+            frameSink.add(new AgentRunner.ToolCallEvent(
+                    tc.id(),
+                    tc.function().name(),
+                    ToolRegistry.iconFor(tc.function().name()),
+                    tc.function().arguments(),
+                    text,
+                    structured,
+                    generatedAttachmentsJson(persisted),
+                    persisted.stream().map(a -> a.uuid).toList()));
+        }
+    }
+
+    /**
+     * JCLAW-228/562: serialize the tool-produced attachments for the live SSE {@code tool_call}
+     * frame as a JSON array, in the per-item shape {@link AttachmentService#toView} defines, so
+     * the chat UI can render generated images / voice clips inline without waiting for a
+     * reload. {@code null} when the call produced nothing.
+     */
+    private static @Nullable String generatedAttachmentsJson(@Nullable List<MessageAttachment> atts) {
+        if (atts == null || atts.isEmpty()) return null;
+        return gson.toJson(AttachmentService.toViews(atts));
+    }
+
+}

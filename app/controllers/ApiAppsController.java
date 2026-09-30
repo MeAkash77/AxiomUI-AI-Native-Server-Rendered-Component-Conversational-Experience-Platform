@@ -1,0 +1,155 @@
+package controllers;
+
+import com.google.gson.Gson;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.media.Content;
+import io.swagger.v3.oas.annotations.media.Schema;
+import io.swagger.v3.oas.annotations.responses.ApiResponse;
+import org.jspecify.annotations.Nullable;
+import play.Play;
+import play.mvc.Controller;
+import play.mvc.With;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
+import java.util.regex.Pattern;
+
+import static controllers.AgentAccess.Level.OPEN;
+import static controllers.AgentAccess.Level.OPERATOR_ONLY;
+import static utils.GsonHolder.GSON;
+
+/**
+ * Apps registry (SPEC-apps): enumerates operator-hosted mini-apps under
+ * {@code public/apps/<slug>/}. Each app self-describes via {@code app.json}
+ * (name/version/creator/icon/price) and is launched statically at
+ * {@code /apps/<slug>/}. The filesystem IS the registry — no DB entity — so
+ * adding or removing an app is adding or removing its directory.
+ */
+@With(AuthCheck.class)
+public class ApiAppsController extends Controller {
+
+    private static final Gson gson = GSON;
+
+    /** A hosted-app slug is a single path segment of lowercase alphanumerics and
+     *  hyphens — no dots or slashes, so it can never traverse out of public/apps/. */
+    static final Pattern SLUG = Pattern.compile("^[a-z0-9][a-z0-9-]*$");
+
+    /** The manifest filename every hosted app carries under {@code public/apps/<slug>/}. */
+    private static final String APP_JSON = "app.json";
+
+    /** One hosted app: the parsed manifest plus derived launch fields. {@code id}
+     *  is the directory name under {@code public/apps/}; {@code url} = {@code
+     *  /apps/<id>/}; {@code icon} is resolved to an app-root-relative URL (null
+     *  when the manifest omits it — the card supplies a default). {@code agent}
+     *  is the designated agent id the app may invoke (JCLAW-763; null when the
+     *  manifest omits it — the app is non-invoking). */
+    public record AppEntry(String id, String url, String name, String version,
+                           @Nullable String creator, @Nullable String icon,
+                           @Nullable String price, @Nullable String description,
+                           @Nullable String agent) {}
+
+    public record AppsResponse(List<AppEntry> apps) {}
+
+    public record DeleteResponse(boolean deleted, String slug) {}
+
+    /** GET /api/apps — every {@code public/apps/<slug>/} carrying both {@code
+     *  app.json} and {@code index.html}. A missing or malformed manifest is
+     *  skipped, never a 500. */
+    @Operation(summary = "List operator-hosted mini-apps discovered under public/apps/")
+    @ApiResponse(responseCode = "200", content = @Content(schema = @Schema(implementation = AppsResponse.class)))
+    @AgentAccess(OPEN)
+    public static void list() {
+        var appsDir = Play.getFile("public/apps").toPath();
+        var apps = new ArrayList<AppEntry>();
+        if (Files.isDirectory(appsDir)) {
+            try (var dirs = Files.list(appsDir)) {
+                dirs.filter(Files::isDirectory).sorted().forEach(dir -> {
+                    var entry = readApp(dir);
+                    if (entry != null) apps.add(entry);
+                });
+            } catch (IOException _) {
+                // public/apps unreadable — return whatever we have (likely empty)
+            }
+        }
+        renderJSON(gson.toJson(new AppsResponse(apps)));
+    }
+
+    /** DELETE /api/apps/{slug} — remove a hosted app by deleting its
+     *  {@code public/apps/<slug>/} directory. The filesystem is the whole
+     *  registry (no DB row, no app-owned state yet), so removing the directory
+     *  fully removes the app. Rejects a slug that isn't a well-formed, existing
+     *  app directory — the {@link #SLUG} regex plus a parent-containment check
+     *  guard against path traversal. */
+    @Operation(summary = "Delete an operator-hosted mini-app (removes its public/apps/<slug>/ directory)")
+    @ApiResponse(responseCode = "200", content = @Content(schema = @Schema(implementation = DeleteResponse.class)))
+    @AgentAccess(value = OPERATOR_ONLY,
+            reason = "removes an operator-hosted app directory, outside every agent workspace")
+    public static void delete(String slug) {
+        if (slug == null || !SLUG.matcher(slug).matches()) {
+            badRequest("Invalid app slug");
+        }
+        var appsDir = Play.getFile("public/apps").toPath().toAbsolutePath().normalize();
+        var target = appsDir.resolve(slug).normalize();
+        // Defense in depth beyond the regex: the target must be a direct child of
+        // public/apps/ — never public/apps itself, never anything outside it.
+        if (!appsDir.equals(target.getParent())) {
+            badRequest("Invalid app slug");
+        }
+        if (!Files.isDirectory(target) || !Files.isRegularFile(target.resolve(APP_JSON))) {
+            notFound("No such app: " + slug);
+        }
+        try {
+            deleteRecursively(target);
+        } catch (IOException e) {
+            error("Failed to delete app: " + e.getMessage());
+        }
+        renderJSON(gson.toJson(new DeleteResponse(true, slug)));
+    }
+
+    /** Remove a directory tree depth-first (children before parents). */
+    private static void deleteRecursively(Path root) throws IOException {
+        try (var walk = Files.walk(root)) {
+            for (var p : walk.sorted(Comparator.reverseOrder()).toList()) {
+                Files.delete(p);
+            }
+        }
+    }
+
+    /** Parse one app directory into an entry, or null when it isn't a valid,
+     *  launchable app (missing app.json/index.html, or unparseable manifest). */
+    static @Nullable AppEntry readApp(Path dir) {
+        if (!Files.isRegularFile(dir.resolve(APP_JSON))
+                || !Files.isRegularFile(dir.resolve("index.html"))) {
+            return null;
+        }
+        try {
+            var m = JsonParser.parseString(Files.readString(dir.resolve(APP_JSON))).getAsJsonObject();
+            var id = dir.getFileName().toString();
+            var name = str(m, "name");
+            var version = str(m, "version");
+            var icon = str(m, "icon");
+            return new AppEntry(
+                    id,
+                    "/apps/" + id + "/",
+                    name != null ? name : id,
+                    version != null ? version : "0.0.0",
+                    str(m, "creator"),
+                    icon != null ? "/apps/" + id + "/" + icon : null,
+                    str(m, "price"),
+                    str(m, "description"),
+                    str(m, "agent"));
+        } catch (RuntimeException | IOException _) {  // malformed manifest — skip, don't fail the list
+            return null;
+        }
+    }
+
+    private static @Nullable String str(JsonObject o, String key) {
+        return o.has(key) && !o.get(key).isJsonNull() ? o.get(key).getAsString() : null;
+    }
+}

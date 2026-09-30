@@ -1,0 +1,236 @@
+package utils;
+
+import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
+import org.HdrHistogram.AtomicHistogram;
+import org.jspecify.annotations.NonNull;
+import org.jspecify.annotations.Nullable;
+import services.LatencyMetricRecorder;
+import services.telemetry.TurnMetrics;
+
+import java.util.HashMap;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
+
+/**
+ * In-memory HdrHistogram-backed latency stats, partitioned by channel.
+ * Not persisted — resets on JVM restart and via {@link #reset()}.
+ *
+ * <p>Uses {@link AtomicHistogram} for lock-free multi-writer recording;
+ * values below 1ms are clamped to 1 since HdrHistogram requires positive
+ * integers. The range covers 1ms..1h with 3 significant digits (≈0.1%
+ * relative error), which replaces the hand-rolled log-linear buckets that
+ * rounded tail percentiles up to the next power of two.
+ *
+ * <p>Per-channel partitioning (JCLAW-102): every sample is bound to a
+ * channel (web, telegram, task, …) so the dashboard can show distinct
+ * distributions per transport instead of one comingled average. A blank
+ * or null channel falls back to {@link #UNKNOWN_CHANNEL} so nothing silently
+ * disappears from the snapshot.
+ */
+public final class LatencyStats {
+
+    public static final String UNKNOWN_CHANNEL = "unknown";
+
+    // 1ms..1h, 3 sig digits — memory footprint is ~50 KB per histogram.
+    private static final long HIGHEST_TRACKABLE_MS = 3_600_000L;
+    private static final int NUMBER_OF_SIG_DIGITS = 3;
+
+    // channel → (segment → histogram). Outer and inner maps are both
+    // ConcurrentHashMap so record() is lock-free on the fast path.
+    private static final ConcurrentHashMap<String, ConcurrentHashMap<String, Histogram>> BY_CHANNEL =
+            new ConcurrentHashMap<>();
+
+    private LatencyStats() {}
+
+    // S6213: `record` is the semantically correct verb for histogram observation
+    // (matches HdrHistogram.recordValue, Micrometer Timer.record, etc.). Renaming
+    // would force 16+ call sites across agents/, services/, tools/ to use a less
+    // idiomatic name purely to avoid Java's contextual keyword.
+    @SuppressWarnings("java:S6213")
+    public static void record(@Nullable String channel, @NonNull String segment, long valueMs) {
+        record(channel, segment, valueMs, null);
+    }
+
+    /**
+     * Record a sample to the live in-memory histogram AND persist it for the
+     * time-windowed Chat Performance dashboard (JCLAW-515). {@code agentId} tags
+     * the persisted row (null for agent-less recordings) so the dashboard's agent
+     * filter works. The in-memory histogram remains the source of truth for the
+     * live snapshot and the load-test harness; the persisted enqueue is best-effort
+     * and batched off the turn path by {@link LatencyMetricRecorder}.
+     */
+    @SuppressWarnings("java:S6213")
+    public static void record(@Nullable String channel, @NonNull String segment, long valueMs, @Nullable String agentId) {
+        var resolved = (channel == null || channel.isBlank()) ? UNKNOWN_CHANNEL : channel;
+        BY_CHANNEL
+                .computeIfAbsent(resolved, _ -> new ConcurrentHashMap<>())
+                .computeIfAbsent(segment, _ -> new Histogram())
+                .record(valueMs);
+        LatencyMetricRecorder.enqueue(agentId, resolved, segment, valueMs);
+        TurnMetrics.recordSegment(resolved, segment, valueMs, agentId);
+    }
+
+    /**
+     * Snapshot every channel's histograms as a nested JSON object:
+     * {@code {channel: {segment: histogramJson, …}, …}}. Callers that want
+     * a single aggregate view across channels can merge client-side (or
+     * we can add a server-side merge later — JCLAW-102 defers that).
+     */
+    public static @NonNull JsonObject snapshot() {
+        var root = new JsonObject();
+        for (var channelEntry : BY_CHANNEL.entrySet()) {
+            var channelObj = new JsonObject();
+            for (var e : channelEntry.getValue().entrySet()) {
+                channelObj.add(e.getKey(), e.getValue().toJson());
+            }
+            root.add(channelEntry.getKey(), channelObj);
+        }
+        return root;
+    }
+
+    public static void reset() {
+        BY_CHANNEL.clear();
+    }
+
+    /**
+     * Aggregate raw persisted samples (segment → values) into the same
+     * {@code {segment: histogramJson}} shape {@link #snapshot} emits per channel,
+     * for the windowed Chat Performance dashboard (JCLAW-515). Reuses the
+     * HdrHistogram percentile machinery so server-side (windowed/filtered) and
+     * live aggregation produce an identical shape from one code path.
+     */
+    public static @NonNull JsonObject aggregate(@NonNull Map<String, ? extends Iterable<Long>> samplesBySegment) {
+        var root = new JsonObject();
+        for (var e : samplesBySegment.entrySet()) {
+            var hist = new Histogram();
+            for (long v : e.getValue()) hist.record(v);
+            root.add(e.getKey(), hist.toJson());
+        }
+        return root;
+    }
+
+    /**
+     * Capture the current histogram state (all channels, all segments) and
+     * return a {@link Runnable} that, when invoked, restores the exact state
+     * at capture time — dropping any samples recorded between capture and
+     * restore, and removing any (channel, segment) pairs that were created
+     * after capture.
+     *
+     * <p>Used by the load-test harness to discard warmup samples without
+     * wiping data accumulated from previous runs. Safe to call while other
+     * threads are recording, but concurrent writes happening <em>between</em>
+     * the reset and add steps of the restore are lost — keep the window
+     * narrow (snapshot → single warmup request → restore).
+     */
+    public static @NonNull Runnable captureResetPoint() {
+        Map<String, Map<String, HistogramCopy>> snap = new HashMap<>();
+        for (var channelEntry : BY_CHANNEL.entrySet()) {
+            var inner = new HashMap<String, HistogramCopy>();
+            for (var e : channelEntry.getValue().entrySet()) {
+                inner.put(e.getKey(), e.getValue().copy());
+            }
+            snap.put(channelEntry.getKey(), inner);
+        }
+        return () -> {
+            // Drop channels entirely absent from the snapshot.
+            BY_CHANNEL.keySet().retainAll(snap.keySet());
+            for (var channelEntry : snap.entrySet()) {
+                var segmentMap = BY_CHANNEL.get(channelEntry.getKey());
+                if (segmentMap == null) continue;
+                // Drop segments in this channel that didn't exist at snapshot time.
+                segmentMap.keySet().retainAll(channelEntry.getValue().keySet());
+                for (var e : channelEntry.getValue().entrySet()) {
+                    var hist = segmentMap.get(e.getKey());
+                    if (hist != null) hist.restoreFrom(e.getValue());
+                }
+            }
+        };
+    }
+
+    /**
+     * Single-use per-segment snapshot used by {@link #captureResetPoint()}. Not
+     * immutable: {@code hdr} is a mutable {@link AtomicHistogram} (a deep copy
+     * taken at capture time via {@link AtomicHistogram#copy()}). It is owned by
+     * the restore closure {@code captureResetPoint} returns — read once during
+     * {@link Histogram#restoreFrom} and never mutated or shared — so the
+     * effective immutability the snapshot relies on holds by single-use, not by
+     * the field type.
+     */
+    private record HistogramCopy(AtomicHistogram hdr, long sumMs) {}
+
+    private static final class Histogram {
+        private final AtomicHistogram hdr =
+                new AtomicHistogram(HIGHEST_TRACKABLE_MS, NUMBER_OF_SIG_DIGITS);
+        // HdrHistogram doesn't track raw sum internally; we keep it alongside
+        // to support sum_ms / avg downstream without a second histogram pass.
+        private final AtomicLong sumMs = new AtomicLong();
+
+        // S6213: matches public LatencyStats.record API and HdrHistogram.recordValue verb.
+        @SuppressWarnings("java:S6213")
+        void record(long value) {
+            long clamped = Math.clamp(value, 1, HIGHEST_TRACKABLE_MS);
+            hdr.recordValue(clamped);
+            sumMs.addAndGet(value);
+        }
+
+        HistogramCopy copy() {
+            return new HistogramCopy(hdr.copy(), sumMs.get());
+        }
+
+        void restoreFrom(HistogramCopy c) {
+            hdr.reset();
+            hdr.add(c.hdr);
+            sumMs.set(c.sumMs);
+        }
+
+        JsonObject toJson() {
+            long n = hdr.getTotalCount();
+            var o = new JsonObject();
+            o.addProperty("count", n);
+            o.addProperty("sum_ms", sumMs.get());
+            if (n == 0) {
+                o.addProperty("min_ms", 0);
+                o.addProperty("max_ms", 0);
+                o.addProperty("p50_ms", 0);
+                o.addProperty("p90_ms", 0);
+                o.addProperty("p99_ms", 0);
+                o.addProperty("p999_ms", 0);
+                return o;
+            }
+            o.addProperty("min_ms", hdr.getMinValue());
+            o.addProperty("max_ms", hdr.getMaxValue());
+            o.addProperty("p50_ms", hdr.getValueAtPercentile(50.0));
+            o.addProperty("p90_ms", hdr.getValueAtPercentile(90.0));
+            o.addProperty("p99_ms", hdr.getValueAtPercentile(99.0));
+            o.addProperty("p999_ms", hdr.getValueAtPercentile(99.9));
+            // Log buckets at fractional factors of 2 (base = 2^(1/4) ≈ 1.189),
+            // giving ~4× the resolution of plain log-2 so tight distributions
+            // (e.g. TTFT with p50 and max within 1.3×) split into multiple bars
+            // instead of collapsing into one. Boundaries iterate in double
+            // precision and ceil to integer ms; consecutive duplicates after
+            // ceiling are skipped. Interior zero-count buckets are preserved
+            // so the frontend can draw a continuous empirical distribution.
+            var buckets = new JsonArray();
+            final double logBase = Math.pow(2.0, 0.25);
+            long maxValue = hdr.getMaxValue();
+            long prevLe = 0;
+            double boundary = 1.0;
+            while (prevLe < maxValue) {
+                long le = (long) Math.ceil(boundary);
+                if (le > prevLe) {
+                    long bucketCount = hdr.getCountBetweenValues(prevLe + 1, le);
+                    var b = new JsonObject();
+                    b.addProperty("le_ms", le);
+                    b.addProperty("count", bucketCount);
+                    buckets.add(b);
+                    prevLe = le;
+                }
+                boundary *= logBase;
+            }
+            o.add("buckets", buckets);
+            return o;
+        }
+    }
+}

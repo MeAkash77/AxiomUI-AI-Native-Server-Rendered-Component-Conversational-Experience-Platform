@@ -1,0 +1,303 @@
+import { describe, it, expect, vi, afterEach } from 'vitest'
+import { mountSuspended, registerEndpoint } from '@nuxt/test-utils/runtime'
+import { flushPromises } from '@vue/test-utils'
+import { defineComponent, h, nextTick, ref } from 'vue'
+import ChatSubagentTranscriptPanel from '~/components/chat/ChatSubagentTranscriptPanel.vue'
+import type { SubagentRunStatus } from '~/composables/useChatSubagentChips'
+
+afterEach(() => {
+  vi.useRealTimers()
+  vi.restoreAllMocks()
+})
+
+function row(id: number, o: Record<string, unknown> = {}) {
+  return { id, role: 'assistant', content: `reply ${id}`, createdAt: '2026-09-13T00:00:00Z', ...o }
+}
+
+// Each test serves its own conversation id: the transcript cache is module-level by design.
+function serve(convoId: number, initial: unknown[]) {
+  const server = { rows: [...initial], calls: 0, gate: null as Promise<void> | null }
+  registerEndpoint(`/api/conversations/${convoId}/messages`, async (event) => {
+    if (server.gate) await server.gate
+    server.calls++
+    const { getQuery } = await import('h3')
+    const query = getQuery(event)
+    const offset = Number(query.offset) || 0
+    return structuredClone(server.rows.slice(offset, offset + (Number(query.limit) || 200)))
+  })
+  return server
+}
+
+async function mountPanel(convoId: number, initial: SubagentRunStatus = 'RUNNING', attach = false) {
+  const status = ref<SubagentRunStatus>(initial)
+  const wrapper = await mountSuspended(defineComponent({
+    setup: () => () => h(ChatSubagentTranscriptPanel, { childConversationId: convoId, status: status.value, agentId: null }),
+  }), attach ? { attachTo: document.body } : {})
+  return { wrapper, status }
+}
+
+// Fails every request while `fail` is set, and holds each one while `gate` is.
+function serveFlaky(convoId: number, rows: unknown[]) {
+  const server = { fail: false, gate: null as Promise<void> | null }
+  registerEndpoint(`/api/conversations/${convoId}/messages`, async () => {
+    if (server.gate) await server.gate
+    if (server.fail) {
+      const { createError } = await import('h3')
+      throw createError({ statusCode: 503 })
+    }
+    return structuredClone(rows)
+  })
+  return server
+}
+
+function occurrences(text: string, needle: string) {
+  return text.split(needle).length - 1
+}
+
+function fakeLayout(el: HTMLElement, layout: { scrollTop: number, scrollHeight: () => number, clientHeight: number }) {
+  Object.defineProperty(el, 'scrollHeight', { configurable: true, get: layout.scrollHeight })
+  Object.defineProperty(el, 'clientHeight', { configurable: true, value: layout.clientHeight })
+  Object.defineProperty(el, 'scrollTop', { configurable: true, writable: true, value: layout.scrollTop })
+}
+
+describe('ChatSubagentTranscriptPanel', () => {
+  it('renders the child transcript through the chat page\'s message renderer', async () => {
+    serve(201, [
+      row(1, { role: 'user', content: 'hello there' }),
+      row(2, { content: null, toolCalls: [{ id: 'c1', function: { name: 'web_search', arguments: '{"query":"cats"}' } }] }),
+      row(3, { role: 'tool', content: 'found cats', toolResults: 'c1' }),
+      row(4, { content: '# Big Heading', reasoning: 'let me think' }),
+    ])
+    const { wrapper } = await mountPanel(201, 'COMPLETED')
+    await vi.waitFor(() => expect(wrapper.text()).toContain('Big Heading'))
+
+    expect(wrapper.text()).toContain('hello there')
+    expect(wrapper.text()).toContain('1 tool call')
+    expect(wrapper.find('textarea').exists()).toBe(false)
+
+    // Collapsed by default, as on a chat reload; the toggle has to reach a row it mutates in place.
+    expect(wrapper.find('[data-reasoning-body]').exists()).toBe(false)
+    await wrapper.findAll('button').find(b => b.text().includes('Thinking'))!.trigger('click')
+    expect(wrapper.find('[data-reasoning-body]').text()).toContain('let me think')
+  })
+
+  it('links to the full-page transcript', async () => {
+    serve(202, [row(1)])
+    const { wrapper } = await mountPanel(202, 'COMPLETED')
+    expect(wrapper.find('[data-testid="subagent-transcript-full"]').attributes('href')).toBe('/chat?conversation=202')
+    // The one scroller, bounded by the viewport so the link beneath it stays on screen.
+    expect(wrapper.find('[data-testid="subagent-transcript-scroll"]').classes()).toContain('max-h-[min(24rem,40vh)]')
+  })
+
+  it('announces a failed load and retries it on request, since a finished run is never polled', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    let fail = true
+    registerEndpoint('/api/conversations/211/messages', async () => {
+      if (fail) {
+        const { createError } = await import('h3')
+        throw createError({ statusCode: 503 })
+      }
+      return [row(1, { content: 'back again' })]
+    })
+    const { wrapper } = await mountPanel(211, 'COMPLETED')
+    await vi.waitFor(() => expect(wrapper.find('[role="status"]').text()).toBe('Could not load this transcript.'))
+
+    fail = false
+    await wrapper.find('[data-testid="subagent-transcript-retry"]').trigger('click')
+    await vi.waitFor(() => expect(wrapper.text()).toContain('back again'))
+    expect(wrapper.find('[data-testid="subagent-transcript-retry"]').exists()).toBe(false)
+  })
+
+  it('shows a placeholder for an empty transcript', async () => {
+    serve(203, [])
+    const { wrapper } = await mountPanel(203, 'RUNNING')
+    await vi.waitFor(() => expect(wrapper.find('[data-testid="subagent-transcript-empty"]').exists()).toBe(true))
+  })
+
+  it('appends a new message while RUNNING without duplicating the ones shown', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] })
+    const server = serve(204, [row(1)])
+    const { wrapper } = await mountPanel(204, 'RUNNING')
+    await vi.waitFor(() => expect(wrapper.text()).toContain('reply 1'))
+
+    server.rows.push(row(2))
+    vi.advanceTimersByTime(5000)
+    await vi.waitFor(() => expect(wrapper.text()).toContain('reply 2'))
+
+    vi.advanceTimersByTime(5000)
+    await vi.waitFor(() => expect(server.calls).toBe(3))
+    await flushPromises()
+    expect(occurrences(wrapper.text(), 'reply 1')).toBe(1)
+    expect(occurrences(wrapper.text(), 'reply 2')).toBe(1)
+  })
+
+  it('fetches the last messages when the run ends, then stops refreshing', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] })
+    const server = serve(205, [row(1)])
+    const { wrapper, status } = await mountPanel(205, 'RUNNING')
+    await vi.waitFor(() => expect(wrapper.text()).toContain('reply 1'))
+
+    server.rows.push(row(2))
+    status.value = 'KILLED'
+    await vi.waitFor(() => expect(wrapper.text()).toContain('reply 2'))
+
+    vi.advanceTimersByTime(20_000)
+    await flushPromises()
+    expect(server.calls).toBe(2)
+  })
+
+  it('stops refreshing when unmounted, as a collapsed chip does', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] })
+    const server = serve(206, [row(1)])
+    const { wrapper } = await mountPanel(206, 'RUNNING')
+    await vi.waitFor(() => expect(server.calls).toBe(1))
+
+    wrapper.unmount()
+    vi.advanceTimersByTime(20_000)
+    await flushPromises()
+    expect(server.calls).toBe(1)
+  })
+
+  it('shows what was loaded at once on re-expand, then catches up', async () => {
+    const server = serve(207, [row(1)])
+    const first = await mountPanel(207, 'RUNNING')
+    await vi.waitFor(() => expect(first.wrapper.text()).toContain('reply 1'))
+    first.wrapper.unmount()
+
+    let release!: () => void
+    server.gate = new Promise((resolve) => {
+      release = resolve
+    })
+    server.rows.push(row(2))
+    const second = await mountPanel(207, 'RUNNING')
+    expect(second.wrapper.text()).toContain('reply 1')
+    expect(second.wrapper.text()).not.toContain('reply 2')
+
+    release()
+    await vi.waitFor(() => expect(second.wrapper.text()).toContain('reply 2'))
+  })
+
+  it('keeps the reader\'s place above the bottom when a message arrives', async () => {
+    const server = serve(208, [row(1)])
+    const { wrapper, status } = await mountPanel(208, 'RUNNING')
+    await vi.waitFor(() => expect(wrapper.text()).toContain('reply 1'))
+    const scroller = wrapper.find('[data-testid="subagent-transcript-scroll"]')
+    const el = scroller.element as HTMLElement
+    let height = 1000
+    fakeLayout(el, { scrollTop: 100, scrollHeight: () => height, clientHeight: 200 })
+    await scroller.trigger('scroll')
+
+    height = 1400
+    server.rows.push(row(2))
+    status.value = 'COMPLETED'
+    await vi.waitFor(() => expect(wrapper.text()).toContain('reply 2'))
+    await nextTick()
+    expect(el.scrollTop).toBe(100)
+  })
+
+  it('follows new messages when the reader is already at the bottom', async () => {
+    const server = serve(209, [row(1)])
+    const { wrapper, status } = await mountPanel(209, 'RUNNING')
+    await vi.waitFor(() => expect(wrapper.text()).toContain('reply 1'))
+    const scroller = wrapper.find('[data-testid="subagent-transcript-scroll"]')
+    const el = scroller.element as HTMLElement
+    let height = 1000
+    fakeLayout(el, { scrollTop: 800, scrollHeight: () => height, clientHeight: 200 })
+    await scroller.trigger('scroll')
+
+    height = 1400
+    server.rows.push(row(2))
+    status.value = 'COMPLETED'
+    await vi.waitFor(() => expect(wrapper.text()).toContain('reply 2'))
+    await nextTick()
+    expect(el.scrollTop).toBe(1400)
+  })
+
+  it('wires no delete action: a click on the row\'s delete control sends nothing', async () => {
+    serve(210, [row(1, { role: 'user', content: 'keep me' })])
+    let deleted = false
+    registerEndpoint('/api/conversations/210/messages/1', {
+      method: 'DELETE',
+      handler: () => {
+        deleted = true
+        return {}
+      },
+    })
+    const { wrapper } = await mountPanel(210, 'COMPLETED')
+    await vi.waitFor(() => expect(wrapper.text()).toContain('keep me'))
+
+    await wrapper.find('button[title="Delete message"]').trigger('click')
+    await flushPromises()
+    expect(deleted).toBe(false)
+    expect(wrapper.text()).toContain('keep me')
+  })
+
+  it('follows a call result that lands on a row already shown, when the reader is at the bottom', async () => {
+    const server = serve(212, [
+      row(1, { role: 'user', content: 'go' }),
+      row(2, { content: 'searching now', toolCalls: [{ id: 'c1', function: { name: 'web_search', arguments: '{}' } }] }),
+    ])
+    const { wrapper, status } = await mountPanel(212, 'RUNNING')
+    await vi.waitFor(() => expect(wrapper.text()).toContain('searching now'))
+    const scroller = wrapper.find('[data-testid="subagent-transcript-scroll"]')
+    const el = scroller.element as HTMLElement
+    let height = 1000
+    fakeLayout(el, { scrollTop: 800, scrollHeight: () => height, clientHeight: 200 })
+    await scroller.trigger('scroll')
+
+    // The tool row is never displayed, so the displayed row count does not change.
+    height = 1400
+    server.rows.push(row(3, { role: 'tool', content: 'found it', toolResults: 'c1' }))
+    status.value = 'COMPLETED'
+    await vi.waitFor(() => expect(el.scrollTop).toBe(1400))
+  })
+
+  it('keeps what loaded and offers a retry when a later refresh fails', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const rows = [row(1, { content: 'first reply' })]
+    const server = serveFlaky(213, rows)
+    const { wrapper, status } = await mountPanel(213, 'RUNNING')
+    await vi.waitFor(() => expect(wrapper.text()).toContain('first reply'))
+    const stale = () => wrapper.find('[data-testid="subagent-transcript-stale"]')
+    expect(stale().attributes('role')).toBe('status')
+    expect(stale().text()).toBe('')
+
+    server.fail = true
+    rows.push(row(2, { content: 'last reply' }))
+    status.value = 'COMPLETED'
+    await vi.waitFor(() => expect(stale().text()).toBe('Could not refresh this transcript.'))
+    expect(wrapper.text()).toContain('first reply')
+
+    server.fail = false
+    await wrapper.find('[data-testid="subagent-transcript-refresh-retry"]').trigger('click')
+    await vi.waitFor(() => expect(wrapper.text()).toContain('last reply'))
+    expect(stale().text()).toBe('')
+    expect(wrapper.find('[data-testid="subagent-transcript-refresh-retry"]').exists()).toBe(false)
+  })
+
+  it('keeps Retry focused while it runs, then hands focus to the transcript when it succeeds', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const server = serveFlaky(214, [row(1, { content: 'back again' })])
+    server.fail = true
+    const { wrapper } = await mountPanel(214, 'COMPLETED', true)
+    const retry = () => wrapper.find('[data-testid="subagent-transcript-retry"]')
+    await vi.waitFor(() => expect(retry().exists()).toBe(true))
+
+    let release!: () => void
+    server.gate = new Promise((resolve) => {
+      release = resolve
+    })
+    server.fail = false
+    const button = retry().element as HTMLElement
+    button.focus()
+    await retry().trigger('click')
+    expect(retry().element).toBe(button)
+    expect(button.getAttribute('aria-busy')).toBe('true')
+    expect(document.activeElement).toBe(button)
+
+    release()
+    await vi.waitFor(() => expect(wrapper.text()).toContain('back again'))
+    await vi.waitFor(() => expect(document.activeElement).toBe(wrapper.find('[data-testid="subagent-transcript-scroll"]').element))
+    wrapper.unmount()
+  })
+})

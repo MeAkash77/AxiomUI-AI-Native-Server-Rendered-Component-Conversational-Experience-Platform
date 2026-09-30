@@ -1,0 +1,280 @@
+/* Tailwind v4 CSS-first entry point. MUST stay in bare-string form —
+   `@tailwindcss/vite` only intercepts `@import "tailwindcss"`. Rewriting to
+   `@import url("tailwindcss")` (what stylelint's default `import-notation`
+   rule prefers) makes the plugin skip the file, so no utility classes are
+   ever generated and the whole site renders unstyled. */
+@import "tailwindcss";
+
+/* Self-hosted Inter Variable (weights 100–900). Matches the font stack
+   Unsloth Studio ships — its body sans is what gives their dark-mode chat
+   UI the crisp, tight feel; system-ui → SF Pro renders noticeably wider and
+   softer at the same Tailwind sizes. Package emits the @font-face rules
+   plus the woff2 files; Vite picks them up automatically. */
+@import "@fontsource-variable/inter";
+
+/* Handwriting face, used by exactly one element: the "Leave a star!" nudge
+   that points at the header's GitHub link on first load. Self-hosted for the
+   same reason Inter is: instances run air-gapped and can't reach a font CDN.
+   Only the latin/600 subset — the nudge renders four words, so the rest of
+   the family is dead weight.
+
+   Declared by hand instead of `@import "@fontsource/caveat/latin-600.css"`
+   purely to drop that file's `.woff` fallback. Measured: the browser fetches
+   only the woff2 (verified via the Resource Timing API against a cold cache),
+   so the 61 KB .woff shipped in the build for nobody — it exists for browsers
+   predating 2016, which cannot run this app at all. Halves the font's
+   on-disk footprint, 111 KB → 50 KB, with no user-visible change. */
+@font-face {
+  font-family: Caveat;
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url("@fontsource/caveat/files/caveat-latin-600-normal.woff2") format("woff2");
+}
+
+/* Class-based dark mode (preserves v3 darkMode: 'class' behavior).
+   The <html> element carries the 'dark' class; useTheme() manages it. */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* ── shadcn-vue theme tokens (neutral base, Tailwind v4) ────────────── */
+
+@layer base {
+  :root {
+    /* color-scheme tells the browser to render its native UI (date/time
+       pickers, scrollbars, default form controls, focus rings) in the
+       matching palette. Without it the browser falls back to the OS
+       preference and ignores the in-app theme toggle, so a dark-mode
+       user on a light-mode OS gets a glaring white datetime popup. The
+       `.dark` block below flips this to `dark`. */
+    color-scheme: light;
+
+    /* ── shadcn-vue component tokens ─────────────────────────────────────
+       Background surfaces match Unsloth Studio's light mode:
+       body/background is pure white; sidebar/composer (surface-elevated
+       below) sit on a 99%-white step for a near-imperceptible lift. */
+    --background: #fff;
+    --foreground: hsl(0 0% 3.9%);
+    --card: #fff;
+    --card-foreground: hsl(0 0% 3.9%);
+    --popover: #fff;
+    --popover-foreground: hsl(0 0% 3.9%);
+    --primary: hsl(0 0% 9%);
+    --primary-foreground: hsl(0 0% 98%);
+    --secondary: hsl(0 0% 96.1%);
+    --secondary-foreground: hsl(0 0% 9%);
+    --muted: hsl(0 0% 96.1%);
+    --muted-foreground: hsl(0 0% 43%);     /* JCLAW-691 #6: 45.1%→43% so muted text ≥4.5:1 on --muted */
+    --accent: hsl(0 0% 96.1%);
+    --accent-foreground: hsl(0 0% 9%);
+    --destructive: hsl(0 72% 45%);         /* JCLAW-691 #5: darkened so white --destructive-foreground ≥4.5:1 (was 60.2% ≈3.6:1) */
+    --destructive-foreground: hsl(0 0% 98%);
+    --border: hsl(0 0% 55%);               /* ≥3:1 non-text on --muted as well as the near-white surfaces (57% was 2.88:1 on --muted). Heavier chrome — see audit note. */
+    --input: hsl(0 0% 55%);                /* JCLAW-691 #4: 89.8%→55% so form-field borders ≥3:1 non-text on the near-white surface */
+    --ring: hsl(0 0% 3.9%);
+    --radius: 0.5rem;
+
+    /* ── JClaw semantic design tokens (UX-DR1 Phase 1) ─────────────────
+       Surface, foreground, and status colors mapped to the existing
+       neutral / emerald / red palette. These tokens describe intent
+       (surface, emphasis, status) so future theme changes only touch CSS
+       variables, not every Vue file. ──────────────────────────────────── */
+    --surface: #fff;                    /* page background — Unsloth white */
+    --surface-elevated: #fcfcfc;           /* sidebar/header/composer — Unsloth 99% */
+    --fg-primary: hsl(0 0% 27%);           /* body text — neutral-700 */
+    --fg-muted: hsl(0 0% 43%);             /* secondary text — neutral; ≥4.5:1 incl. tinted surfaces (WCAG AA) */
+    --fg-strong: hsl(0 0% 9%);             /* emphasis/hover — neutral-900 */
+    --ok: hsl(160 84% 27%);                /* success — JCLAW-691 #2: darkened emerald so text ≥4.5:1 on white (was 39% ≈2.6:1); dark keeps 39% */
+    --danger: hsl(0 72% 49%);              /* error — 51%→49% so error text ≥4.5:1 on --muted too (was 4.40:1) */
+    --warning: hsl(38 92% 31%);            /* WCAG-2026-08 #5: 33%→31% so warning text ≥4.5:1 on every light surface incl. --muted (was 4.22:1 there, 4.49:1 on --surface-elevated) */
+    --info: hsl(221 83% 45%);              /* informational — JCLAW-691 #2: darkened blue so text ≥4.5:1 on white (was blue-500 ≈3.6:1); dark keeps blue-500 */
+  }
+
+  .dark {
+    /* Flip the browser's native-UI palette to dark. See :root above for
+       why this exists. */
+    color-scheme: dark;
+
+    /* ── shadcn-vue component tokens ─────────────────────────────────────
+       Background surfaces match Unsloth Studio's dark mode: #1a1b1e for
+       the main chat area, #222427 for the elevated tier (sidebar, header,
+       cards, popovers, composer), #2e3035 for muted/accent/border tints. */
+    --background: #1a1b1e;
+    --foreground: hsl(0 0% 98%);
+    --card: #222427;
+    --card-foreground: hsl(0 0% 98%);
+    --popover: #222427;
+    --popover-foreground: hsl(0 0% 83%);
+    --primary: hsl(0 0% 98%);
+    --primary-foreground: hsl(0 0% 9%);
+    --secondary: hsl(0 0% 14.9%);
+    --secondary-foreground: hsl(0 0% 98%);
+    --muted: hsl(0 0% 14.9%);
+    --muted-foreground: hsl(0 0% 63.9%);
+    --accent: hsl(0 0% 14.9%);
+    --accent-foreground: hsl(0 0% 98%);
+    --destructive: hsl(0 62.8% 30.6%);
+    --destructive-foreground: hsl(0 0% 98%);
+
+    /* Border lightness was hsl(0 0% 14.9%) — shadcn's default, but
+       near-isoluminant with --surface-elevated (#222427 ≈ 14.7% L) so
+       borders on tables, menus, cards, and form inputs effectively
+       vanished. The visible borders in this app (sidebar outer chrome,
+       composer card, ChatContextMeter) all bypass the token with explicit
+       hsl(0 0% 25%)/50 or fg-muted/40 overrides. Lifting the token to
+       ~22% L (~#383838) gives ~7 points of contrast against the elevated
+       surface — clearly visible without becoming heavy chrome. The two
+       intentional-invisibility uses of `dark:border-border` in
+       layouts/default.vue have been switched to `dark:border-transparent`
+       to preserve their structural-spacer behavior. */
+    --border: hsl(0 0% 44%);               /* ≥3:1 non-text on --muted as well as the elevated dark surface (43% was 2.95:1 on --muted). Heavier chrome — see audit note. */
+    --input: hsl(0 0% 45%);                /* JCLAW-691 #4: 22%→45% so form-field borders ≥3:1 non-text on the elevated dark surface */
+    --ring: hsl(0 0% 83.1%);
+
+    /* ── JClaw semantic design tokens ──────────────────────────────────── */
+    --surface: #1a1b1e;                    /* page background — Unsloth */
+    --surface-elevated: #222427;           /* sidebar/header/composer — Unsloth */
+    --fg-primary: hsl(0 0% 83%);           /* body text — neutral-300 */
+    --fg-muted: hsl(0 0% 56%);             /* secondary text — ~4.8:1 on elevated surface (WCAG AA; was 50%≈3.93:1) */
+    --fg-strong: hsl(0 0% 100%);           /* emphasis/hover — white */
+    --ok: hsl(160 84% 39%);                /* success — emerald-500 */
+    --danger: hsl(0 84% 65%);              /* error — 64%→65% so error text ≥4.5:1 on --muted as well as --surface-elevated (was 4.46:1) */
+    --warning: hsl(38 92% 50%);            /* warning — amber-500 */
+    --info: hsl(217 91% 63%);              /* informational — 62%→63% so info text ≥4.5:1 on --muted as well as --surface-elevated (was 4.47:1) */
+  }
+
+  /* Preserve v3 defaults that changed in v4 */
+  button:not(:disabled),
+  [role="button"]:not(:disabled) {
+    cursor: pointer;
+  }
+
+  /* Theme toggle uses View Transitions API to crossfade light↔dark via
+     a circular clip-path reveal anchored to the clicked button (see
+     useTheme.ts). Disable the browser's default crossfade animation so
+     the JS-driven clipPath on ::view-transition-new(root) takes full
+     control; mix-blend-mode: normal prevents the old/new layers from
+     blending in unexpected ways during the reveal. No effect on browsers
+     without View Transitions support — the rule simply doesn't apply. */
+  ::view-transition-old(root),
+  ::view-transition-new(root) {
+    animation: none;
+    mix-blend-mode: normal;
+  }
+
+  *,
+  ::after,
+  ::before,
+  ::backdrop,
+  ::file-selector-button {
+    border-color: var(--border);
+  }
+
+  /* Tailwind v4's preflight renders ::placeholder as currentColor at 50%
+     opacity, which measures 3.34:1 against our fields — under the 4.5:1 WCAG
+     1.4.3 wants. Only four of this app's placeholders set a colour of their
+     own, and a `placeholder:` utility still wins over this base rule. */
+  ::placeholder {
+    color: var(--fg-muted);
+    opacity: 1;
+  }
+
+  /* Inter Variable as the default sans — matches Unsloth Studio's body
+     font. The `--font-sans` @theme token below wires the class utility;
+     these rules apply the font globally so prose inherits it without
+     needing font-sans on every element. */
+  html,
+  body {
+    font-family: "Inter Variable", ui-sans-serif, sans-serif, system-ui;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizelegibility;
+  }
+}
+
+/* Register tokens as Tailwind utilities (v4 @theme inline) */
+@theme inline {
+  /* shadcn-vue component tokens */
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+
+  /* JClaw semantic design tokens */
+  --color-surface: var(--surface);
+  --color-surface-elevated: var(--surface-elevated);
+  --color-fg-primary: var(--fg-primary);
+  --color-fg-muted: var(--fg-muted);
+  --color-fg-strong: var(--fg-strong);
+  --color-ok: var(--ok);
+  --color-danger: var(--danger);
+  --color-warning: var(--warning);
+  --color-info: var(--info);
+
+  /* font-sans utility — uses Inter Variable same as the global body rule. */
+  --font-sans: "Inter Variable", ui-sans-serif, sans-serif, system-ui;
+}
+
+/* ── Copy button on rendered code blocks ─────────────────────────────
+   Emitted by ~/utils/chat-markdown's code renderer, so the selectors are
+   unprefixed on purpose: the same markup appears under .prose-chat (chat)
+   and .md-preview (agent editor), and both need identical treatment.
+   Positioning hangs off .code-block rather than the <pre> because the <pre>
+   scrolls horizontally and would carry the button off-screen with it. */
+.code-block { position: relative; }
+
+.code-copy {
+  position: absolute;
+  top: 0.4em;
+  right: 0.5em;
+  padding: 0.15em 0.5em;
+  border-radius: 0.35em;
+  font-family: inherit;
+  font-size: 0.75rem;
+  line-height: 1.5;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s, color 0.15s;
+  background: rgb(0,0,0,6%);
+  border: 1px solid rgb(0,0,0,12%);
+  color: #525252;
+}
+
+.code-block:hover .code-copy,
+.code-copy:focus-visible { opacity: 1; }
+
+/* #065f46 (emerald-800): the button's 6% black sits over the code block's own
+   tint, where emerald-700 measured only 4.40:1. */
+.code-copy[data-copied] { opacity: 1; color: #065f46; }
+
+html.dark .code-copy {
+  background: rgb(255,255,255,8%);
+  border-color: rgb(255,255,255,14%);
+  color: #a3a3a3;
+}
+html.dark .code-copy[data-copied] { color: #6ee7b7; }
+
+/* A display equation wider than the bubble scrolls inside it rather than widening the transcript. */
+.katex-display { overflow: auto hidden; }
+
+/* A select has no caret, so `focus:outline-hidden` left it with no focus cue at all (2.4.7).
+   Unlayered so it outranks that utility wherever a select carries it. */
+select:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }

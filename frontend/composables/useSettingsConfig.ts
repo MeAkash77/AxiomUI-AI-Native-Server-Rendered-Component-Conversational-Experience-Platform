@@ -1,0 +1,191 @@
+import type { InjectionKey, Ref } from 'vue'
+import type { ApiErrorDetails, ConfigEntry, ConfigResponse, ProviderInfo, ProviderModelDef } from '~/types/api'
+
+/**
+ * Shared /api/config store for the Settings page and its extracted panels
+ * (JCLAW-680). The page owns the single awaited {@code useFetch('/api/config')}
+ * — Nuxt dedupes by key, but rather than have each panel re-await it (which
+ * would spawn a Suspense boundary per child), the page provides one reactive
+ * context that panels {@link useSettingsConfig inject} synchronously.
+ *
+ * Exposes the two primitives every panel needs: {@code configValue(key)} to
+ * read a stored row (with a fallback) and {@code saveField(key, value)} to
+ * POST-then-refresh. {@code saving} is shared so the whole page still greys out
+ * its inputs during a write, matching the pre-extraction monolith.
+ */
+export interface SettingsConfigContext {
+  configData: Ref<ConfigResponse | null>
+  /**
+   * Re-reads the store, keeping the last good copy when the read fails, so a handler calls it after a
+   * failed write as well as a successful one: a half-landed pair of writes then shows what was saved.
+   */
+  refresh: () => Promise<void>
+  saving: Ref<boolean>
+  /** Value of the config row {@code key}, or {@code fallback} when absent. */
+  configValue: (key: string, fallback?: string) => string
+  /** POST {@code {key, value}} to /api/config then refresh the store. */
+  saveField: (key: string, value: string) => Promise<void>
+  /**
+   * Parsed {@code provider.<name>.models} JSON, or [] when unset/invalid.
+   * The LLM-provider model catalog is a pure read-projection of the config
+   * store, so media panels (transcription diarization, captioning, video)
+   * that need a provider's audio/vision/video models inject it from here
+   * rather than each re-deriving it (JCLAW-680 second pass).
+   */
+  getProviderModels: (providerName: string) => ProviderModelDef[]
+  /** True when {@code provider.<name>.apiKey} is set and non-blank. */
+  apiKeyConfigured: (providerName: string) => boolean
+  /**
+   * Page-wide inline config-row editor (JCLAW-680 second pass). The Settings
+   * page and every section that edits a config row inline share ONE editor —
+   * only a single key is editable at a time. {@code editingKey} names it (null
+   * = nothing editing), {@code editValue} is the buffer, {@code startEdit}
+   * opens a row, {@code updateEntry} POSTs the buffer and closes the editor.
+   * Panels inject these so their pencil-edit UIs drive the same singleton.
+   */
+  editingKey: Ref<string | null>
+  editValue: Ref<string>
+  /** Why the open editor's last save was refused; panels render it beside the editor it belongs to. */
+  editError: Ref<ApiErrorDetails | null>
+  startEdit: (entry: ConfigEntry) => void
+  updateEntry: (key: string) => Promise<void>
+  /**
+   * GET /api/providers billing projection (JCLAW-680 second pass). A shared read
+   * — the inline editor's {@code updateEntry} refreshes it on {@code provider.*}
+   * writes, and the LLM Providers panel injects it for its billing rows.
+   */
+  providersData: Ref<ProviderInfo[] | null>
+  refreshProviders: () => Promise<void>
+}
+
+export const settingsConfigKey: InjectionKey<SettingsConfigContext>
+  = Symbol('settingsConfig')
+
+/**
+ * Page-level: create the shared config store and {@code provide} it to child
+ * panels. Returns the context plus the {@code AsyncData} handle so the page can
+ * {@code await} it (keeping the original single-Suspense load), and the raw
+ * {@code configData}/{@code refresh}/{@code saving} refs the page still uses
+ * directly for the panels not yet extracted.
+ */
+export function useProvideSettingsConfig() {
+  const asyncConfig = useFetch<ConfigResponse>('/api/config')
+  const asyncProviders = useFetch<ProviderInfo[]>('/api/providers')
+  const saving = ref(false)
+
+  function configValue(key: string, fallback = ''): string {
+    return asyncConfig.data.value?.entries?.find(e => e.key === key)?.value ?? fallback
+  }
+
+  // Not Nuxt's refresh(): that resets the data to its default when the read fails, which would
+  // empty every panel during the same outage that failed a write. The caller is already showing why.
+  const configReads = useLatestRequest()
+  async function refresh(): Promise<void> {
+    const request = configReads.begin()
+    try {
+      const fresh = await $fetch<ConfigResponse>('/api/config')
+      if (configReads.isCurrent(request)) asyncConfig.data.value = fresh
+    }
+    catch { /* keep the last good copy */ }
+  }
+
+  const providerReads = useLatestRequest()
+  async function refreshProviders(): Promise<void> {
+    const request = providerReads.begin()
+    try {
+      const fresh = await $fetch<ProviderInfo[]>('/api/providers')
+      if (providerReads.isCurrent(request)) asyncProviders.data.value = fresh
+    }
+    catch { /* keep the last good copy */ }
+  }
+
+  async function saveField(key: string, value: string): Promise<void> {
+    saving.value = true
+    try {
+      await $fetch('/api/config', { method: 'POST', body: { key, value } })
+      refresh()
+    }
+    finally {
+      saving.value = false
+    }
+  }
+
+  function getProviderModels(providerName: string): ProviderModelDef[] {
+    const modelsEntry = asyncConfig.data.value?.entries?.find(e => e.key === `provider.${providerName}.models`)
+    if (!modelsEntry?.value) return []
+    try {
+      return JSON.parse(modelsEntry.value) as ProviderModelDef[]
+    }
+    catch { return [] }
+  }
+
+  function apiKeyConfigured(providerName: string): boolean {
+    const v = asyncConfig.data.value?.entries?.find(e => e.key === `provider.${providerName}.apiKey`)?.value
+    return !!v && v.trim().length > 0
+  }
+
+  // Page-wide inline config-row editor — single editable key at a time.
+  const editingKey = ref<string | null>(null)
+  const editValue = ref('')
+  const editError = ref<ApiErrorDetails | null>(null)
+  // Every editor opener sets editingKey, several inline, so opening another editor drops a stale reason here.
+  watch(editingKey, () => {
+    editError.value = null
+  })
+
+  function startEdit(entry: ConfigEntry) {
+    editingKey.value = entry.key
+    editValue.value = entry.value
+  }
+
+  async function updateEntry(key: string) {
+    saving.value = true
+    editError.value = null
+    try {
+      await $fetch('/api/config', {
+        method: 'POST',
+        body: { key, value: editValue.value },
+      })
+      editingKey.value = null
+      refresh()
+      // JCLAW-280: provider-scoped config rows (modality, subscription price,
+      // API keys) feed the /api/providers projection; refresh it so provider
+      // billing rows reflect the new value immediately.
+      if (key.startsWith('provider.')) refreshProviders()
+    }
+    catch (e) {
+      editError.value = apiErrorDetails(e)
+    }
+    finally {
+      saving.value = false
+    }
+  }
+
+  const context: SettingsConfigContext = {
+    configData: asyncConfig.data as Ref<ConfigResponse | null>,
+    refresh,
+    saving,
+    configValue,
+    saveField,
+    getProviderModels,
+    apiKeyConfigured,
+    editingKey,
+    editValue,
+    editError,
+    startEdit,
+    updateEntry,
+    providersData: asyncProviders.data as Ref<ProviderInfo[] | null>,
+    refreshProviders,
+  }
+  provide(settingsConfigKey, context)
+  return { ...context, asyncConfig, asyncProviders }
+}
+
+/** Panel-level: inject the shared config context provided by the page. */
+export function useSettingsConfig(): SettingsConfigContext {
+  const context = inject(settingsConfigKey)
+  if (!context) {
+    throw new Error('useSettingsConfig() must be used within a component that provides the settings config context')
+  }
+  return context
+}

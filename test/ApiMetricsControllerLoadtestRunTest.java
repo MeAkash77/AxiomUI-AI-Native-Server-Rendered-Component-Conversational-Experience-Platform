@@ -1,0 +1,167 @@
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+import llm.LlmResilience;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import play.Play;
+import play.mvc.Http;
+import play.test.Fixtures;
+import play.test.FunctionalTest;
+import services.LoadTestHarness;
+import services.LoadTestRunner;
+import utils.CircuitBreakers;
+
+import java.net.ServerSocket;
+import java.util.HashMap;
+
+/**
+ * End-to-end success path of POST /api/metrics/loadtest in mock mode: the
+ * controller enables the in-process mock provider, LoadTestRunner drives real
+ * HTTP against this test JVM's own /api/chat/stream (the fork's virtual-thread
+ * Invoker makes the nested requests deadlock-free), and the response reports
+ * the aggregate counts. Existing ApiMetricsControllerTest covers the auth gate
+ * and every body-validation rejection; this class covers the run itself and
+ * the shape/math of the JSON the dashboard consumes.
+ */
+class ApiMetricsControllerLoadtestRunTest extends FunctionalTest {
+
+    // JCLAW-890: a mock-mode loadtest reaches LoadTestRunner's setScenario and so
+    // mutates the same JVM-global harness LoadTestHarnessTest asserts against.
+    // The two classes run in different play1 lanes, which is why JUnit's own
+    // @Isolated cannot serialize them. See LoadTestHarnessSync.
+    @BeforeEach
+    void setup() {
+        LoadTestHarnessSync.acquire();
+        Fixtures.deleteDatabase();
+        // The workers' minted session cookie is refused (401 password_unset) until an
+        // admin password exists.
+        AuthFixture.seedAdminPassword("loadtest-pw");
+    }
+
+    @AfterEach
+    void releaseHarness() {
+        AuthFixture.clearAdminPassword();
+        LoadTestHarnessSync.release();
+    }
+
+    /** Loopback origin + X-Loadtest-Auth carrying application.secret — the
+     *  LoadtestAuthCheck gate (mirrors ApiMetricsControllerTest). */
+    private Http.Request authedLoadtestRequest() {
+        var req = newRequest();
+        req.remoteAddress = "127.0.0.1";
+        if (req.headers == null) {
+            req.headers = new HashMap<>();
+        }
+        var secret = Play.configuration.getProperty("application.secret");
+        req.headers.put("x-loadtest-auth", new Http.Header("x-loadtest-auth", secret));
+        return req;
+    }
+
+    @Test
+    void mockLoadtestRunReportsExactCountsAndPerTurnBuckets() {
+        // 1 worker × 2 turns against the mock provider (1 ms TTFT, 5 tokens at
+        // 200 tok/s) — small enough to finish fast, multi-turn so the
+        // turnBuckets branch engages.
+        var body = """
+                {"concurrency":1,"turns":2,"ttftMs":1,"tokensPerSecond":200,"responseTokens":5}
+                """;
+        var response = POST(authedLoadtestRequest(), "/api/metrics/loadtest",
+                "application/json", body);
+        assertEquals(200, response.status.intValue(),
+                "loadtest must accept the mock-mode body; response: " + getContent(response));
+        var json = JsonParser.parseString(getContent(response)).getAsJsonObject();
+
+        // Hand-computed: totalRequests = concurrency × turns = 1 × 2. This
+        // 200 is itself the regression pin for the promptless-mock-mode 400
+        // (validateLoadtestInput rejected the parsePromptsField empty-list
+        // default).
+        assertEquals(2, json.get("totalRequests").getAsInt());
+        assertEquals(2, json.get("successCount").getAsInt(), "every turn must succeed: " + json);
+        assertEquals(0, json.get("errorCount").getAsInt(), json.toString());
+
+        // Duration aggregates must be internally consistent: min ≤ avg ≤ max,
+        // and with one sequential worker the wall clock spans both turns.
+        long min = json.get("minPerRequestMs").getAsLong();
+        long avg = json.get("avgPerRequestMs").getAsLong();
+        long max = json.get("maxPerRequestMs").getAsLong();
+        long wall = json.get("wallClockMs").getAsLong();
+        assertTrue(min <= avg && avg <= max, "min<=avg<=max violated: " + json);
+        assertTrue(wall >= max, "c=1 wall clock must cover the slowest turn: " + json);
+
+        // Per-run averages are always emitted (mock mode included).
+        assertTrue(json.get("avgTtftMs").getAsLong() >= 0, json.toString());
+        assertTrue(json.get("avgResponseTokens").getAsLong() >= 0, json.toString());
+        assertTrue(json.get("avgReasoningTokens").getAsLong() >= 0, json.toString());
+        assertTrue(json.get("avgTokensPerSec").getAsDouble() >= 0.0, json.toString());
+
+        // Mock mode: provider/model absence IS the run-mode signal.
+        assertFalse(json.has("provider"), "mock run must not echo a provider: " + json);
+        assertFalse(json.has("model"), "mock run must not echo a model: " + json);
+
+        // turns=2 → per-turn buckets, ordered by turn position, one successful
+        // sample per position (the single worker).
+        var buckets = json.getAsJsonArray("turnBuckets");
+        assertNotNull(buckets, "multi-turn run must emit turnBuckets: " + json);
+        assertEquals(2, buckets.size());
+        JsonObject turn1 = buckets.get(0).getAsJsonObject();
+        JsonObject turn2 = buckets.get(1).getAsJsonObject();
+        assertEquals(1, turn1.get("turn").getAsInt());
+        assertEquals(1, turn1.get("count").getAsInt());
+        assertEquals(2, turn2.get("turn").getAsInt());
+        assertEquals(1, turn2.get("count").getAsInt());
+
+        // JCLAW-1194: the run minted the mock provider's breaker; teardown must not leave it
+        // on the dashboard as a row for a provider that no longer exists.
+        assertFalse(CircuitBreakers.snapshot().containsKey(LlmResilience.breakerName(LoadTestRunner.LOADTEST_PROVIDER)),
+                "mock breaker must be gone after the run: " + CircuitBreakers.snapshot().keySet());
+    }
+
+    @Test
+    void teardownAndCleanForgetTheMockBreakerAndOnlyThat() {
+        var mock = LlmResilience.breakerName(LoadTestRunner.LOADTEST_PROVIDER);
+        var real = LlmResilience.breakerName("jclaw1194-real");
+        try {
+            LlmResilience.breakerFor(LoadTestRunner.LOADTEST_PROVIDER);
+            LlmResilience.breakerFor("jclaw1194-real");
+            LoadTestRunner.disable();
+            assertFalse(CircuitBreakers.snapshot().containsKey(mock), "disable() must forget the mock breaker");
+            assertTrue(CircuitBreakers.snapshot().containsKey(real), "a real provider's breaker is not the harness's to drop");
+
+            // The --clean recovery path, for a run the server died partway through.
+            LlmResilience.breakerFor(LoadTestRunner.LOADTEST_PROVIDER);
+            var response = DELETE(authedLoadtestRequest(), "/api/metrics/loadtest/data");
+            assertEquals(200, response.status.intValue(), getContent(response));
+            assertFalse(CircuitBreakers.snapshot().containsKey(mock), "--clean must forget the mock breaker");
+            assertTrue(CircuitBreakers.snapshot().containsKey(real));
+        } finally {
+            CircuitBreakers.remove(real);
+            CircuitBreakers.remove(mock);
+        }
+    }
+
+    /**
+     * Regression for the CI-only "Address already in use" 500: when the
+     * configured mock port is held by another process (a second JClaw on the
+     * Jenkins host, a parallel build), the harness must fall back to an
+     * ephemeral port instead of failing the loadtest — every consumer reads
+     * the actual port back via {@link LoadTestHarness#port()}. Lives in this
+     * class (not a unit test) so it shares a lane with the run test above:
+     * both mutate the JVM-global harness singleton.
+     */
+    @Test
+    void harnessFallsBackToAnEphemeralPortWhenTheConfiguredOneIsTaken() throws Exception {
+        LoadTestHarness.stop();
+        try (var squatter = new ServerSocket(0, 1, java.net.InetAddress.getLoopbackAddress())) {
+            int taken = squatter.getLocalPort();
+            int bound = LoadTestHarness.start(taken);
+            try {
+                assertTrue(LoadTestHarness.isRunning(), "harness must come up despite the squat");
+                assertNotEquals(taken, bound, "harness must not report the squatted port");
+                assertEquals(bound, LoadTestHarness.port(), "port() must expose the actual bound port");
+            } finally {
+                LoadTestHarness.stop();
+            }
+        }
+    }
+}

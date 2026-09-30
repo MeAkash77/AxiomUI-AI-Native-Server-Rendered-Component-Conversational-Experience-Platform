@@ -1,0 +1,209 @@
+package llm;
+
+import com.google.gson.Gson;
+import com.google.gson.JsonParseException;
+import com.google.gson.reflect.TypeToken;
+import llm.LlmTypes.ModelInfo;
+import llm.LlmTypes.ProviderConfig;
+import org.jspecify.annotations.Nullable;
+import services.ConfigService;
+import services.Tx;
+import utils.GsonHolder;
+
+import java.math.BigDecimal;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+/**
+ * Loads LLM provider configurations from the Config database table and
+ * creates the appropriate {@link LlmProvider} subclass for each.
+ *
+ * Provider configs are stored as:
+ *   provider.{name}.baseUrl
+ *   provider.{name}.apiKey
+ *   provider.{name}.models  (JSON array)
+ *
+ * Provider type is resolved by name (substring match, case-insensitive):
+ *   "openrouter" → {@link OpenRouterProvider}
+ *   "ollama"     → {@link OllamaProvider}  (covers ollama-cloud, ollama-local)
+ *   "openai"     → {@link OpenAiProvider}
+ *   anything else → {@link OpenAiProvider}  (lm-studio, groq, azure, …)
+ */
+public final class ProviderRegistry {
+
+    private ProviderRegistry() { /* static-only utility */ }
+
+    private static final String CONFIG_KEY_PREFIX = "provider.";
+    /** Settings &gt; LLM Providers: pins the provider {@link #getPrimary()} returns. */
+    public static final String PRIMARY_PROVIDER_KEY = "llm.primaryProvider";
+
+    /** Providers whose {@code provider.*} credentials are image-generation only (JCLAW-225, BFL Flux)
+     *  and must NOT be registered as chat LlmProviders — they don't speak {@code /chat/completions}.
+     *  The {@code services.imagegen} clients read their {@code provider.bfl.*} keys directly. */
+    private static final Set<String> IMAGE_ONLY_PROVIDERS = Set.of("bfl", "replicate");
+
+    private static final Gson gson = GsonHolder.GSON;
+    private static volatile Map<String, LlmProvider> cache = Map.of();
+    private static volatile long lastRefresh;
+    private static final long REFRESH_INTERVAL_MS = 60_000;
+    private static final Object refreshLock = new Object();
+    private static final AtomicBoolean refreshing = new AtomicBoolean(false);
+
+    public static @Nullable LlmProvider get(@Nullable String name) {
+        // Map.of() is the initial cache and its get(null) throws, so the guard is not
+        // merely defensive — an unconfigured provider name reaches here before the
+        // first refresh (JCLAW-1160).
+        if (name == null) return null;
+        refreshIfNeeded();
+        return cache.get(name);
+    }
+
+    public static List<LlmProvider> listAll() {
+        refreshIfNeeded();
+        return new ArrayList<>(cache.values());
+    }
+
+    /**
+     * The first configured provider, for an agent whose own is missing. There is deliberately no
+     * "secondary" beside it (JCLAW-1190): a turn's fallback is the pair the operator set on the
+     * agent, never whichever provider happens to sort next.
+     */
+    public static @Nullable LlmProvider getPrimary() {
+        var providers = listAll();
+        return providers.isEmpty() ? null : providers.getFirst();
+    }
+
+    private static void refreshIfNeeded() {
+        // Cold start: the cache has never been refreshed (lastRefresh == 0).
+        // The async-refresh path below lets the CAS loser fall through to read
+        // an empty cache while the winner is still mid-refresh, so get()/
+        // listAll() would briefly return null/empty for a provider that is
+        // actually configured. Seed synchronously under double-checked
+        // refreshLock so the very first access blocks until a populated
+        // snapshot is published. Keyed on lastRefresh (not cache.isEmpty()) so
+        // a legitimately provider-less registry doesn't re-run the DB read on
+        // every call — one refresh stamps lastRefresh non-zero and we revert to
+        // the interval-gated async path.
+        if (lastRefresh == 0L) {
+            synchronized (refreshLock) {
+                if (lastRefresh == 0L) {
+                    Tx.run(ProviderRegistry::refreshInner);
+                    return;
+                }
+            }
+        }
+        if (System.currentTimeMillis() - lastRefresh > REFRESH_INTERVAL_MS) {
+            refresh();
+        }
+    }
+
+    public static void refresh() {
+        // Atomic compare-and-set prevents thundering herd — only one thread
+        // enters refreshInner(), concurrent callers skip and use the stale cache.
+        if (!refreshing.compareAndSet(false, true)) return;
+        try {
+            // refreshInner() reads from the Config table, which requires a JPA
+            // transaction. Wrap in Tx.run so callers (like streaming prologue code)
+            // can invoke get()/getPrimary() without holding an ambient transaction
+            // just in case the 60s cache is stale. Tx.run short-circuits when
+            // already inside a tx, so we don't pay twice.
+            Tx.run(ProviderRegistry::refreshInner);
+        } finally {
+            refreshing.set(false);
+        }
+    }
+
+    private static void refreshInner() {
+        // Snapshot all config in one DB roundtrip — no lock held during IO,
+        // so concurrent get() calls are not blocked by the DB read.
+        var allConfigs = ConfigService.listAll();
+        var configMap = new HashMap<String, String>();
+        for (var c : allConfigs) configMap.put(c.key, c.value);
+
+        // Sort provider names so ordering is stable regardless of the source
+        // HashMap's bucket layout: getPrimary() must not shift when
+        // an unrelated config key resizes the map and reshuffles key iteration.
+        var providerNames = new ArrayList<>(configMap.keySet().stream()
+                .filter(k -> k.startsWith(CONFIG_KEY_PREFIX) && k.endsWith(".baseUrl"))
+                .map(k -> k.substring(CONFIG_KEY_PREFIX.length(), k.lastIndexOf(".")))
+                .distinct()
+                .toList());
+        Collections.sort(providerNames);
+
+        // Optional operator pin (Settings > LLM Providers): forces a named provider to the
+        // front of the deterministic order when it matches a configured provider.
+        var primary = configMap.get(PRIMARY_PROVIDER_KEY);
+        if (primary != null && !primary.isBlank() && providerNames.remove(primary.trim())) {
+            providerNames.addFirst(primary.trim());
+        }
+
+        // LinkedHashMap preserves the order established above so getPrimary() is deterministic.
+        var newCache = new LinkedHashMap<String, LlmProvider>();
+        for (var name : providerNames) {
+            if (IMAGE_ONLY_PROVIDERS.contains(name)) continue; // image-gen only — not a chat provider
+            var config = buildProviderConfig(name, configMap);
+            if (config != null) newCache.put(name, LlmProvider.forConfig(config));
+        }
+
+        // Only hold the lock for the atomic pointer swap
+        synchronized (refreshLock) {
+            cache = Collections.unmodifiableMap(newCache);
+            lastRefresh = System.currentTimeMillis();
+        }
+    }
+
+    /**
+     * Assemble a {@link ProviderConfig} for {@code name} from {@code configMap},
+     * or return {@code null} when required credentials are missing.
+     */
+    private static @Nullable ProviderConfig buildProviderConfig(String name,
+                                                                HashMap<String, String> configMap) {
+        var baseUrl = configMap.get(CONFIG_KEY_PREFIX + name + ".baseUrl");
+        var apiKey = configMap.get(CONFIG_KEY_PREFIX + name + ".apiKey");
+        if (baseUrl == null || baseUrl.isBlank() || apiKey == null || apiKey.isBlank()) return null;
+
+        var models = parseModels(configMap.get(CONFIG_KEY_PREFIX + name + ".models"));
+
+        // JCLAW-280: payment modality + monthly subscription price.
+        // Defaults derive from the provider's supported-modality set,
+        // so a fresh-install Ollama-Cloud row is SUBSCRIPTION without
+        // any explicit config row; OpenAI defaults to PER_TOKEN; and
+        // free-at-point-of-use providers (ollama-local, lm-studio)
+        // get an empty supported set so the registry leaves modality
+        // at its safe PER_TOKEN default — the cost path treats them
+        // as free-tier regardless.
+        var modalityRaw = configMap.get(CONFIG_KEY_PREFIX + name + ".paymentModality");
+        var modality = PaymentModality.parseOrDefault(modalityRaw, name);
+        var subscriptionMonthly = parseSubscriptionMonthly(
+                configMap.get(CONFIG_KEY_PREFIX + name + ".subscriptionMonthlyUsd"));
+
+        return new ProviderConfig(name, baseUrl, apiKey, models, modality, subscriptionMonthly);
+    }
+
+    private static List<ModelInfo> parseModels(@Nullable String modelsJson) {
+        if (modelsJson == null || modelsJson.isBlank()) return List.of();
+        try {
+            return gson.fromJson(modelsJson, new TypeToken<List<ModelInfo>>() {}.getType());
+        } catch (JsonParseException _) {
+            // Skip malformed model JSON
+            return List.of();
+        }
+    }
+
+    private static BigDecimal parseSubscriptionMonthly(@Nullable String raw) {
+        if (raw == null || raw.isBlank()) return BigDecimal.ZERO;
+        try {
+            var v = new BigDecimal(raw.trim());
+            return v.signum() < 0 ? BigDecimal.ZERO : v;
+        } catch (NumberFormatException _) {
+            // Malformed price — fall back to zero rather than refuse the provider.
+            return BigDecimal.ZERO;
+        }
+    }
+}

@@ -1,0 +1,3591 @@
+<script setup lang="ts">
+import {
+  ChevronDownIcon,
+  ChevronRightIcon,
+  ChevronUpIcon,
+  CodeBracketIcon,
+  EyeIcon,
+  PencilSquareIcon,
+  PlusIcon,
+  PuzzlePieceIcon,
+  TrashIcon,
+  XMarkIcon,
+} from '@heroicons/vue/24/outline'
+import { Save } from '@lucide/vue'
+import AgentWorkspaceManager from '~/components/agents/AgentWorkspaceManager.vue'
+import { renderMarkdown } from '~/utils/chat-markdown'
+import type {
+  Agent,
+  AgentSkill,
+  AgentTool,
+  ConfigResponse,
+  ConfigValueResponse,
+  CoreMigrationStatus,
+  EffectiveAllowlist,
+  PromptBreakdown,
+  PromptBreakdownEntry,
+  WorkspaceFileContent,
+} from '~/types/api'
+import { effectiveThinkingLevels, findProviderModel, type ProviderModel } from '~/composables/useProviders'
+
+const { confirm } = useConfirm()
+
+// Parallel fetch — avoids sequential waterfall
+const [{ data: agents, refresh }, { data: configData }] = await Promise.all([
+  useFetch<Agent[]>('/api/agents'),
+  useFetch<ConfigResponse>('/api/config'),
+])
+
+// One page instance across /agents and /agents/<id>. NuxtPage keys by path by
+// default, so opening an agent would otherwise unmount and remount the whole
+// page — refetching every panel, and letting the outgoing instance's
+// onUnmounted null the breadcrumb the incoming one had already set.
+definePageMeta({ key: () => '/agents' })
+
+const route = useRoute()
+const router = useRouter()
+
+const editing = ref<Agent | null>(null)
+const creating = ref(false)
+
+// Feed the layout breadcrumb: when editing, show "Agents > {name}"; when
+// creating, show "Agents > New agent"; otherwise just "Agents". The URL carries
+// the id, not the name, so the crumb still has to be published from here.
+const breadcrumbExtra = useBreadcrumbExtra()
+watch([editing, creating], ([agent, isCreating]) => {
+  if (agent) breadcrumbExtra.value = agent.name
+  else if (isCreating) breadcrumbExtra.value = 'New agent'
+  else breadcrumbExtra.value = null
+}, { immediate: true })
+// Only the create form needs this. It has no URL of its own, so a click on the
+// "Agents" crumb is a same-route click that NuxtLink skips, and the layout
+// nulling the extra is the only signal it should close. The edit form closes
+// through the route instead — that crumb genuinely changes path.
+watch(breadcrumbExtra, (value) => {
+  if (value === null && creating.value) cancel()
+})
+onUnmounted(() => {
+  breadcrumbExtra.value = null
+  stopCoreMigrationPoll()
+})
+const workspaceTab = ref('AGENT.md')
+const workspaceContent = ref('')
+// Snapshot of the last-saved workspace-file content for the active tab.
+// Compared against workspaceContent to drive the save button's disabled state.
+// Updated on load (reset to server copy) and on successful save (reset to the
+// just-persisted value).
+const workspaceBaseline = ref('')
+interface AgentForm {
+  name: string
+  description: string
+  modelProvider: string
+  modelId: string
+  enabled: boolean
+  thinkingMode: string
+  /** JCLAW-1190: '' means no fallback; the pair is sent as null/null then. */
+  fallbackProvider: string
+  fallbackModelId: string
+}
+const form = ref<AgentForm>({
+  name: '',
+  description: '',
+  modelProvider: '',
+  modelId: '',
+  enabled: true,
+  thinkingMode: '',
+  fallbackProvider: '',
+  fallbackModelId: '',
+})
+// Snapshot of the agent form at load time (or after a successful save). See
+// formDirty below — together they gate the Save button so it's only active
+// when the form has unsaved changes.
+const formBaseline = ref({ ...form.value })
+
+// True while the form is being filled from a loaded agent rather than typed
+// into, so field watchers can tell an operator's edit from a page load
+// (JCLAW-1078).
+const populatingForm = ref(false)
+const formDirty = computed(() =>
+  JSON.stringify(form.value) !== JSON.stringify(formBaseline.value),
+)
+const workspaceDirty = computed(() => workspaceContent.value !== workspaceBaseline.value)
+// MacDown-style split view for the workspace markdown editor: the editor
+// (textarea) and the live HTML preview can each be shown/hidden, but at least
+// one pane always stays visible so the panel never collapses to nothing.
+// Both on = side-by-side split (the default).
+const showWorkspaceEditor = ref(true)
+const showWorkspacePreview = ref(true)
+function toggleWorkspaceEditor() {
+  // Refuse to hide the editor when it's the only visible pane.
+  if (showWorkspaceEditor.value && !showWorkspacePreview.value) return
+  showWorkspaceEditor.value = !showWorkspaceEditor.value
+}
+function toggleWorkspacePreview() {
+  // Refuse to hide the preview when it's the only visible pane.
+  if (showWorkspacePreview.value && !showWorkspaceEditor.value) return
+  showWorkspacePreview.value = !showWorkspacePreview.value
+}
+const agentTools = ref<AgentTool[]>([])
+const agentSkills = ref<AgentSkill[]>([])
+// One save per section at a time: a rollback that lands after a later save to the same row would undo it.
+const savingTools = ref(false)
+const savingSkills = ref(false)
+const savingMcp = ref(false)
+const toolSave = useSaveAttempt()
+const toolsError = toolSave.saveError
+const skillSave = useSaveAttempt()
+const skillsError = skillSave.saveError
+const mcpSave = useSaveAttempt()
+const mcpError = mcpSave.saveError
+// Effective shell allowlist for the current agent: global entries + per-skill
+// contributions. Derived server-side so the UI doesn't have to re-compute the
+// join. Populated on agent edit and refreshed whenever skill enable/disable or
+// install actions happen — i.e., any time the union could change.
+const effectiveAllowlist = ref<EffectiveAllowlist | null>(null)
+const allowlistExpanded = ref(false)
+
+// Group agentTools by category, in the canonical order from useToolMeta.
+// Each entry is { category, tools[] } — empty categories are omitted.
+const { TOOL_META, getToolMeta, getPillClass, refresh: refreshTools } = useToolMeta()
+
+// Force a refetch on visit so the MCP rows in the agent's tools section
+// reflect live server state (an operator who disabled a server in
+// another tab shouldn't see its row here until a hard reload).
+onMounted(() => {
+  refreshTools()
+})
+
+// Resolve a tool's icon through the shared dictionary in utils/tool-icons.ts,
+// which is the only place the backend's icon-key vocabulary is mapped.
+function toolIconComponent(name: string) {
+  return toolIconFor(getToolMeta(name)?.icon)
+}
+function toolIconExtraClass(name: string): string {
+  return toolIconClassFor(getToolMeta(name)?.icon)
+}
+/**
+ * One row in the agent's tools section. Either a single native tool with
+ * its own toggle, or a folded group of MCP tools (all sharing one server)
+ * with a single toggle that flips every member via the bulk endpoint.
+ */
+type ToolRow
+  = | { kind: 'tool', key: string, tool: AgentTool, enabled: boolean }
+    | { kind: 'group', key: string, group: string, members: AgentTool[], enabled: boolean, functionCount: number }
+
+const toolsByCategory = computed(() => {
+  // JCLAW-281: MCP servers render in their own section below; this computed
+  // is native-only now. The remaining four categories cover every native tool.
+  const categories = ['System', 'Files', 'Web', 'Utilities'] as const
+  const orderedNames = [
+    'exec',
+    'filesystem', 'documents',
+    'web_fetch', 'web_search', 'browser',
+    'datetime', 'checklist', 'task_manager',
+  ]
+  const posOf = (name: string) => {
+    const i = orderedNames.indexOf(name)
+    return i === -1 ? 999 : i
+  }
+  return categories
+    .map((category) => {
+      const inCategory = agentTools.value
+        .filter(t => (TOOL_META.value[t.name]?.category ?? 'Utilities') === category)
+      // Fold tools that share a `group` (MCP) into one row; emit single-tool
+      // rows for everything else. Preserves first-appearance order within
+      // the category so the rendering stays stable across reloads.
+      const groupBuckets = new Map<string, AgentTool[]>()
+      const rows: ToolRow[] = []
+      for (const t of inCategory) {
+        const groupName = (t.group as string | undefined) ?? null
+        if (groupName) {
+          const existing = groupBuckets.get(groupName)
+          if (existing) {
+            existing.push(t)
+          }
+          else {
+            const bucket = [t]
+            groupBuckets.set(groupName, bucket)
+            // Reserve this group's slot on first sight; we'll fill its row
+            // shape after the loop completes.
+            rows.push({
+              kind: 'group',
+              key: `group:${groupName}`,
+              group: groupName,
+              members: bucket,
+              enabled: false,
+              functionCount: 0,
+            })
+          }
+        }
+        else {
+          rows.push({
+            kind: 'tool',
+            key: t.name,
+            tool: t,
+            enabled: t.enabled,
+          })
+        }
+      }
+      // Resolve group rows now that we have all members.
+      for (const row of rows) {
+        if (row.kind === 'group') {
+          row.enabled = row.members.every(m => m.enabled)
+          row.functionCount = row.members.length
+        }
+      }
+      // Native tools sort by canonical order; group rows trail.
+      rows.sort((a, b) => {
+        const ai = a.kind === 'tool' ? posOf(a.tool.name) : 1000
+        const bi = b.kind === 'tool' ? posOf(b.tool.name) : 1000
+        return ai - bi
+      })
+      return { category, rows }
+    })
+    .filter(g => g.rows.length > 0)
+})
+
+/**
+ * JCLAW-281: per-server toggle rows for the agent detail page's MCP Servers
+ * sub-section. Each connected MCP server folds into one row regardless of
+ * how many actions it advertises; the bulk-toggle endpoint flips every
+ * AgentToolConfig entry for the server's per-action wrappers in one call.
+ */
+type McpServerRow = {
+  key: string
+  server: string
+  enabled: boolean
+  /**
+   * Per-action read-only display: every tool the server advertises, minus
+   * the server-level handle itself. Post-Phase-6 these aren't individually
+   * toggleable — the agent gets the whole server or nothing — but the
+   * operator still wants to see what the agent has access to.
+   */
+  actions: { name: string, description: string }[]
+}
+const mcpServerRows = computed<McpServerRow[]>(() => {
+  const buckets = new Map<string, AgentTool[]>()
+  for (const t of agentTools.value) {
+    const group = (t.group as string | undefined) ?? null
+    if (!group) continue
+    let bucket = buckets.get(group)
+    if (!bucket) {
+      bucket = []
+      buckets.set(group, bucket)
+    }
+    bucket.push(t)
+  }
+  const rows: McpServerRow[] = []
+  for (const [server, members] of buckets) {
+    // The server-level handle (mcp_<server>) is the row that the toggle
+    // governs and the only one with an explicit AgentToolConfig row post-
+    // Phase-6. Per-action members are shown read-only beneath the toggle.
+    const handleName = `mcp_${server}`
+    const serverHandle = members.find(m => m.name === handleName)
+    const actions = members
+      .filter(m => m.name !== handleName)
+      .map(m => ({ name: m.name, description: m.description ?? '' }))
+      .sort((a, b) => a.name.localeCompare(b.name))
+    rows.push({
+      key: `mcp:${server}`,
+      server,
+      enabled: serverHandle?.enabled ?? false,
+      actions,
+    })
+  }
+  // Sort alphabetically by server name for stable rendering.
+  rows.sort((a, b) => a.server.localeCompare(b.server))
+  return rows
+})
+
+/**
+ * Per-server expanded-action-list disclosure state on the agent edit panel.
+ * Tracks the server name (not key) so the state survives a re-fetch that
+ * may rebuild row identities.
+ */
+const expandedMcpServer = ref<string | null>(null)
+function toggleMcpExpand(server: string) {
+  expandedMcpServer.value = expandedMcpServer.value === server ? null : server
+}
+
+const queueMode = ref('queue')
+const savedQueueMode = ref('queue')
+const savingQueueMode = ref(false)
+const queueModeSave = useSaveAttempt()
+const queueModeError = queueModeSave.saveError
+// JCLAW-465: per-agent content-compression enable, managed in its own
+// Optimization card (immediate-save on toggle, like Queue Mode). Initialised
+// from the agent's effective value when the edit form opens.
+const compressionEnabled = ref(false)
+// JCLAW-463/464: per-type sub-toggles, gated by the master above.
+const compressionJson = ref(false)
+const compressionCode = ref(false)
+const compressionText = ref(false)
+const compressionTargetRatio = ref(0.3)
+const savingCompression = ref(false)
+// JCLAW-500: per-agent ACP external-harness grant (custom agents only; the main
+// agent is always allowed and shows no toggle). Immediate-save on toggle.
+const acpAllowed = ref(false)
+
+// JCLAW-534: per-agent memory auto-capture (immediate-save card, like ACP).
+// The toggle gates capture; the provider/model selects override the extractor
+// model (sent as null when they match the agent's default, so it keeps
+// inheriting the default and tracks it if the default later changes).
+/**
+ * Core-memory usage for the agent being edited (JCLAW-981).
+ *
+ * Lives on the agent rather than in Settings because the cap is per agent: the core block
+ * is assembled per agent, so one instance-wide number describes a state no migration can
+ * act on, and cannot say whose excess it is. Settings still owns the cap itself, which is
+ * global policy.
+ */
+const coreMigration = ref<CoreMigrationStatus | null>(null)
+const coreMigrationError = ref('')
+const { mutate: startMigration, error: startMigrationError } = useApiMutation()
+
+async function refreshCoreMigration() {
+  const agentId = editing.value?.id
+  if (!agentId) return
+  try {
+    const status = await $fetch<CoreMigrationStatus>(`/api/agents/${agentId}/core-migration`)
+    if (editing.value?.id === agentId) coreMigration.value = status
+  }
+  catch {
+    if (editing.value?.id === agentId) coreMigration.value = null
+  }
+}
+
+async function startCoreMigration() {
+  if (!editing.value?.id) return
+  coreMigrationError.value = ''
+  const status = await startMigration<CoreMigrationStatus>(
+    `/api/agents/${editing.value.id}/core-migration`, { method: 'POST' })
+  if (status === null) {
+    coreMigrationError.value = startMigrationError.value ?? 'Could not start the migration.'
+    return
+  }
+  coreMigration.value = status
+  pollCoreMigration()
+}
+
+/** Poll only while this agent's run is in flight; the status is otherwise static. */
+let coreMigrationTimer: ReturnType<typeof setTimeout> | undefined
+function pollCoreMigration() {
+  if (!coreMigration.value?.running) return
+  coreMigrationTimer = setTimeout(async () => {
+    await refreshCoreMigration()
+    pollCoreMigration()
+  }, 1000)
+}
+function stopCoreMigrationPoll() {
+  if (coreMigrationTimer) clearTimeout(coreMigrationTimer)
+  coreMigrationTimer = undefined
+}
+
+const memoryAutocaptureEnabled = ref(true)
+const memoryAutocaptureProvider = ref('')
+const memoryAutocaptureModel = ref('')
+const savingMemory = ref(false)
+const savingAcpAllowed = ref(false)
+// Section-header count: the master plus each per-type sub-toggle that is
+// effectively on (sub-toggles are off while the master is off).
+const compressionEnabledCount = computed(() => {
+  const m = compressionEnabled.value
+  return [m, m && compressionJson.value, m && compressionCode.value, m && compressionText.value]
+    .filter(Boolean).length
+})
+const execBypassAllowlist = ref(false)
+const execAllowGlobalPaths = ref(false)
+const savingExec = ref(false)
+const execSave = useSaveAttempt()
+const execError = execSave.saveError
+const saving = ref(false)
+/** Why the last agent create/update was refused; cleared on the next attempt and on form open/close. */
+const saveError = ref<string | null>(null)
+const agentSave = useSaveAttempt()
+// The immediate-save partial PUTs and the row delete never read the error; the wrapper's log line is enough.
+const { mutate: mutateAgent } = useApiMutation()
+
+// Delete state for the Custom Agents list. `deletingAll` gates the header's
+// "Delete All" button (wipes every custom agent); `deletingId` gates a single
+// card's trash button so an in-flight delete disables just that row.
+const deletingAll = ref(false)
+const deleteAllSave = useSaveAttempt()
+const deleteAllError = deleteAllSave.saveError
+// A failed enable switch or capability pill on either list.
+const listSave = useSaveAttempt()
+const agentListError = listSave.saveError
+const workspaceSave = useSaveAttempt()
+const workspaceError = workspaceSave.saveError
+const deletingId = ref<number | null>(null)
+
+// A11y: stable ids for label/control association in the edit form
+const agentNameId = useId()
+const agentDescriptionId = useId()
+const agentProviderId = useId()
+const agentModelId = useId()
+const agentFallbackProviderId = useId()
+const agentFallbackModelId = useId()
+const agentQueueModeId = useId()
+const agentWorkspaceTextareaId = useId()
+const agentMemoryProviderId = useId()
+const agentMemoryModelId = useId()
+
+// --- System prompt breakdown dialog state ---
+// Scoped to a single agent: opened from a per-row button on the agent list, so
+// there's no picker — the agent is known at open-time. Closing does not reset
+// `promptBreakdownAgent` so re-opening the same agent's dialog feels instant.
+const promptBreakdownOpen = ref(false)
+const promptBreakdownAgent = ref<Agent | null>(null)
+const promptBreakdownData = ref<PromptBreakdown | null>(null)
+const promptBreakdownLoading = ref(false)
+const promptBreakdownError = ref('')
+
+/**
+ * Which channel's prompt the dialog is currently previewing. Every real chat
+ * lives on a channel, so we default to `web` — the admin chat UI — rather
+ * than exposing a meaningless channel-less baseline.
+ */
+const promptBreakdownChannel = ref<'web' | 'telegram' | 'slack' | 'whatsapp'>('web')
+
+// A channel switch or a second agent's modal can overtake an in-flight breakdown or prompt text.
+const promptLoads = useLatestRequest()
+async function loadPromptBreakdown() {
+  if (!promptBreakdownAgent.value) return
+  const request = promptLoads.begin()
+  promptBreakdownData.value = null
+  promptBreakdownError.value = ''
+  promptBreakdownLoading.value = true
+  // A channel switch invalidates any prompt text already fetched — Channel
+  // Guidance differs per channel, so the cached copy would misreport.
+  promptTextOpen.value = false
+  promptText.value = ''
+  try {
+    const breakdown = await $fetch<PromptBreakdown>(
+      `/api/agents/${promptBreakdownAgent.value.id}/prompt-breakdown?channelType=${encodeURIComponent(promptBreakdownChannel.value)}`,
+    )
+    if (promptLoads.isCurrent(request)) promptBreakdownData.value = breakdown
+  }
+  catch (e: unknown) {
+    if (promptLoads.isCurrent(request)) promptBreakdownError.value = e instanceof Error ? e.message : 'Failed to load prompt breakdown'
+  }
+  finally {
+    if (promptLoads.isCurrent(request)) promptBreakdownLoading.value = false
+  }
+}
+
+async function openPromptBreakdown(agent: Agent) {
+  promptBreakdownAgent.value = agent
+  promptBreakdownOpen.value = true
+  promptBreakdownChannel.value = 'web'
+  await loadPromptBreakdown()
+}
+
+function closePromptBreakdown() {
+  promptBreakdownOpen.value = false
+  // Drop the full-text panel too, so re-opening lands on the breakdown rather
+  // than on a stale prompt captured for a different agent or channel.
+  promptTextOpen.value = false
+  promptText.value = ''
+}
+
+// Global Escape handler so the modal dismisses via keyboard (the overlay is
+// click-to-dismiss, so this keeps keyboard parity for a11y).
+function handlePromptBreakdownEscape(e: KeyboardEvent) {
+  if (promptBreakdownOpen.value && e.key === 'Escape') {
+    e.preventDefault()
+    closePromptBreakdown()
+  }
+}
+onMounted(() => document.addEventListener('keydown', handlePromptBreakdownEscape))
+onBeforeUnmount(() => document.removeEventListener('keydown', handlePromptBreakdownEscape))
+
+/** Table is the exhaustive view and stays the default; the donut is the
+ *  at-a-glance shape (see PromptSizeDonut for why it collapses the long tail). */
+const promptBreakdownView = ref<'table' | 'chart'>('table')
+
+/**
+ * Single series behind the chart view: prompt sections followed by tool schemas.
+ *
+ * The two are disjoint halves of the same whole — sections are contiguous,
+ * non-overlapping spans of the assembled prompt string, and tool schemas are the
+ * separately-delivered `tools` array — so one pie over both accounts for 100% of
+ * the input the model receives, which is why the chart view shows one and not
+ * two. Skills are deliberately excluded: they live inside the Skills section
+ * already, so including them would double-count.
+ *
+ * Tool schemas roll up into a single slice rather than one per tool. Individually
+ * they are ~30 entries, nearly all under 2%, which turned the donut into a band
+ * of slivers and buried the sections it exists to compare. Rolled up, the chart
+ * answers the question it is actually read for — how the input splits between
+ * standing prompt and tool surface — and the table below keeps the per-tool
+ * numbers for when that is the question instead.
+ */
+const promptChartEntries = computed<PromptBreakdownEntry[]>(() => {
+  const data = promptBreakdownData.value
+  if (!data) return []
+  if (!data.tools.length) return [...data.sections]
+  return [
+    ...data.sections,
+    {
+      name: `Tool schemas (${data.tools.length})`,
+      chars: data.tools.reduce((n, t) => n + t.chars, 0),
+      tokens: data.tools.reduce((n, t) => n + t.tokens, 0),
+    },
+  ]
+})
+
+// Full assembled prompt text. Fetched lazily from its own endpoint rather than
+// riding along on the breakdown: it runs to tens of kilobytes and the dialog is
+// opened to read numbers far more often than to read the prompt.
+const promptTextOpen = ref(false)
+const promptText = ref('')
+const promptTextLoading = ref(false)
+const promptTextError = ref('')
+
+// Same MacDown-style split as the workspace file editor, minus the editing: the
+// assembled prompt is markdown, so it reads either as the literal string the
+// model receives (raw) or as rendered HTML. Both panes on = side-by-side, and
+// at least one always stays visible. The choice is deliberately not reset by
+// closePromptText() — it's a viewing preference, so it survives Back/re-open.
+const showPromptRaw = ref(true)
+const showPromptRendered = ref(true)
+function togglePromptRaw() {
+  // Refuse to hide the raw pane when it's the only visible one.
+  if (showPromptRaw.value && !showPromptRendered.value) return
+  showPromptRaw.value = !showPromptRaw.value
+}
+function togglePromptRendered() {
+  // Refuse to hide the rendered pane when it's the only visible one.
+  if (showPromptRendered.value && !showPromptRaw.value) return
+  showPromptRendered.value = !showPromptRendered.value
+}
+
+// Computed rather than called inline in the template: the prompt runs to tens of
+// kilobytes, and Vue's own caching keeps unrelated re-renders of the dialog off
+// the markdown pipeline (and out of the shared render LRU).
+const promptTextHtml = computed(() => renderMarkdown(promptText.value))
+
+async function openPromptText() {
+  if (!promptBreakdownAgent.value) return
+  const request = promptLoads.begin()
+  promptTextOpen.value = true
+  promptTextError.value = ''
+  promptTextLoading.value = true
+  try {
+    const res = await $fetch<{ text: string }>(
+      `/api/agents/${promptBreakdownAgent.value.id}/prompt-text?channelType=${encodeURIComponent(promptBreakdownChannel.value)}`,
+    )
+    if (promptLoads.isCurrent(request)) promptText.value = res.text
+  }
+  catch (e: unknown) {
+    if (promptLoads.isCurrent(request)) promptTextError.value = e instanceof Error ? e.message : 'Failed to load system prompt'
+  }
+  finally {
+    if (promptLoads.isCurrent(request)) promptTextLoading.value = false
+  }
+}
+
+function closePromptText() {
+  promptTextOpen.value = false
+}
+
+function copyPromptText() {
+  if (promptText.value) navigator.clipboard.writeText(promptText.value)
+}
+
+const skillsExpanded = ref(true)
+
+/**
+ * Sort state for the two breakdown tables. `null` sortBy means
+ * "as-is" (the order the backend sends, which for prompt sections is
+ * the actual assembly order — meaningful, so it's the default).
+ *
+ * Click cycle on a column: desc → asc → as-is. Skill subrows ride
+ * along with the parent Skills row regardless of sort, since they're
+ * rendered inside the same v-for template; the Total row sits outside
+ * the loop, so it always stays at the bottom.
+ */
+type BreakdownSortCol = 'name' | 'chars'
+const sectionsSortBy = ref<BreakdownSortCol | null>(null)
+const sectionsSortDir = ref<'asc' | 'desc'>('desc')
+const toolsSortBy = ref<BreakdownSortCol | null>(null)
+const toolsSortDir = ref<'asc' | 'desc'>('desc')
+
+function cycleSectionsSort(col: BreakdownSortCol) {
+  if (sectionsSortBy.value !== col) {
+    sectionsSortBy.value = col
+    sectionsSortDir.value = 'desc'
+  }
+  else if (sectionsSortDir.value === 'desc') {
+    sectionsSortDir.value = 'asc'
+  }
+  else {
+    sectionsSortBy.value = null
+    sectionsSortDir.value = 'desc'
+  }
+}
+function cycleToolsSort(col: BreakdownSortCol) {
+  if (toolsSortBy.value !== col) {
+    toolsSortBy.value = col
+    toolsSortDir.value = 'desc'
+  }
+  else if (toolsSortDir.value === 'desc') {
+    toolsSortDir.value = 'asc'
+  }
+  else {
+    toolsSortBy.value = null
+    toolsSortDir.value = 'desc'
+  }
+}
+function sortBreakdownRows<T extends { name: string, chars: number, tokens: number }>(
+  rows: T[],
+  by: BreakdownSortCol | null,
+  dir: 'asc' | 'desc',
+): T[] {
+  if (!by) return rows
+  const sorted = [...rows]
+  sorted.sort((a, b) => {
+    const cmp = by === 'name' ? a.name.localeCompare(b.name) : a[by] - b[by]
+    return dir === 'desc' ? -cmp : cmp
+  })
+  return sorted
+}
+const sortedSections = computed(() =>
+  sortBreakdownRows(promptBreakdownData.value?.sections ?? [], sectionsSortBy.value, sectionsSortDir.value),
+)
+const sortedTools = computed(() =>
+  sortBreakdownRows(promptBreakdownData.value?.tools ?? [], toolsSortBy.value, toolsSortDir.value),
+)
+
+function formatChars(n: number): string {
+  return n.toLocaleString()
+}
+
+function formatTokens(n: number): string {
+  return n.toLocaleString()
+}
+
+function percentOfTotal(chars: number, total: number): string {
+  if (total === 0) return '0%'
+  return ((chars / total) * 100).toFixed(1) + '%'
+}
+
+/**
+ * Bottom-of-table subtotals: PROMPT SECTIONS sum and TOOL SCHEMAS sum.
+ * Together they equal TOTAL CHARS.
+ */
+const sectionsAggregate = computed(() => {
+  const rows = promptBreakdownData.value?.sections ?? []
+  return {
+    chars: rows.reduce((s, r) => s + r.chars, 0),
+    tokens: rows.reduce((s, r) => s + r.tokens, 0),
+  }
+})
+const toolSchemasAggregate = computed(() => {
+  const rows = promptBreakdownData.value?.tools ?? []
+  return {
+    chars: rows.reduce((s, r) => s + r.chars, 0),
+    tokens: rows.reduce((s, r) => s + r.tokens, 0),
+  }
+})
+
+/**
+ * Per-skill rows account for the <skill> XML entries inside
+ * <available_skills>, but the Skills section *also* carries the
+ * skill-matching prose preamble + the <available_skills> open/close
+ * tags. Surface that delta as its own subrow so the inlined children
+ * genuinely sum to the parent Skills row.
+ */
+const skillsMatchingGap = computed(() => {
+  const data = promptBreakdownData.value
+  if (!data) return { chars: 0, tokens: 0 }
+  const skillsSection = data.sections.find(s => s.name === 'Skills')
+  if (!skillsSection) return { chars: 0, tokens: 0 }
+  const itemized = data.skills.reduce(
+    (acc, sk) => ({ chars: acc.chars + sk.chars, tokens: acc.tokens + sk.tokens }),
+    { chars: 0, tokens: 0 },
+  )
+  return {
+    chars: skillsSection.chars - itemized.chars,
+    tokens: skillsSection.tokens - itemized.tokens,
+  }
+})
+
+// The main agent is a structural singleton (seeded on first boot, cannot be
+// renamed or deleted, always enabled). Splitting it out of the list keeps the
+// Custom Agents section focused on user-created agents and lets the New Agent
+// button sit where it's actually applicable.
+const mainAgent = computed(() => (agents.value ?? []).find(a => a.isMain))
+const customAgents = computed(() => (agents.value ?? []).filter(a => !a.isMain))
+
+// Extract configured providers (those with non-empty API keys)
+const configDataRef = computed(() => configData.value ?? null)
+const { providers } = useProviders(configDataRef)
+
+// Models for the currently selected provider
+const availableModels = computed(() => {
+  const provider = providers.value.find(p => p.name === form.value.modelProvider)
+  return provider?.models ?? []
+})
+
+// JCLAW-1190: providers an agent may fall back to — any configured one but its own — and
+// the models registered on the chosen one.
+const fallbackProviders = computed(() =>
+  providers.value.filter(p => p.name !== form.value.modelProvider),
+)
+const fallbackAvailableModels = computed(() => {
+  const provider = providers.value.find(p => p.name === form.value.fallbackProvider)
+  return provider?.models ?? []
+})
+
+// JCLAW-534: models for the per-agent autocapture extractor-model override.
+const autocaptureAvailableModels = computed(() => {
+  const provider = providers.value.find(p => p.name === memoryAutocaptureProvider.value)
+  return provider?.models ?? []
+})
+
+// The currently selected model's full metadata — drives the thinking-level dropdown.
+const selectedModel = computed<ProviderModel | null>(() =>
+  availableModels.value.find(m => m.id === form.value.modelId) ?? null,
+)
+
+// Look up a listed agent's model metadata so the row can show capability pills.
+function modelForAgent(agent: Agent | null | undefined): ProviderModel | null {
+  if (!agent) return null
+  return findProviderModel(providers.value, agent.modelProvider, agent.modelId)
+}
+
+// Pick a sensible default reasoning-effort level when the user toggles
+// the Thinking pill on. Middle of the model's declared levels matches the
+// spirit of backend DEFAULT_THINKING_LEVELS (low/medium/high → medium).
+function defaultThinkingLevel(model: ProviderModel | null): string {
+  const levels = effectiveThinkingLevels(model)
+  if (!levels.length) return 'medium'
+  return levels[Math.floor(levels.length / 2)] ?? 'medium'
+}
+
+// Whether the selected provider is configured and the selected model is available.
+// Kept with `_` prefix so the unused-vars rule is satisfied while the logic
+// remains available for when the UI re-surfaces provider-mismatch warnings.
+const _providerValid = computed(() => {
+  const provider = providers.value.find(p => p.name === form.value.modelProvider)
+  if (!provider) return false
+  return !form.value.modelId || provider.models.some(m => m.id === form.value.modelId)
+})
+
+// Auto-select first provider when creating
+function newAgent() {
+  const defaultProvider = providers.value[0]?.name ?? ''
+  const defaultModel = providers.value[0]?.models?.[0]?.id ?? ''
+  populatingForm.value = true
+  form.value = {
+    name: '',
+    description: '',
+    modelProvider: defaultProvider,
+    modelId: defaultModel,
+    enabled: true,
+    thinkingMode: '',
+    fallbackProvider: '',
+    fallbackModelId: '',
+  }
+  formBaseline.value = { ...form.value }
+  creating.value = true
+  editing.value = null
+  saveError.value = null
+  void nextTick(() => {
+    populatingForm.value = false
+  })
+}
+
+function editAgent(agent: Agent) {
+  populatingForm.value = true
+  form.value = {
+    name: agent.name,
+    description: agent.description ?? '',
+    modelProvider: agent.modelProvider,
+    modelId: agent.modelId,
+    enabled: agent.enabled,
+    thinkingMode: agent.thinkingMode ?? '',
+    fallbackProvider: agent.fallbackProvider ?? '',
+    fallbackModelId: agent.fallbackModelId ?? '',
+  }
+  formBaseline.value = { ...form.value }
+  void nextTick(() => {
+    populatingForm.value = false
+  })
+  editing.value = agent
+  compressionEnabled.value = agent.compressionEnabled
+  compressionJson.value = agent.compressionJson
+  compressionCode.value = agent.compressionCode
+  compressionText.value = agent.compressionText
+  compressionTargetRatio.value = agent.compressionTargetRatio
+  acpAllowed.value = agent.acpAllowed
+  memoryAutocaptureEnabled.value = agent.memoryAutocaptureEnabled
+  coreMigrationError.value = ''
+  coreMigration.value = null
+  stopCoreMigrationPoll()
+  refreshCoreMigration()
+  memoryAutocaptureProvider.value = agent.memoryAutocaptureProvider
+  memoryAutocaptureModel.value = agent.memoryAutocaptureModel
+  creating.value = false
+  saveError.value = null
+  toolsError.value = null
+  skillsError.value = null
+  mcpError.value = null
+  loadWorkspaceFile(agent.id, 'AGENT.md')
+  loadAgentTools(agent.id)
+  loadAgentSkills(agent.id)
+  loadEffectiveAllowlist(agent.id)
+  loadQueueMode(agent.name)
+  loadExecConfig(agent.name)
+}
+
+/** Navigate to an agent's own URL; the route watcher below opens the form. */
+function openAgent(agent: Agent) {
+  router.push(`/agents/${agent.name}`)
+}
+
+// The route is the source of truth for which agent is open: /agents lists,
+// /agents/<name> opens that one. Names are safe URL segments without encoding —
+// the API constrains them to ^\w[\w-]{0,63}$ and enforces uniqueness — and they
+// read far better than a row id. `immediate` covers arriving with the name
+// already in the URL (deep link, reload, command palette from another page); the
+// watcher proper covers picking an agent while already here.
+//
+// Closing navigates back to /agents, so "form open" and "URL names an agent" can
+// never disagree — which is what makes re-picking the agent you just closed work
+// rather than becoming a same-URL push the watcher never sees.
+watch(() => route.params.name, (raw) => {
+  const slug = Array.isArray(raw) ? raw[0] : raw
+  if (!slug) {
+    editing.value = null
+    return
+  }
+  // Case-insensitive so a hand-typed /agents/testing still lands; the stored
+  // name is what the breadcrumb and the form display.
+  const wanted = slug.toLowerCase()
+  const agent = (agents.value ?? []).find(a => a.name.toLowerCase() === wanted)
+  // A name matching no agent falls back to the list rather than stranding the
+  // page on an empty editor.
+  if (agent) editAgent(agent)
+  else router.replace('/agents')
+}, { immediate: true })
+
+// When the selected model changes, drop a thinking mode the new model doesn't
+// advertise. Prevents submitting a stale level (e.g. "high" after swapping
+// to a non-thinking model) that would be silently normalized server-side.
+watch(() => [form.value.modelProvider, form.value.modelId], () => {
+  if (form.value.thinkingMode) {
+    const levels = effectiveThinkingLevels(selectedModel.value)
+    if (!levels.includes(form.value.thinkingMode)) form.value.thinkingMode = ''
+  }
+})
+
+// JCLAW-1190: the fallback model belongs to the fallback provider. Swapping the provider
+// picks that provider's first model; choosing "None" clears the model; and moving the
+// primary onto the fallback provider drops the fallback, which the backend would reject.
+watch(() => form.value.fallbackProvider, (provider) => {
+  if (populatingForm.value) return
+  if (!provider) {
+    form.value.fallbackModelId = ''
+    return
+  }
+  if (!fallbackAvailableModels.value.some(m => m.id === form.value.fallbackModelId)) {
+    form.value.fallbackModelId = fallbackAvailableModels.value[0]?.id ?? ''
+  }
+})
+watch(() => form.value.modelProvider, (provider) => {
+  if (!populatingForm.value && provider && provider === form.value.fallbackProvider) {
+    form.value.fallbackProvider = ''
+  }
+})
+
+// Pill toggle from inside the Edit Agent form. Thinking is the only
+// remaining toggleable capability — vision/audio are pure capability
+// indicators (no LLM API exposes an off-switch for either).
+function toggleFormCapability(capability: 'thinking') {
+  if (capability === 'thinking') {
+    form.value.thinkingMode = form.value.thinkingMode
+      ? ''
+      : defaultThinkingLevel(selectedModel.value)
+  }
+}
+
+// Pill toggle from a listing row — persists immediately via a partial PUT
+// so the row stays in sync with the backend. Only the touched field is
+// sent; the update endpoint honours absent-key-leaves-unchanged.
+async function toggleListingCapability(agent: Agent | undefined, capability: 'thinking') {
+  if (!agent) return
+  const body: Record<string, unknown> = {}
+  if (capability === 'thinking') {
+    body.thinkingMode = agent.thinkingMode
+      ? null
+      : defaultThinkingLevel(modelForAgent(agent))
+  }
+  if (await listSave.attempt(() => $fetch(`/api/agents/${agent.id}`, { method: 'PUT', body }))) refresh()
+}
+
+// The seven per-agent loads editAgent fires are unawaited; opening another agent while one is in
+// flight must not land the previous agent's data in the new form, so each checks the editor first.
+async function loadAgentTools(agentId: number) {
+  try {
+    const tools = await $fetch<AgentTool[]>(`/api/agents/${agentId}/tools`)
+    if (editing.value?.id === agentId) agentTools.value = tools
+  }
+  catch {
+    if (editing.value?.id === agentId) agentTools.value = []
+  }
+}
+
+/** Flips the switch, saves, and puts it back if the save fails. Resolves to whether the server took it. */
+async function saveToolEnabled(tool: AgentTool, enabled: boolean): Promise<boolean> {
+  if (!editing.value) return false
+  const agentId = editing.value.id
+  const previous = tool.enabled
+  tool.enabled = enabled
+  const ok = await toolSave.attempt(() => $fetch(`/api/agents/${agentId}/tools/${tool.name}`, {
+    method: 'PUT',
+    body: { enabled },
+  }))
+  if (!ok) tool.enabled = previous
+  return ok
+}
+
+async function toggleTool(tool: AgentTool) {
+  savingTools.value = true
+  toolsError.value = null
+  await saveToolEnabled(tool, !tool.enabled)
+  savingTools.value = false
+}
+
+/**
+ * Bulk-toggle every tool in a group (MCP server) for the editing agent,
+ * via PUT /api/agents/:id/tool-groups/:group. One HTTP call regardless of
+ * group size, and it updates the local agentTools state so the row's
+ * toggle reflects immediately without waiting for a refetch.
+ */
+async function toggleToolGroup(group: string, enabled: boolean) {
+  if (!editing.value) return
+  // Optimistic local update so the toggle animates without a roundtrip.
+  // Only flip the server-level handle (mcp_<group>) — that's the single
+  // row the backend writes post-Phase-6; per-action wrappers no longer
+  // carry independent enablement, their `enabled` falls out of the
+  // default policy in ApiToolsController.listForAgent.
+  const handleName = `mcp_${group}`
+  const handle = agentTools.value.find(t => t.name === handleName)
+  const previous = handle?.enabled ?? false
+  if (handle) handle.enabled = enabled
+  savingMcp.value = true
+  const agentId = editing.value.id
+  const ok = await mcpSave.attempt(() => $fetch(`/api/agents/${agentId}/tool-groups/${encodeURIComponent(group)}`, {
+    method: 'PUT',
+    body: { enabled },
+  }))
+  if (!ok && handle) handle.enabled = previous
+  savingMcp.value = false
+}
+
+// JCLAW-281: drives the "Tools" section header count and bulk-toggle.
+// MCP server rows live in their own section below and have their own
+// per-server enable state, so they're excluded here.
+const toggleableAgentTools = computed(() =>
+  agentTools.value.filter(t => !t.group),
+)
+
+const allAgentToolsEnabled = computed(() =>
+  toggleableAgentTools.value.length > 0 && toggleableAgentTools.value.every(t => t.enabled),
+)
+
+async function toggleAllAgentTools() {
+  const next = !allAgentToolsEnabled.value
+  savingTools.value = true
+  toolsError.value = null
+  await Promise.all(toggleableAgentTools.value.map(t => saveToolEnabled(t, next)))
+  savingTools.value = false
+}
+
+// Returns the tool names that a skill depends on but are currently disabled for this agent.
+// Only flags tools that are registered (present in agentTools) — unknown tools are ignored.
+function skillDisabledTools(skill: AgentSkill): string[] {
+  if (!skill.tools?.length) return []
+  const toolMap = new Map(agentTools.value.map(t => [t.name, t.enabled]))
+  return skill.tools.filter(name => toolMap.has(name) && !toolMap.get(name))
+}
+
+// Alphabetical display order. The API returns skills in agent-config insertion
+// order (whatever sequence the operator promoted/added them in), but the list
+// is much easier to scan if names are sorted — matches the cross-agent skills
+// matrix at pages/skills/[[name]].vue's `sortedAgentSkillsMap`. Locale-aware,
+// case-insensitive comparator so mixed-case names land where a human would
+// expect them, not where ASCII order would.
+const sortedAgentSkills = computed(() =>
+  [...agentSkills.value].sort((a, b) =>
+    a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }),
+  ),
+)
+
+// Skills with no missing tool dependencies — these are the ones the per-skill
+// toggle would actually flip. Bulk toggle must filter the same way so we never
+// silently re-enable a skill that's structurally non-functional (its enabled
+// state would have no effect, and the UI's opacity-45 + cursor-not-allowed
+// already communicates "you can't toggle me").
+const toggleableAgentSkills = computed(() =>
+  agentSkills.value.filter(s => skillDisabledTools(s).length === 0),
+)
+
+const allAgentSkillsEnabled = computed(() =>
+  toggleableAgentSkills.value.length > 0 && toggleableAgentSkills.value.every(s => s.enabled),
+)
+
+async function toggleAllAgentSkills() {
+  if (!editing.value) return
+  const agentId = editing.value.id
+  const next = !allAgentSkillsEnabled.value
+  savingSkills.value = true
+  skillsError.value = null
+  const saved = await Promise.all(toggleableAgentSkills.value.map(s => saveSkillEnabled(s, next)))
+  if (saved.some(Boolean)) await reloadSkillState(agentId)
+  savingSkills.value = false
+}
+
+async function loadAgentSkills(agentId: number) {
+  try {
+    const skills = await $fetch<AgentSkill[]>(`/api/agents/${agentId}/skills`)
+    if (editing.value?.id === agentId) agentSkills.value = skills
+  }
+  catch {
+    if (editing.value?.id === agentId) agentSkills.value = []
+  }
+}
+
+async function loadEffectiveAllowlist(agentId: number) {
+  try {
+    const allowlist = await $fetch<EffectiveAllowlist>(`/api/agents/${agentId}/shell/effective-allowlist`)
+    if (editing.value?.id === agentId) effectiveAllowlist.value = allowlist
+  }
+  catch {
+    if (editing.value?.id === agentId) effectiveAllowlist.value = null
+  }
+}
+
+async function loadQueueMode(agentName: string) {
+  queueModeError.value = null
+  let mode = 'queue'
+  try {
+    const config = await $fetch<ConfigValueResponse>(`/api/config/agent.${agentName}.queue.mode`)
+    mode = config.value || 'queue'
+  }
+  catch { /* the stored default */ }
+  if (editing.value?.name !== agentName) return
+  queueMode.value = mode
+  savedQueueMode.value = mode
+}
+
+async function saveQueueMode() {
+  if (!editing.value) return
+  savingQueueMode.value = true
+  const key = `agent.${editing.value.name}.queue.mode`
+  const ok = await queueModeSave.attempt(() => $fetch('/api/config', {
+    method: 'POST',
+    body: { key, value: queueMode.value },
+  }))
+  if (ok) savedQueueMode.value = queueMode.value
+  else queueMode.value = savedQueueMode.value
+  savingQueueMode.value = false
+}
+
+// JCLAW-465: immediate-save the per-agent compression toggle via a partial PUT
+// (the update endpoint honours absent-key-leaves-unchanged). Keeps editing.value
+// and the list row in sync so a later edit reopens with the right state.
+async function saveCompression() {
+  if (!editing.value) return
+  savingCompression.value = true
+  const saved = await mutateAgent(`/api/agents/${editing.value.id}`, {
+    method: 'PUT',
+    body: { compressionEnabled: compressionEnabled.value },
+  })
+  if (saved === null) {
+    // Revert the toggle to the persisted value on failure.
+    compressionEnabled.value = editing.value.compressionEnabled
+  }
+  else {
+    editing.value.compressionEnabled = compressionEnabled.value
+    refresh()
+  }
+  savingCompression.value = false
+}
+
+// JCLAW-500: immediate-save the per-agent ACP grant via a partial PUT, mirroring
+// saveCompression. Keeps editing.value and the list row in sync.
+async function saveAcpAllowed() {
+  if (!editing.value) return
+  savingAcpAllowed.value = true
+  const saved = await mutateAgent(`/api/agents/${editing.value.id}`, {
+    method: 'PUT',
+    body: { acpAllowed: acpAllowed.value },
+  })
+  if (saved === null) {
+    acpAllowed.value = editing.value.acpAllowed
+  }
+  else {
+    editing.value.acpAllowed = acpAllowed.value
+    refresh()
+  }
+  savingAcpAllowed.value = false
+}
+
+function toggleAcpAllowed() {
+  acpAllowed.value = !acpAllowed.value
+  saveAcpAllowed()
+}
+
+// JCLAW-534: immediate-save the per-agent memory auto-capture enable, mirroring
+// saveAcpAllowed.
+async function saveMemoryEnabled() {
+  if (!editing.value) return
+  savingMemory.value = true
+  const saved = await mutateAgent(`/api/agents/${editing.value.id}`, {
+    method: 'PUT',
+    body: { memoryAutocaptureEnabled: memoryAutocaptureEnabled.value },
+  })
+  if (saved === null) {
+    memoryAutocaptureEnabled.value = editing.value.memoryAutocaptureEnabled
+  }
+  else {
+    editing.value.memoryAutocaptureEnabled = memoryAutocaptureEnabled.value
+    refresh()
+  }
+  savingMemory.value = false
+}
+
+function toggleMemoryAutocapture() {
+  memoryAutocaptureEnabled.value = !memoryAutocaptureEnabled.value
+  saveMemoryEnabled()
+}
+
+// JCLAW-534: immediate-save the extractor-model override. Sent as null when the
+// selection equals the agent's default model, so the agent keeps inheriting the
+// default (and tracks it if the default later changes).
+async function saveMemoryModel() {
+  if (!editing.value) return
+  savingMemory.value = true
+  const isDefault = memoryAutocaptureProvider.value === editing.value.modelProvider
+    && memoryAutocaptureModel.value === editing.value.modelId
+  const updated = await mutateAgent<Agent>(`/api/agents/${editing.value.id}`, {
+    method: 'PUT',
+    body: {
+      memoryAutocaptureProvider: isDefault ? null : memoryAutocaptureProvider.value,
+      memoryAutocaptureModel: isDefault ? null : memoryAutocaptureModel.value,
+    },
+  })
+  if (updated === null) {
+    memoryAutocaptureProvider.value = editing.value.memoryAutocaptureProvider
+    memoryAutocaptureModel.value = editing.value.memoryAutocaptureModel
+  }
+  else {
+    editing.value.memoryAutocaptureProvider = updated.memoryAutocaptureProvider
+    editing.value.memoryAutocaptureModel = updated.memoryAutocaptureModel
+    editing.value.memoryAutocaptureModelInherited = updated.memoryAutocaptureModelInherited
+    refresh()
+  }
+  savingMemory.value = false
+}
+
+// The override model id won't exist under a newly-picked provider, so snap it to
+// that provider's first model, then save.
+function onAutocaptureProviderChange() {
+  memoryAutocaptureModel.value = autocaptureAvailableModels.value[0]?.id ?? ''
+  saveMemoryModel()
+}
+
+// JCLAW-463: per-type sub-toggle saves. Same immediate-save partial-PUT pattern
+// as the master; the field name is the only thing that varies.
+async function persistCompressionField(
+  key: 'compressionJson' | 'compressionCode' | 'compressionText',
+  model: Ref<boolean>,
+) {
+  if (!editing.value) return
+  savingCompression.value = true
+  const saved = await mutateAgent(`/api/agents/${editing.value.id}`, {
+    method: 'PUT',
+    body: { [key]: model.value },
+  })
+  if (saved === null) {
+    model.value = editing.value[key]
+  }
+  else {
+    editing.value[key] = model.value
+    refresh()
+  }
+  savingCompression.value = false
+}
+
+function saveCompressionJson() {
+  return persistCompressionField('compressionJson', compressionJson)
+}
+
+function saveCompressionCode() {
+  return persistCompressionField('compressionCode', compressionCode)
+}
+
+function saveCompressionText() {
+  return persistCompressionField('compressionText', compressionText)
+}
+
+// JCLAW-464: targetRatio is a number, not a toggle — its own immediate-save PUT.
+async function saveCompressionRatio() {
+  if (!editing.value) return
+  savingCompression.value = true
+  const saved = await mutateAgent(`/api/agents/${editing.value.id}`, {
+    method: 'PUT',
+    body: { compressionTargetRatio: compressionTargetRatio.value },
+  })
+  if (saved === null) {
+    compressionTargetRatio.value = editing.value.compressionTargetRatio
+  }
+  else {
+    editing.value.compressionTargetRatio = compressionTargetRatio.value
+    refresh()
+  }
+  savingCompression.value = false
+}
+
+// Pill-toggle click handlers: flip the ref, then immediate-save via the
+// existing partial-PUT helpers (which read the just-flipped value).
+function toggleCompression() {
+  compressionEnabled.value = !compressionEnabled.value
+  saveCompression()
+}
+function toggleCompressionJson() {
+  compressionJson.value = !compressionJson.value
+  saveCompressionJson()
+}
+function toggleCompressionCode() {
+  compressionCode.value = !compressionCode.value
+  saveCompressionCode()
+}
+function toggleCompressionText() {
+  compressionText.value = !compressionText.value
+  saveCompressionText()
+}
+
+async function loadExecConfig(agentName: string) {
+  execError.value = null
+  const [bypass, globalPaths] = await Promise.all([
+    $fetch<ConfigValueResponse>(`/api/config/agent.${agentName}.shell.bypassAllowlist`).catch(() => null),
+    $fetch<ConfigValueResponse>(`/api/config/agent.${agentName}.shell.allowGlobalPaths`).catch(() => null),
+  ])
+  if (editing.value?.name !== agentName) return
+  execBypassAllowlist.value = bypass?.value === 'true'
+  execAllowGlobalPaths.value = globalPaths?.value === 'true'
+}
+
+async function toggleExecConfig(key: 'bypassAllowlist' | 'allowGlobalPaths') {
+  if (!editing.value) return
+  const grant = key === 'bypassAllowlist' ? execBypassAllowlist : execAllowGlobalPaths
+  const previous = grant.value
+  grant.value = !previous
+  savingExec.value = true
+  const configKey = `agent.${editing.value.name}.shell.${key}`
+  const ok = await execSave.attempt(() => $fetch('/api/config', {
+    method: 'POST',
+    body: { key: configKey, value: String(grant.value) },
+  }))
+  // A 403 here is an application.conf ceiling, and its message is the only place the operator learns that.
+  if (!ok) grant.value = previous
+  savingExec.value = false
+}
+
+/** Flips the switch, saves, and puts it back if the save fails. Resolves to whether the server took it. */
+async function saveSkillEnabled(skill: AgentSkill, enabled: boolean): Promise<boolean> {
+  if (!editing.value) return false
+  const agentId = editing.value.id
+  const previous = skill.enabled
+  skill.enabled = enabled
+  const ok = await skillSave.attempt(() => $fetch(`/api/agents/${agentId}/skills/${skill.name}`, {
+    method: 'PUT',
+    body: { enabled },
+  }))
+  if (!ok) skill.enabled = previous
+  return ok
+}
+
+async function reloadSkillState(agentId: number) {
+  await loadAgentSkills(agentId)
+  // Skill enable/disable flips which commands count toward the effective
+  // allowlist — refresh the table so the bySkill section matches the toggle.
+  await loadEffectiveAllowlist(agentId)
+}
+
+async function toggleSkill(skill: AgentSkill) {
+  if (!editing.value || skillDisabledTools(skill).length) return
+  const agentId = editing.value.id
+  savingSkills.value = true
+  skillsError.value = null
+  if (await saveSkillEnabled(skill, !skill.enabled)) await reloadSkillState(agentId)
+  savingSkills.value = false
+}
+
+/**
+ * When the operator picks a different provider, move the model to one that
+ * provider actually offers.
+ *
+ * <p>Only for a hand-made change (JCLAW-1078). Populating the form from a
+ * loaded agent also changes this field, and reacting to that edited the record
+ * merely because someone opened it: `providers` is filtered to providers with
+ * an API key, so an agent stored against a provider whose key is currently
+ * unset would have its model silently swapped on load.
+ *
+ * <p>It used to set `enabled = false` here too, which is what made saving the
+ * main agent fail with "The main agent cannot be disabled" and — since only the
+ * main agent is guarded — quietly switched off any custom agent instead. An
+ * unconfigured provider is a configuration gap, not an instruction to turn the
+ * agent off; the editor already says so via `providerConfigured`.
+ */
+watch(() => form.value.modelProvider, (newProvider) => {
+  if (populatingForm.value) return
+  const provider = providers.value.find(p => p.name === newProvider)
+  const currentModelValid = provider?.models?.some(m => m.id === form.value.modelId)
+  if (!currentModelValid) {
+    form.value.modelId = provider?.models?.[0]?.id ?? ''
+  }
+})
+
+async function saveAgent() {
+  saving.value = true
+  saveError.value = null
+  // Empty string means "reasoning off" — send null so the backend clears the
+  // column. The model also collapses unknown levels to null defensively, but
+  // normalizing on the way out keeps the wire payload honest.
+  const payload = {
+    ...form.value,
+    thinkingMode: form.value.thinkingMode || null,
+    // Blank description clears the column; backend also strips/trims.
+    description: form.value.description.trim() || null,
+    // JCLAW-1190: "None" is null/null; the backend refuses half a pair.
+    fallbackProvider: form.value.fallbackProvider || null,
+    fallbackModelId: form.value.fallbackProvider ? form.value.fallbackModelId || null : null,
+  }
+  const ok = await agentSave.attempt(async () => {
+    if (creating.value) {
+      await $fetch('/api/agents', { method: 'POST', body: payload })
+      // Create mode navigates back to the list so the user sees the new row.
+      editing.value = null
+      creating.value = false
+    }
+    else if (editing.value) {
+      await $fetch(`/api/agents/${editing.value.id}`, { method: 'PUT', body: payload })
+      // Edit mode stays on the detail page; reset the baseline so the Save
+      // button disables until the user makes another change.
+      formBaseline.value = { ...form.value }
+    }
+  })
+  if (ok) refresh()
+  else saveError.value = agentSave.saveError.value?.message ?? 'Failed to save agent'
+  saving.value = false
+}
+
+// Toggle a custom agent's enabled flag from the list view without opening the
+// edit form. The PUT endpoint accepts partial updates, so we only send the
+// enabled field — other fields fall through to their existing values.
+async function toggleAgentEnabled(agent: Agent) {
+  const ok = await listSave.attempt(() => $fetch(`/api/agents/${agent.id}`, {
+    method: 'PUT',
+    body: { enabled: !agent.enabled },
+  }))
+  if (ok) refresh()
+}
+
+// Delete a single custom agent from its card's trash button. Guarded by a
+// confirm dialog; `deletingId` disables just this row while the DELETE is
+// in flight.
+async function deleteAgent(agent: Agent) {
+  const ok = await confirm({
+    title: 'Delete agent',
+    message: `Delete the "${agent.name}" agent? This cannot be undone.`,
+    confirmText: 'Delete',
+    variant: 'danger',
+  })
+  if (!ok) return
+  deletingId.value = agent.id
+  if (await mutateAgent(`/api/agents/${agent.id}`, { method: 'DELETE' }) !== null) refresh()
+  deletingId.value = null
+}
+
+// Wipe every custom agent (the main agent is a singleton and unaffected).
+// Gated behind a type-'delete' confirm, matching the Conversations wipe-all.
+async function deleteAll() {
+  const targets = customAgents.value
+  if (!targets.length || deletingAll.value) return
+  const count = targets.length
+  const ok = await confirm({
+    title: 'Delete all custom agents',
+    message: `Delete all ${count} custom agent${count === 1 ? '' : 's'}? This cannot be undone. The main agent is not affected.`,
+    confirmText: `Delete ${count}`,
+    variant: 'danger',
+    requireText: 'delete',
+  })
+  if (!ok) return
+  deletingAll.value = true
+  let deletedAny = false
+  await deleteAllSave.attempt(async () => {
+    // Sequential deletes keep per-row error handling simple and avoid thundering
+    // the API with parallel DELETEs. The list is small (user-curated).
+    for (const agent of targets) {
+      await $fetch(`/api/agents/${agent.id}`, { method: 'DELETE' })
+      deletedAny = true
+    }
+  })
+  deletingAll.value = false
+  // Refresh after a failure too, so the agents already deleted leave the list.
+  if (deletedAny) refresh()
+}
+
+async function loadWorkspaceFile(agentId: number, filename: string) {
+  workspaceTab.value = filename
+  workspaceError.value = null
+  let content = ''
+  try {
+    const data = await $fetch<WorkspaceFileContent>(`/api/agents/${agentId}/workspace/${filename}`)
+    content = data.content ?? ''
+  }
+  catch { /* shown as an empty file */ }
+  // The operator may have opened another agent or tab while this file was loading.
+  if (editing.value?.id !== agentId || workspaceTab.value !== filename) return
+  workspaceContent.value = content
+  workspaceBaseline.value = content
+}
+
+async function saveWorkspaceFile() {
+  if (!editing.value || !workspaceDirty.value) return
+  const saved = workspaceContent.value
+  const agentId = editing.value.id
+  const ok = await workspaceSave.attempt(() => $fetch(`/api/agents/${agentId}/workspace/${workspaceTab.value}`, {
+    method: 'PUT',
+    body: { content: saved },
+  }))
+  // The baseline stays put, so the file still reads as unsaved beside the reason.
+  if (!ok) return
+  // Snapshot the just-persisted value so the save button disables until the
+  // textarea diverges again. Capture before the await resolved so a late
+  // keystroke doesn't get clobbered into the baseline.
+  workspaceBaseline.value = saved
+}
+
+function cancel() {
+  editing.value = null
+  creating.value = false
+  agentTools.value = []
+  agentSkills.value = []
+  queueMode.value = 'queue'
+  // Only the edit form has a URL of its own; the create form lives on /agents.
+  if (route.params.name) router.push('/agents')
+}
+
+const workspaceFiles = ['SOUL.md', 'IDENTITY.md', 'USER.md', 'BOOTSTRAP.md', 'AGENT.md']
+</script>
+
+<template>
+  <div>
+    <div class="flex items-center justify-between mb-6">
+      <h1 class="text-lg font-semibold text-fg-strong">
+        Agents
+      </h1>
+      <button
+        v-if="!editing && !creating"
+        type="button"
+        :disabled="!providers.length"
+        class="inline-flex items-center gap-1.5 text-xs px-3 py-1.5 bg-emerald-700 hover:bg-emerald-800 text-white disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-emerald-700 transition-colors"
+        title="New Agent"
+        @click="newAgent"
+      >
+        <PlusIcon
+          class="w-4 h-4"
+          aria-hidden="true"
+        />
+        New Agent
+      </button>
+    </div>
+
+    <div
+      v-if="!providers.length && !editing && !creating"
+      class="bg-surface-elevated border border-border p-4 mb-4 text-sm text-fg-muted"
+    >
+      No LLM providers configured. Go to <NuxtLink
+        to="/settings?section=providers"
+        class="text-fg-strong underline"
+      >Settings</NuxtLink> and add an API key first.
+    </div>
+
+    <ApiErrorAlert
+      v-if="!editing && !creating"
+      :error="agentListError"
+      class="mb-4"
+    />
+    <!-- Main Agent section -->
+    <div
+      v-if="!editing && !creating"
+      class="mb-6 space-y-2"
+    >
+      <h2 class="text-sm font-medium text-fg-muted">
+        Main Agent
+      </h2>
+      <p class="text-xs text-fg-muted">
+        The built-in singleton agent. Always enabled, cannot be renamed or deleted. Handles admin chat and acts as the fallback route for channels without an explicit binding.
+      </p>
+      <div
+        class="bg-surface-elevated border border-border"
+        data-tour="main-agent"
+      >
+        <!-- The row must stay non-interactive: it contains ModelCapabilityPills, whose pills are buttons. Making the row itself a control (element or role) nests them, which screen readers announce as one button and axe flags as nested-interactive (JCLAW-1013). The name is the open affordance instead. -->
+        <div
+          v-if="mainAgent"
+          class="px-4 py-3 flex items-center justify-between"
+        >
+          <div>
+            <button
+              type="button"
+              class="text-sm text-fg-strong hover:underline"
+              @click="openAgent(mainAgent)"
+            >
+              {{ mainAgent.name }}
+            </button>
+            <div
+              v-if="mainAgent.description"
+              class="text-xs text-fg-muted mt-0.5"
+            >
+              {{ mainAgent.description }}
+            </div>
+            <div class="text-xs text-fg-muted mt-3">
+              {{ mainAgent.modelProvider }} / {{ mainAgent.modelId }}
+            </div>
+            <ModelCapabilityPills
+              :model="modelForAgent(mainAgent)"
+              :thinking-mode="mainAgent.thinkingMode"
+              class="mt-2"
+              @toggle="(cap) => toggleListingCapability(mainAgent, cap)"
+            />
+          </div>
+          <div class="flex items-center gap-3 shrink-0">
+            <span
+              v-if="!mainAgent.providerConfigured"
+              class="text-xs font-mono text-amber-700 dark:text-amber-400"
+            >provider not configured</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Custom Agents section -->
+    <div
+      v-if="!editing && !creating"
+      class="mb-6 space-y-2"
+    >
+      <div class="flex items-center justify-between gap-3">
+        <h2 class="text-sm font-medium text-fg-muted">
+          Custom Agents
+        </h2>
+        <button
+          v-if="customAgents.length"
+          type="button"
+          :disabled="deletingAll"
+          class="px-3 py-1.5 border border-red-700 text-red-700 dark:text-red-400 text-xs font-medium hover:bg-red-700 hover:text-white disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+          @click="deleteAll"
+        >
+          {{ deletingAll ? 'Deleting…' : 'Delete All' }}
+        </button>
+      </div>
+      <ApiErrorAlert :error="deleteAllError" />
+      <p class="text-xs text-fg-muted">
+        Additional agents you create for specific channels, peers, or workflows.
+      </p>
+      <div class="bg-surface-elevated border border-border">
+        <!-- Non-interactive for the same reason as the main-agent row above: the toggle, the delete button and the capability pills are all controls, and wrapping them in one makes them a nested-interactive violation (JCLAW-1013). -->
+        <div
+          v-for="agent in customAgents"
+          :key="agent.id"
+          class="px-4 py-3 border-b border-border last:border-b-0"
+        >
+          <!-- Name + enabled toggle share the top row so the switch aligns with
+               the agent name rather than centering against the whole card. -->
+          <div class="flex items-center justify-between gap-3">
+            <button
+              type="button"
+              class="text-sm text-fg-strong truncate min-w-0 text-left hover:underline"
+              @click="openAgent(agent)"
+            >
+              {{ agent.name }}
+            </button>
+            <div class="flex items-center gap-3 shrink-0">
+              <span
+                v-if="agent.enabled && !agent.providerConfigured"
+                class="text-xs font-mono text-amber-700 dark:text-amber-400 border border-amber-400/30 px-1"
+              >provider not configured</span>
+              <!-- Enabled toggle -->
+              <button
+                :class="agent.enabled ? 'bg-emerald-600 hover:bg-emerald-500' : 'bg-muted hover:bg-neutral-300 dark:hover:bg-neutral-600'"
+                class="relative w-9 h-5 rounded-full transition-colors"
+                :title="agent.enabled ? 'Disable agent' : 'Enable agent'"
+                role="switch"
+                :aria-checked="agent.enabled"
+                :aria-label="`${agent.name} agent`"
+                @click="toggleAgentEnabled(agent)"
+              >
+                <span
+                  :class="agent.enabled ? 'translate-x-4' : 'translate-x-0.5'"
+                  class="block w-4 h-4 bg-white rounded-full transition-transform"
+                />
+              </button>
+            </div>
+          </div>
+          <!-- Always render the description slot (min-h reserves one line, truncate
+               keeps it to one) so cards with and without a description share the
+               same top-block height — the list stays vertically consistent. -->
+          <div class="text-xs text-fg-muted mt-1 min-h-4 truncate">
+            {{ agent.description }}
+          </div>
+          <!-- Bottom row: provider/model + capability pills stay left-aligned and
+               share the row with the bottom-right delete button. mt-4 gives a
+               consistent, roomy separation from the name/description group above
+               whether or not this agent has a description. -->
+          <div class="flex items-center justify-between gap-3 mt-4">
+            <div class="min-w-0">
+              <div class="text-xs text-fg-muted">
+                {{ agent.modelProvider }} / {{ agent.modelId }}
+              </div>
+              <ModelCapabilityPills
+                :model="modelForAgent(agent)"
+                :thinking-mode="agent.thinkingMode"
+                class="mt-2"
+                @toggle="(cap) => toggleListingCapability(agent, cap)"
+              />
+            </div>
+            <button
+              type="button"
+              :disabled="deletingId === agent.id"
+              class="p-1.5 shrink-0 text-fg-muted hover:text-red-700 dark:hover:text-red-400 disabled:opacity-40 transition-colors"
+              :title="`Delete ${agent.name}`"
+              @click="deleteAgent(agent)"
+            >
+              <TrashIcon
+                class="w-4 h-4"
+                aria-hidden="true"
+              />
+            </button>
+          </div>
+        </div>
+        <div
+          v-if="!customAgents.length"
+          class="px-4 py-8 text-center text-sm text-fg-muted"
+        >
+          No custom agents yet. Click <span class="text-fg-muted">New Agent</span> to create one.
+        </div>
+      </div>
+    </div>
+
+    <!-- Edit / Create form -->
+    <div
+      v-if="editing || creating"
+      class="space-y-4"
+    >
+      <button
+        class="text-xs text-fg-muted hover:text-fg-strong transition-colors"
+        @click="cancel"
+      >
+        &larr; Back to agents
+      </button>
+      <div
+        class="bg-surface-elevated border border-border p-4"
+        data-tour="agent-edit-form"
+      >
+        <div class="flex items-center justify-between mb-4 gap-2">
+          <h2 class="text-sm font-medium text-fg-strong">
+            {{ creating ? 'New Agent' : 'Edit Agent' }}
+          </h2>
+          <button
+            v-if="editing"
+            class="px-2.5 py-1 text-xs font-medium text-emerald-700 dark:text-emerald-400
+                   bg-emerald-500/10 border border-emerald-600/30 hover:bg-emerald-500/20
+                   hover:text-emerald-800 dark:hover:text-emerald-300 hover:border-emerald-600
+                   dark:hover:border-emerald-500/50 transition-colors"
+            title="Inspect the system prompt this agent receives — per-section char + token breakdown"
+            @click="openPromptBreakdown(editing)"
+          >
+            Inspect prompt
+          </button>
+        </div>
+        <div class="grid grid-cols-2 gap-x-4 gap-y-5">
+          <label
+            :for="agentNameId"
+            class="block"
+          >
+            <span class="block text-xs text-fg-muted mb-1">
+              Name
+              <span
+                v-if="editing?.isMain"
+                class="ml-1 text-fg-muted"
+              >(locked)</span>
+            </span>
+            <input
+              :id="agentNameId"
+              v-model="form.name"
+              :disabled="editing?.isMain"
+              class="w-full px-3 py-2 bg-muted border border-input text-sm text-fg-strong focus:outline-hidden focus:border-ring disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+          </label>
+          <label
+            :for="agentDescriptionId"
+            class="block"
+          >
+            <span class="block text-xs text-fg-muted mb-1">Description</span>
+            <input
+              :id="agentDescriptionId"
+              v-model="form.description"
+              maxlength="255"
+              placeholder="What is this agent for?"
+              class="w-full px-3 py-2 bg-muted border border-input text-sm text-fg-strong focus:outline-hidden focus:border-ring"
+            >
+          </label>
+          <label
+            :for="agentProviderId"
+            class="block"
+          >
+            <span class="block text-xs text-fg-muted mb-1">Default Provider</span>
+            <select
+              :id="agentProviderId"
+              v-model="form.modelProvider"
+              class="w-full px-3 py-2 bg-muted border border-input text-sm text-fg-strong focus:outline-hidden focus:border-ring"
+            >
+              <option
+                v-for="p in providers"
+                :key="p.name"
+                :value="p.name"
+              >
+                {{ p.name }}
+              </option>
+            </select>
+          </label>
+          <label
+            :for="agentModelId"
+            class="block"
+          >
+            <span class="block text-xs text-fg-muted mb-1">Default Model</span>
+            <select
+              :id="agentModelId"
+              v-model="form.modelId"
+              class="w-full px-3 py-2 bg-muted border border-input text-sm text-fg-strong focus:outline-hidden focus:border-ring"
+            >
+              <option
+                v-for="m in availableModels"
+                :key="m.id"
+                :value="m.id"
+              >
+                {{ m.name || m.id }}
+              </option>
+            </select>
+          </label>
+          <label
+            :for="agentFallbackProviderId"
+            class="block"
+          >
+            <span class="block text-xs text-fg-muted mb-1">Fallback Provider</span>
+            <select
+              :id="agentFallbackProviderId"
+              v-model="form.fallbackProvider"
+              class="w-full px-3 py-2 bg-muted border border-input text-sm text-fg-strong focus:outline-hidden focus:border-ring"
+            >
+              <option value="">
+                None
+              </option>
+              <option
+                v-for="p in fallbackProviders"
+                :key="p.name"
+                :value="p.name"
+              >
+                {{ p.name }}
+              </option>
+            </select>
+          </label>
+          <label
+            :for="agentFallbackModelId"
+            class="block"
+          >
+            <span class="block text-xs text-fg-muted mb-1">Fallback Model</span>
+            <select
+              :id="agentFallbackModelId"
+              v-model="form.fallbackModelId"
+              :disabled="!form.fallbackProvider"
+              class="w-full px-3 py-2 bg-muted border border-input text-sm text-fg-strong focus:outline-hidden focus:border-ring disabled:opacity-50"
+            >
+              <option
+                v-for="m in fallbackAvailableModels"
+                :key="m.id"
+                :value="m.id"
+              >
+                {{ m.name || m.id }}
+              </option>
+            </select>
+          </label>
+        </div>
+        <p class="mt-2 text-xs text-fg-muted">
+          A fallback is where a turn goes when the default provider's circuit breaker refuses it. Optional; leave it at None to fail fast instead.
+        </p>
+        <ModelCapabilityPills
+          :model="selectedModel"
+          :thinking-mode="form.thinkingMode"
+          size="md"
+          class="mt-5"
+          @toggle="toggleFormCapability"
+        />
+        <div class="flex items-center mt-4 gap-3">
+          <button
+            :disabled="saving || !formDirty || !form.name || !form.modelProvider || !form.modelId"
+            class="p-1.5 text-emerald-700 dark:text-emerald-400 hover:text-emerald-600 dark:hover:text-emerald-300 disabled:opacity-40 disabled:hover:text-emerald-700 dark:disabled:hover:text-emerald-400 transition-colors"
+            :title="saving ? 'Saving...' : formDirty ? 'Save' : 'No changes to save'"
+            @click="saveAgent"
+          >
+            <Save
+              class="w-5 h-5"
+              aria-hidden="true"
+            />
+          </button>
+          <p
+            v-if="saveError"
+            class="text-xs text-red-700 dark:text-red-400"
+            role="alert"
+          >
+            {{ saveError }}
+          </p>
+        </div>
+      </div>
+
+      <!-- Queue Mode -->
+      <div
+        v-if="editing"
+        class="bg-surface-elevated border border-border p-4"
+        data-testid="agent-queue-mode"
+      >
+        <div class="flex items-center justify-between">
+          <div>
+            <span class="text-sm font-medium text-fg-strong">Queue Mode</span>
+            <div class="text-xs text-fg-muted mt-0.5">
+              How to handle messages when the agent is busy
+            </div>
+          </div>
+          <div class="flex items-center gap-2">
+            <label :for="agentQueueModeId">
+              <span class="sr-only">Queue mode</span>
+              <select
+                :id="agentQueueModeId"
+                v-model="queueMode"
+                :disabled="savingQueueMode"
+                class="bg-muted border border-input text-sm text-fg-strong px-2 py-1 focus:outline-hidden focus:border-ring disabled:opacity-50"
+                @change="saveQueueMode"
+              >
+                <option value="queue">
+                  Queue (FIFO)
+                </option>
+                <option value="collect">
+                  Collect (batch)
+                </option>
+                <option value="interrupt">
+                  Interrupt
+                </option>
+              </select>
+            </label>
+          </div>
+        </div>
+        <ApiErrorAlert
+          :error="queueModeError"
+          class="mt-2"
+        />
+      </div>
+
+      <!-- JCLAW-500: per-agent ACP external-harness grant. The acp runtime
+           launches an operator-configured external process outside JClaw's tool
+           and workspace confinement, so it is opt-in per custom agent; the main
+           agent always has it and shows no toggle. Immediate-saves via a partial
+           PUT, like the compression card. -->
+      <div
+        v-if="editing && !editing.isMain"
+        class="bg-surface-elevated border border-border"
+      >
+        <div class="px-4 py-2.5 flex items-center justify-between gap-4">
+          <div>
+            <span class="text-sm font-medium text-fg-strong">ACP External Harness</span>
+            <div class="text-xs text-fg-muted mt-0.5">
+              Allow this agent to spawn subagents under the external ACP runtime
+              (runtime=acp), which runs outside JClaw's tool and workspace
+              confinement.
+            </div>
+          </div>
+          <button
+            type="button"
+            :title="acpAllowed ? 'Revoke ACP runtime' : 'Allow ACP runtime'"
+            :disabled="savingAcpAllowed"
+            class="shrink-0 disabled:opacity-50"
+            role="switch"
+            :aria-checked="acpAllowed"
+            aria-label="ACP runtime"
+            @click="toggleAcpAllowed"
+          >
+            <div
+              class="relative w-9 h-5 rounded-full transition-colors duration-200"
+              :class="acpAllowed ? 'bg-emerald-500' : 'bg-muted'"
+            >
+              <div
+                class="absolute top-0.5 w-4 h-4 rounded-full bg-white shadow-sm transition-all duration-200"
+                :class="acpAllowed ? 'left-[18px]' : 'left-0.5'"
+              />
+            </div>
+          </button>
+        </div>
+      </div>
+
+      <!-- JCLAW-534: per-agent memory auto-capture — enable toggle + extractor-
+           model override. Immediate-saves via a partial PUT, like the ACP and
+           compression cards. The model selects default to the agent's model and
+           are sent as null when unchanged so the agent keeps inheriting it. -->
+      <div
+        v-if="editing"
+        class="bg-surface-elevated border border-border"
+      >
+        <div class="px-4 py-2.5 flex items-center justify-between gap-4">
+          <div>
+            <span class="text-sm font-medium text-fg-strong">Memory Autocapture</span>
+            <div class="text-xs text-fg-muted mt-0.5">
+              Automatically capture durable facts from this agent's conversations
+              into long-term memory.
+            </div>
+          </div>
+          <button
+            type="button"
+            :title="memoryAutocaptureEnabled ? 'Turn auto-capture off' : 'Turn auto-capture on'"
+            :disabled="savingMemory"
+            class="shrink-0 disabled:opacity-50"
+            role="switch"
+            :aria-checked="memoryAutocaptureEnabled"
+            aria-label="Memory auto-capture"
+            @click="toggleMemoryAutocapture"
+          >
+            <div
+              class="relative w-9 h-5 rounded-full transition-colors duration-200"
+              :class="memoryAutocaptureEnabled ? 'bg-emerald-500' : 'bg-muted'"
+            >
+              <div
+                class="absolute top-0.5 w-4 h-4 rounded-full bg-white shadow-sm transition-all duration-200"
+                :class="memoryAutocaptureEnabled ? 'left-[18px]' : 'left-0.5'"
+              />
+            </div>
+          </button>
+        </div>
+
+        <div
+          v-if="memoryAutocaptureEnabled"
+          class="px-4 pb-3 pt-2 border-t border-border"
+        >
+          <div class="text-xs text-fg-muted mt-2 mb-2">
+            Extractor model — defaults to the agent's model; pick another (e.g. a
+            cheaper one) to run memory extraction on it instead.
+          </div>
+          <div class="grid grid-cols-2 gap-3">
+            <label
+              :for="agentMemoryProviderId"
+              class="block"
+            >
+              <span class="block text-xs text-fg-muted mb-1">Provider</span>
+              <select
+                :id="agentMemoryProviderId"
+                v-model="memoryAutocaptureProvider"
+                :disabled="savingMemory"
+                class="w-full px-3 py-2 bg-muted border border-input text-sm text-fg-strong focus:outline-hidden focus:border-ring disabled:opacity-50"
+                @change="onAutocaptureProviderChange"
+              >
+                <option
+                  v-for="p in providers"
+                  :key="p.name"
+                  :value="p.name"
+                >
+                  {{ p.name }}
+                </option>
+              </select>
+            </label>
+            <label
+              :for="agentMemoryModelId"
+              class="block"
+            >
+              <span class="block text-xs text-fg-muted mb-1">Model</span>
+              <select
+                :id="agentMemoryModelId"
+                v-model="memoryAutocaptureModel"
+                :disabled="savingMemory"
+                class="w-full px-3 py-2 bg-muted border border-input text-sm text-fg-strong focus:outline-hidden focus:border-ring disabled:opacity-50"
+                @change="saveMemoryModel"
+              >
+                <option
+                  v-for="m in autocaptureAvailableModels"
+                  :key="m.id"
+                  :value="m.id"
+                >
+                  {{ m.name || m.id }}
+                </option>
+              </select>
+            </label>
+          </div>
+        </div>
+      </div>
+
+      <!-- Core memories (JCLAW-981): the always-loaded tier and its cap. Its own card
+           rather than a row under Memory Autocapture, which governs none of it — core
+           memories are injected by prompt assembly whether or not capture runs, and the
+           migration classifier reads the agent's own model, not the extractor override. -->
+      <div
+        v-if="editing && coreMigration"
+        class="bg-surface-elevated border border-border"
+      >
+        <div
+          class="px-4 py-2.5"
+          data-testid="agent-core-memory"
+        >
+          <div class="flex items-center justify-between gap-3">
+            <div class="min-w-0">
+              <span class="text-sm font-medium text-fg-strong">Core memories</span>
+              <span
+                v-if="coreMigration.running"
+                class="ml-2 text-xs text-amber-700 dark:text-amber-400 border border-amber-400/40 px-1"
+              >migrating</span>
+              <span
+                v-else-if="coreMigration.overCap"
+                class="ml-2 text-xs text-amber-700 dark:text-amber-400 border border-amber-400/40 px-1"
+                data-testid="agent-core-over-cap"
+              >over the limit</span>
+            </div>
+            <button
+              type="button"
+              class="shrink-0 px-3 py-1.5 text-xs border border-border hover:bg-muted/40 transition-colors disabled:opacity-50"
+              :disabled="!coreMigration.overCap || coreMigration.running"
+              data-testid="agent-core-migrate"
+              @click="startCoreMigration"
+            >
+              {{ coreMigration.running ? 'Migrating…' : 'Migrate excess' }}
+            </button>
+          </div>
+          <div class="text-xs text-fg-muted mt-0.5">
+            Always loaded into this agent's prompt, independent of Memory Autocapture.
+            Migrating is run by the agent's own model — the extractor model set under
+            Memory Autocapture does not apply here.
+          </div>
+          <p class="text-xs text-fg-muted mt-1">
+            {{ coreMigration.liveCore }} of {{ coreMigration.cap }} allowed.
+            <template v-if="coreMigration.overCap">
+              The excess is not loaded into any turn — it holds the core category without the
+              benefit. Migrating asks this agent to file each one under the category that fits
+              it best; nothing is deleted, and anything it cannot classify stays core so you
+              can run this again.
+            </template>
+          </p>
+          <p
+            v-if="coreMigration.running && coreMigration.total > 0"
+            class="text-xs text-fg-muted mt-1"
+            data-testid="agent-core-migrate-progress"
+          >
+            Recategorised {{ coreMigration.processed }} of {{ coreMigration.total }}.
+          </p>
+          <p
+            v-if="coreMigrationError || coreMigration.error"
+            class="text-xs text-red-700 dark:text-red-400 mt-1"
+            data-testid="agent-core-migrate-error"
+          >
+            {{ coreMigrationError || `Last run failed: ${coreMigration.error}` }}
+          </p>
+        </div>
+      </div>
+
+      <!-- Content Compression (JCLAW-465/463/464): master enable + per-type
+           sub-toggles + the text-aggressiveness slider. Mirrors the Skills/Tools
+           header (title + N/M enabled + a pill toggle); each control immediate-
+           saves via a partial PUT. -->
+      <div
+        v-if="editing"
+        class="bg-surface-elevated border border-border"
+      >
+        <div class="px-4 py-2.5 border-b border-border flex items-center justify-between">
+          <div class="flex items-center gap-2">
+            <span class="text-sm font-medium text-fg-strong">Content Compression</span>
+            <span class="text-xs text-fg-muted">{{ compressionEnabledCount }}/4 enabled</span>
+          </div>
+          <button
+            type="button"
+            :title="compressionEnabled ? 'Disable content compression' : 'Enable content compression'"
+            :disabled="savingCompression"
+            class="shrink-0 disabled:opacity-50"
+            role="switch"
+            :aria-checked="compressionEnabled"
+            aria-label="Content compression"
+            @click="toggleCompression"
+          >
+            <div
+              class="relative w-9 h-5 rounded-full transition-colors duration-200"
+              :class="compressionEnabled ? 'bg-emerald-500' : 'bg-muted'"
+            >
+              <div
+                class="absolute top-0.5 w-4 h-4 rounded-full bg-white shadow-sm transition-all duration-200"
+                :class="compressionEnabled ? 'left-[18px]' : 'left-0.5'"
+              />
+            </div>
+          </button>
+        </div>
+        <div class="divide-y divide-border">
+          <!-- Per-type sub-toggles, gated by the master: inert + dimmed when off. -->
+          <div
+            class="px-4 py-2.5 flex items-center justify-between gap-4"
+            :class="compressionEnabled ? '' : 'opacity-50'"
+          >
+            <div>
+              <span class="text-sm text-fg-strong">JSON</span>
+              <div class="text-xs text-fg-muted mt-0.5">
+                Crush large JSON arrays — keep schema, first items, and errors
+              </div>
+            </div>
+            <button
+              type="button"
+              :title="compressionJson ? 'Disable JSON compression' : 'Enable JSON compression'"
+              :disabled="savingCompression || !compressionEnabled"
+              class="shrink-0"
+              role="switch"
+              :aria-checked="compressionEnabled && compressionJson"
+              aria-label="JSON compression"
+              @click="toggleCompressionJson"
+            >
+              <div
+                class="relative w-9 h-5 rounded-full transition-colors duration-200"
+                :class="(compressionEnabled && compressionJson) ? 'bg-emerald-500' : 'bg-muted'"
+              >
+                <div
+                  class="absolute top-0.5 w-4 h-4 rounded-full bg-white shadow-sm transition-all duration-200"
+                  :class="(compressionEnabled && compressionJson) ? 'left-[18px]' : 'left-0.5'"
+                />
+              </div>
+            </button>
+          </div>
+          <div
+            class="px-4 py-2.5 flex items-center justify-between gap-4"
+            :class="compressionEnabled ? '' : 'opacity-50'"
+          >
+            <div>
+              <span class="text-sm text-fg-strong">Code</span>
+              <div class="text-xs text-fg-muted mt-0.5">
+                Keep imports and signatures, elide function bodies
+              </div>
+            </div>
+            <button
+              type="button"
+              :title="compressionCode ? 'Disable code compression' : 'Enable code compression'"
+              :disabled="savingCompression || !compressionEnabled"
+              class="shrink-0"
+              role="switch"
+              :aria-checked="compressionEnabled && compressionCode"
+              aria-label="Code compression"
+              @click="toggleCompressionCode"
+            >
+              <div
+                class="relative w-9 h-5 rounded-full transition-colors duration-200"
+                :class="(compressionEnabled && compressionCode) ? 'bg-emerald-500' : 'bg-muted'"
+              >
+                <div
+                  class="absolute top-0.5 w-4 h-4 rounded-full bg-white shadow-sm transition-all duration-200"
+                  :class="(compressionEnabled && compressionCode) ? 'left-[18px]' : 'left-0.5'"
+                />
+              </div>
+            </button>
+          </div>
+          <div
+            class="px-4 py-2.5 flex items-center justify-between gap-4"
+            :class="compressionEnabled ? '' : 'opacity-50'"
+          >
+            <div>
+              <span class="text-sm text-fg-strong">Text &amp; logs</span>
+              <div class="text-xs text-fg-muted mt-0.5">
+                Collapse near-duplicate lines, summarize long prose
+              </div>
+            </div>
+            <button
+              type="button"
+              :title="compressionText ? 'Disable text compression' : 'Enable text compression'"
+              :disabled="savingCompression || !compressionEnabled"
+              class="shrink-0"
+              role="switch"
+              :aria-checked="compressionEnabled && compressionText"
+              aria-label="Text compression"
+              @click="toggleCompressionText"
+            >
+              <div
+                class="relative w-9 h-5 rounded-full transition-colors duration-200"
+                :class="(compressionEnabled && compressionText) ? 'bg-emerald-500' : 'bg-muted'"
+              >
+                <div
+                  class="absolute top-0.5 w-4 h-4 rounded-full bg-white shadow-sm transition-all duration-200"
+                  :class="(compressionEnabled && compressionText) ? 'left-[18px]' : 'left-0.5'"
+                />
+              </div>
+            </button>
+          </div>
+          <!-- Text aggressiveness: a slider with the live % value. Gated by master AND Text. -->
+          <div
+            class="px-4 py-2.5 flex max-sm:flex-wrap items-center justify-between gap-4"
+            :class="(compressionEnabled && compressionText) ? '' : 'opacity-50'"
+          >
+            <div>
+              <span class="text-sm text-fg-strong">Text aggressiveness</span>
+              <div class="text-xs text-fg-muted mt-0.5">
+                Minimum shrink to keep a rewrite
+              </div>
+            </div>
+            <div class="flex items-center gap-3 shrink-0">
+              <input
+                v-model.number="compressionTargetRatio"
+                type="range"
+                min="0.05"
+                max="0.95"
+                step="0.05"
+                aria-label="Text aggressiveness"
+                :disabled="savingCompression || !compressionEnabled || !compressionText"
+                class="w-28 accent-emerald-600"
+                @change="saveCompressionRatio"
+              >
+              <span class="text-xs font-mono text-fg-strong w-9 text-right">{{ Math.round(compressionTargetRatio * 100) }}%</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Exec privileges (main agent only) -->
+      <div
+        v-if="editing && editing.isMain"
+        class="bg-surface-elevated border border-border"
+        data-testid="agent-shell-exec"
+      >
+        <div class="px-4 py-2.5 border-b border-border">
+          <span class="text-sm font-medium text-fg-strong">Shell Exec Privileges</span>
+          <span class="ml-2 text-xs text-amber-700 dark:text-amber-400">main agent only</span>
+        </div>
+        <div class="divide-y divide-border">
+          <div class="px-4 py-2.5 flex items-center justify-between">
+            <div>
+              <span class="text-sm text-fg-strong">Bypass allowlist</span>
+              <div class="text-xs text-fg-muted mt-0.5">
+                Allow any command without allowlist validation
+              </div>
+            </div>
+            <button
+              type="button"
+              role="switch"
+              :aria-checked="execBypassAllowlist"
+              aria-label="Bypass allowlist"
+              :disabled="savingExec"
+              :class="execBypassAllowlist ? 'bg-amber-600 hover:bg-amber-500' : 'bg-muted hover:bg-neutral-300 dark:hover:bg-neutral-600'"
+              class="relative w-9 h-5 rounded-full transition-colors shrink-0 disabled:opacity-50"
+              @click="toggleExecConfig('bypassAllowlist')"
+            >
+              <span
+                :class="execBypassAllowlist ? 'translate-x-4' : 'translate-x-0.5'"
+                class="block w-4 h-4 bg-white rounded-full transition-transform"
+              />
+            </button>
+          </div>
+          <div class="px-4 py-2.5 flex items-center justify-between">
+            <div>
+              <span class="text-sm text-fg-strong">Allow global paths</span>
+              <div class="text-xs text-fg-muted mt-0.5">
+                Execute commands outside the agent workspace directory
+              </div>
+            </div>
+            <button
+              type="button"
+              role="switch"
+              :aria-checked="execAllowGlobalPaths"
+              aria-label="Allow global paths"
+              :disabled="savingExec"
+              :class="execAllowGlobalPaths ? 'bg-amber-600 hover:bg-amber-500' : 'bg-muted hover:bg-neutral-300 dark:hover:bg-neutral-600'"
+              class="relative w-9 h-5 rounded-full transition-colors shrink-0 disabled:opacity-50"
+              @click="toggleExecConfig('allowGlobalPaths')"
+            >
+              <span
+                :class="execAllowGlobalPaths ? 'translate-x-4' : 'translate-x-0.5'"
+                class="block w-4 h-4 bg-white rounded-full transition-transform"
+              />
+            </button>
+          </div>
+        </div>
+        <ApiErrorAlert
+          :error="execError"
+          class="px-4 py-2.5 border-t border-border"
+        />
+      </div>
+
+      <!--
+        Effective shell allowlist — derived view of what this agent can run via
+        the exec tool. Aggregates the global shell.allowlist (edited in Settings)
+        with the commands each enabled skill contributes at install time.
+        Read-only: remove a per-skill grant by disabling or removing the skill;
+        change global by editing shell.allowlist in Settings.
+      -->
+      <div
+        v-if="editing && effectiveAllowlist"
+        class="bg-surface-elevated border border-border"
+      >
+        <button
+          class="w-full px-4 py-2.5 border-b border-border text-left hover:bg-muted transition-colors flex items-center justify-between"
+          @click="allowlistExpanded = !allowlistExpanded"
+        >
+          <span class="text-sm font-medium text-fg-strong">
+            Shell Allowlist
+            <span class="ml-2 text-xs font-normal text-fg-muted">
+              {{ effectiveAllowlist.global.length + Object.values(effectiveAllowlist.bySkill).reduce((n, arr) => n + arr.length, 0) }}
+              commands
+              ({{ effectiveAllowlist.global.length }} global +
+              {{ Object.values(effectiveAllowlist.bySkill).reduce((n, arr) => n + arr.length, 0) }}
+              from {{ Object.keys(effectiveAllowlist.bySkill).length }} skill{{ Object.keys(effectiveAllowlist.bySkill).length === 1 ? '' : 's' }})
+            </span>
+          </span>
+          <ChevronRightIcon
+            class="w-3 h-3 text-fg-muted transition-transform"
+            :class="allowlistExpanded ? 'rotate-90' : ''"
+            aria-hidden="true"
+          />
+        </button>
+        <div
+          v-if="allowlistExpanded"
+          class="px-4 py-3"
+        >
+          <p class="text-xs text-fg-muted mb-2">
+            What this agent can run via the exec tool. Global entries come from
+            <span class="font-mono text-fg-muted">shell.allowlist</span> in Settings;
+            per-skill entries come from the skill's declared
+            <span class="font-mono text-fg-muted">commands:</span>
+            and disappear when you disable or remove the skill.
+          </p>
+          <div class="overflow-x-auto">
+            <table class="w-full text-xs">
+              <thead>
+                <tr class="text-fg-muted text-[10px] uppercase tracking-wide">
+                  <th class="text-left font-medium py-1 pr-4">
+                    Command
+                  </th>
+                  <th class="text-left font-medium py-1">
+                    Source
+                  </th>
+                </tr>
+              </thead>
+              <tbody class="divide-y divide-border">
+                <tr
+                  v-for="cmd in effectiveAllowlist.global"
+                  :key="'g:' + cmd"
+                >
+                  <td class="py-1 pr-4 font-mono text-fg-primary">
+                    {{ cmd }}
+                  </td>
+                  <td class="py-1 text-fg-muted">
+                    Global (shell.allowlist)
+                  </td>
+                </tr>
+                <template
+                  v-for="(cmds, skillName) in effectiveAllowlist.bySkill"
+                  :key="skillName"
+                >
+                  <tr
+                    v-for="cmd in cmds"
+                    :key="skillName + ':' + cmd"
+                  >
+                    <td class="py-1 pr-4 font-mono text-cyan-700 dark:text-cyan-400">
+                      {{ cmd }}
+                    </td>
+                    <td class="py-1 text-fg-muted">
+                      Skill: <span class="font-mono text-fg-muted">{{ skillName }}</span>
+                    </td>
+                  </tr>
+                </template>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- Skills -->
+      <div
+        v-if="editing"
+        class="bg-surface-elevated border border-border"
+        data-testid="agent-skills"
+      >
+        <div class="px-4 py-2.5 border-b border-border flex items-center justify-between">
+          <div class="flex items-center gap-2">
+            <span class="text-sm font-medium text-fg-strong">Skills</span>
+            <span class="text-xs text-fg-muted">{{ toggleableAgentSkills.filter(s => s.enabled).length }}/{{ toggleableAgentSkills.length }} enabled</span>
+          </div>
+          <button
+            v-if="toggleableAgentSkills.length"
+            :title="allAgentSkillsEnabled ? 'Disable all skills for this agent' : 'Enable all skills for this agent'"
+            :disabled="savingSkills"
+            class="shrink-0 disabled:opacity-50"
+            role="switch"
+            :aria-checked="allAgentSkillsEnabled"
+            aria-label="All skills for this agent"
+            @click="toggleAllAgentSkills()"
+          >
+            <div
+              class="relative w-9 h-5 rounded-full transition-colors duration-200"
+              :class="allAgentSkillsEnabled ? 'bg-emerald-500' : 'bg-muted'"
+            >
+              <div
+                class="absolute top-0.5 w-4 h-4 rounded-full bg-white shadow-sm transition-all duration-200"
+                :class="allAgentSkillsEnabled ? 'left-[18px]' : 'left-0.5'"
+              />
+            </div>
+          </button>
+        </div>
+        <div class="divide-y divide-border">
+          <div
+            v-for="skill in sortedAgentSkills"
+            :key="skill.name"
+            class="px-4 py-2.5 flex items-start justify-between gap-3 transition-opacity"
+            :class="skillDisabledTools(skill).length ? 'opacity-45' : ''"
+          >
+            <div
+              class="flex-1 min-w-0 transition-[filter]"
+              :class="skillDisabledTools(skill).length ? 'blur-[0.4px]' : ''"
+            >
+              <div class="flex items-center gap-2 flex-wrap">
+                <span class="text-sm text-fg-strong font-mono max-sm:[overflow-wrap:anywhere]">{{ skill.name }}</span>
+                <span
+                  v-if="skill.isGlobal"
+                  class="text-xs text-green-700 dark:text-green-400 border border-green-400/30 px-1"
+                >global</span>
+              </div>
+              <div
+                v-if="skill.tools?.length"
+                class="flex flex-wrap gap-1 mt-1.5"
+              >
+                <span
+                  v-for="tool in skill.tools"
+                  :key="tool"
+                  class="text-xs font-mono px-1.5 py-0.5 border rounded-sm"
+                  :class="getPillClass(tool)"
+                >
+                  {{ tool }}
+                </span>
+              </div>
+              <!--
+                Shell commands this skill contributes to the agent's effective
+                allowlist. These are the binaries bundled under the skill's
+                tools/ directory, blessed at promotion time. Enabling this
+                skill grants execution rights for these exact names.
+              -->
+              <div
+                v-if="skill.commands?.length"
+                class="mt-1.5 text-[11px] text-fg-muted flex flex-wrap items-center gap-1"
+              >
+                <span class="text-fg-muted uppercase tracking-wide text-[10px]">Provides:</span>
+                <span
+                  v-for="cmd in skill.commands"
+                  :key="cmd"
+                  class="font-mono text-cyan-700 dark:text-cyan-400 bg-cyan-400/5 border border-cyan-400/20 px-1.5 py-0.5 rounded-sm"
+                >
+                  {{ cmd }}
+                </span>
+              </div>
+              <div
+                v-if="skillDisabledTools(skill).length"
+                class="text-xs text-amber-700 dark:text-amber-400 mt-1.5"
+              >
+                requires {{ skillDisabledTools(skill).join(', ') }}
+              </div>
+              <div
+                v-else-if="skill.description"
+                class="text-xs text-fg-muted mt-1.5"
+              >
+                {{ skill.description }}
+              </div>
+            </div>
+            <button
+              :title="skillDisabledTools(skill).length
+                ? 'Enable ' + skillDisabledTools(skill).join(', ') + ' to use this skill'
+                : skill.enabled ? 'Disable skill' : 'Enable skill'"
+              :disabled="savingSkills"
+              class="shrink-0 pt-0.5 disabled:opacity-50"
+              :class="skillDisabledTools(skill).length ? 'cursor-not-allowed' : ''"
+              role="switch"
+              :aria-checked="!skillDisabledTools(skill).length && skill.enabled"
+              :aria-disabled="skillDisabledTools(skill).length > 0"
+              :aria-label="`${skill.name} skill`"
+              @click="toggleSkill(skill)"
+            >
+              <div
+                class="relative w-9 h-5 rounded-full transition-colors duration-200"
+                :class="(!skillDisabledTools(skill).length && skill.enabled) ? 'bg-emerald-500' : 'bg-muted'"
+              >
+                <div
+                  class="absolute top-0.5 w-4 h-4 rounded-full bg-white shadow-sm transition-all duration-200"
+                  :class="(!skillDisabledTools(skill).length && skill.enabled) ? 'left-[18px]' : 'left-0.5'"
+                />
+              </div>
+            </button>
+          </div>
+        </div>
+        <div
+          v-if="!agentSkills.length"
+          class="px-4 py-4 text-xs text-fg-muted text-center"
+        >
+          No skills available
+        </div>
+        <ApiErrorAlert
+          :error="skillsError"
+          class="px-4 py-2.5 border-t border-border"
+        />
+      </div>
+
+      <!-- Tools -->
+      <div
+        v-if="editing"
+        class="bg-surface-elevated border border-border"
+        data-testid="agent-tools"
+      >
+        <div class="px-4 py-2.5 border-b border-border flex items-center justify-between">
+          <div class="flex items-center gap-2">
+            <span class="text-sm font-medium text-fg-strong">Tools</span>
+            <span class="text-xs text-fg-muted">{{ toggleableAgentTools.filter(t => t.enabled).length }}/{{ toggleableAgentTools.length }} enabled</span>
+          </div>
+          <button
+            v-if="toggleableAgentTools.length"
+            :title="allAgentToolsEnabled ? 'Disable all tools for this agent' : 'Enable all tools for this agent'"
+            :disabled="savingTools"
+            class="shrink-0 disabled:opacity-50"
+            role="switch"
+            :aria-checked="allAgentToolsEnabled"
+            aria-label="All tools for this agent"
+            @click="toggleAllAgentTools()"
+          >
+            <div
+              class="relative w-9 h-5 rounded-full transition-colors duration-200"
+              :class="allAgentToolsEnabled ? 'bg-emerald-500' : 'bg-muted'"
+            >
+              <div
+                class="absolute top-0.5 w-4 h-4 rounded-full bg-white shadow-sm transition-all duration-200"
+                :class="allAgentToolsEnabled ? 'left-[18px]' : 'left-0.5'"
+              />
+            </div>
+          </button>
+        </div>
+        <div>
+          <template
+            v-for="catGroup in toolsByCategory"
+            :key="catGroup.category"
+          >
+            <!-- Category header row -->
+            <div class="px-4 py-1.5 border-b border-border bg-surface-elevated">
+              <span
+                class="text-[10px] font-semibold uppercase tracking-widest"
+                :class="{
+                  'text-fg-muted': catGroup.category === 'System',
+                  'text-amber-700 dark:text-amber-400': catGroup.category === 'Files',
+                  'text-blue-700 dark:text-blue-400': catGroup.category === 'Web',
+                  'text-emerald-700 dark:text-emerald-400': catGroup.category === 'Utilities',
+                }"
+              >
+                {{ catGroup.category }}
+              </span>
+            </div>
+            <div class="divide-y divide-border">
+              <!-- Group rows: one per MCP server, single toggle flips every tool the server contributes via the bulk endpoint -->
+              <div
+                v-for="row in catGroup.rows"
+                :key="row.key"
+                class="px-4 py-3 flex items-center gap-3"
+              >
+                <template v-if="row.kind === 'group'">
+                  <!-- Violet plug icon for MCP groups, matching the /tools page MCP card -->
+                  <div class="w-8 h-8 rounded flex items-center justify-center shrink-0 bg-violet-500/15">
+                    <PuzzlePieceIcon
+                      class="w-4 h-4 text-violet-700 dark:text-violet-400"
+                      aria-hidden="true"
+                    />
+                  </div>
+                  <div class="flex-1 min-w-0">
+                    <span class="text-sm text-fg-strong font-mono max-sm:[overflow-wrap:anywhere]">{{ row.group }}</span>
+                    <div class="mt-1.5">
+                      <span class="text-xs font-mono px-1.5 py-0.5 border rounded-sm bg-violet-500/10 border-violet-500/25 text-violet-700 dark:text-violet-400">
+                        {{ row.functionCount }} function{{ row.functionCount === 1 ? '' : 's' }}
+                      </span>
+                    </div>
+                  </div>
+                  <button
+                    :title="row.enabled ? `Disable ${row.group} for this agent` : `Enable ${row.group} for this agent`"
+                    role="switch"
+                    :aria-checked="row.enabled"
+                    :aria-label="`${row.group} for this agent`"
+                    :disabled="savingMcp"
+                    class="shrink-0 disabled:opacity-50"
+                    @click="toggleToolGroup(row.group, !row.enabled)"
+                  >
+                    <div
+                      class="relative w-9 h-5 rounded-full transition-colors duration-200"
+                      :class="row.enabled ? 'bg-emerald-500' : 'bg-muted'"
+                    >
+                      <div
+                        class="absolute top-0.5 w-4 h-4 rounded-full bg-white shadow-sm transition-all duration-200"
+                        :class="row.enabled ? 'left-[18px]' : 'left-0.5'"
+                      />
+                    </div>
+                  </button>
+                </template>
+                <template v-else>
+                  <!-- Single native tool: existing render -->
+                  <div
+                    class="w-8 h-8 rounded flex items-center justify-center shrink-0"
+                    :class="getToolMeta(row.tool.name)?.iconBg ?? 'bg-muted'"
+                  >
+                    <component
+                      :is="toolIconComponent(row.tool.name)"
+                      class="w-4 h-4"
+                      :class="[getToolMeta(row.tool.name)?.iconColor ?? 'text-fg-muted', toolIconExtraClass(row.tool.name)]"
+                      aria-hidden="true"
+                    />
+                  </div>
+                  <div class="flex-1 min-w-0">
+                    <span class="text-sm text-fg-strong font-mono max-sm:[overflow-wrap:anywhere]">{{ row.tool.name }}</span>
+                    <div class="flex flex-wrap gap-1 mt-1.5">
+                      <span
+                        v-for="fn in (getToolMeta(row.tool.name)?.functions ?? [])"
+                        :key="fn.name"
+                        class="text-xs font-mono px-1.5 py-0.5 border rounded-sm"
+                        :class="getPillClass(row.tool.name)"
+                      >
+                        {{ fn.name }}
+                      </span>
+                    </div>
+                  </div>
+                  <button
+                    :title="row.tool.enabled ? 'Disable tool for this agent' : 'Enable tool for this agent'"
+                    :disabled="savingTools"
+                    class="shrink-0 disabled:opacity-50"
+                    role="switch"
+                    :aria-checked="row.tool.enabled"
+                    :aria-label="`${row.tool.name} tool for this agent`"
+                    @click="toggleTool(row.tool)"
+                  >
+                    <div
+                      class="relative w-9 h-5 rounded-full transition-colors duration-200"
+                      :class="row.tool.enabled ? 'bg-emerald-500' : 'bg-muted'"
+                    >
+                      <div
+                        class="absolute top-0.5 w-4 h-4 rounded-full bg-white shadow-sm transition-all duration-200"
+                        :class="row.tool.enabled ? 'left-[18px]' : 'left-0.5'"
+                      />
+                    </div>
+                  </button>
+                </template>
+              </div>
+            </div>
+          </template>
+        </div>
+        <div
+          v-if="!agentTools.length"
+          class="px-4 py-4 text-xs text-fg-muted text-center"
+        >
+          No tools registered
+        </div>
+        <ApiErrorAlert
+          :error="toolsError"
+          class="px-4 py-2.5 border-t border-border"
+        />
+      </div>
+
+      <!-- MCP Servers (JCLAW-281): separate sub-section parallel to Tools.
+           One row per connected MCP server with a single server-level toggle
+           that flips every per-action AgentToolConfig row via the existing
+           bulk-toggle endpoint. No per-action toggling — operators enable a
+           server as a unit, matching the function-calling schema's
+           parameterized-tool shape. -->
+      <div
+        v-if="editing && mcpServerRows.length"
+        class="bg-surface-elevated border border-border"
+        data-testid="agent-mcp-servers"
+      >
+        <div class="px-4 py-2.5 border-b border-border flex items-center justify-between">
+          <div class="flex items-center gap-2">
+            <span class="text-sm font-medium text-fg-strong">MCP Servers</span>
+            <span class="text-xs text-fg-muted">{{ mcpServerRows.filter(r => r.enabled).length }}/{{ mcpServerRows.length }} enabled</span>
+          </div>
+        </div>
+        <div class="divide-y divide-border">
+          <div
+            v-for="row in mcpServerRows"
+            :key="row.key"
+          >
+            <div class="px-4 py-3 flex items-center gap-3">
+              <button
+                :title="expandedMcpServer === row.server ? `Collapse ${row.server} actions` : `Expand ${row.server} actions`"
+                :aria-label="expandedMcpServer === row.server ? `Collapse ${row.server} actions` : `Expand ${row.server} actions`"
+                :aria-expanded="expandedMcpServer === row.server"
+                class="w-8 h-8 rounded flex items-center justify-center shrink-0 bg-violet-500/15 hover:bg-violet-500/25 transition-colors"
+                @click="toggleMcpExpand(row.server)"
+              >
+                <ChevronRightIcon
+                  class="w-4 h-4 text-violet-700 dark:text-violet-400 transition-transform duration-150"
+                  :class="{ 'rotate-90': expandedMcpServer === row.server }"
+                  aria-hidden="true"
+                />
+              </button>
+              <div class="flex-1 min-w-0">
+                <span class="text-sm text-fg-strong font-mono max-sm:[overflow-wrap:anywhere]">{{ row.server }}</span>
+                <div class="mt-1.5">
+                  <span class="text-xs font-mono px-1.5 py-0.5 border rounded-sm bg-violet-500/10 border-violet-500/25 text-violet-700 dark:text-violet-400">
+                    {{ row.actions.length }} action{{ row.actions.length === 1 ? '' : 's' }}
+                  </span>
+                </div>
+              </div>
+              <button
+                :title="row.enabled ? `Disable ${row.server} for this agent` : `Enable ${row.server} for this agent`"
+                role="switch"
+                :aria-checked="row.enabled"
+                :aria-label="`${row.server} for this agent`"
+                :disabled="savingMcp"
+                class="shrink-0 disabled:opacity-50"
+                @click="toggleToolGroup(row.server, !row.enabled)"
+              >
+                <div
+                  class="relative w-9 h-5 rounded-full transition-colors duration-200"
+                  :class="row.enabled ? 'bg-emerald-500' : 'bg-muted'"
+                >
+                  <div
+                    class="absolute top-0.5 w-4 h-4 rounded-full bg-white shadow-sm transition-all duration-200"
+                    :class="row.enabled ? 'left-[18px]' : 'left-0.5'"
+                  />
+                </div>
+              </button>
+            </div>
+            <!-- Read-only per-action list. Operators can no longer toggle
+                 individual actions (Phase 6 collapses MCP enablement to
+                 the server level), but they still need visibility into
+                 what each server exposes. Collapsed by default to keep
+                 the agent edit panel scannable. -->
+            <!-- Same divider+ordinal layout used on the /mcp-servers page
+                 expanded tool list. Header bar names the row count so the
+                 operator can tell at a glance how many actions a server
+                 actually exposes; hairline dividers + zero-padded indices
+                 break up the otherwise-unstructured wall of names so a
+                 119-tool server (google-workspace) stays scannable. -->
+            <div
+              v-if="expandedMcpServer === row.server && row.actions.length"
+              class="px-4 pb-3 pl-14"
+            >
+              <div class="border border-border">
+                <div class="flex items-center justify-between px-4 py-2 bg-muted/40 border-b border-border">
+                  <span class="text-[11px] uppercase tracking-wider font-medium text-fg-muted">
+                    Actions
+                  </span>
+                  <span class="text-[11px] font-mono tabular-nums text-fg-muted">
+                    {{ row.actions.length }}
+                  </span>
+                </div>
+                <ol class="divide-y divide-border/60">
+                  <li
+                    v-for="(action, idx) in row.actions"
+                    :key="action.name"
+                    class="grid grid-cols-[2.5rem_1fr] items-baseline gap-x-3 px-4 py-2.5 hover:bg-muted/40 transition-colors"
+                  >
+                    <span class="text-xs font-mono tabular-nums text-fg-muted select-none">
+                      {{ String(idx + 1).padStart(3, '0') }}
+                    </span>
+                    <div class="flex flex-col gap-0.5 min-w-0">
+                      <span class="font-mono text-xs text-fg-strong">{{ action.name }}</span>
+                      <span
+                        v-if="action.description"
+                        class="text-xs text-fg-muted leading-relaxed"
+                      >{{ action.description }}</span>
+                    </div>
+                  </li>
+                </ol>
+              </div>
+            </div>
+          </div>
+        </div>
+        <ApiErrorAlert
+          :error="mcpError"
+          class="px-4 py-2.5 border-t border-border"
+        />
+      </div>
+
+      <!-- Standing tool approvals (JCLAW-1062): sits with Tools and MCP Servers
+           because all three answer "what may this agent do". Grants are per-agent,
+           so revoke lives here; Settings carries only a read-only roll-up. -->
+      <AgentToolApprovals :agent-id="editing?.id ?? null" />
+
+      <!-- Workspace editor -->
+      <div
+        v-if="editing"
+        class="bg-surface-elevated border border-border"
+      >
+        <div class="flex items-center justify-between border-b border-border">
+          <div class="flex min-w-0 overflow-x-auto">
+            <button
+              v-for="file in workspaceFiles"
+              :key="file"
+              :class="workspaceTab === file ? 'text-fg-strong border-b border-white' : 'text-fg-muted'"
+              class="px-4 py-2 text-xs font-mono transition-colors"
+              @click="loadWorkspaceFile(editing.id, file)"
+            >
+              {{ file }}
+            </button>
+          </div>
+          <!-- MacDown-style pane toggles: editor, preview, or both (split). At
+               least one stays on, so a pressed-looking button can't be un-toggled
+               into an empty panel. -->
+          <div class="flex items-center gap-1 pr-2 shrink-0">
+            <button
+              type="button"
+              :class="showWorkspaceEditor ? 'text-fg-strong bg-muted' : 'text-fg-muted'"
+              class="p-1.5 rounded hover:text-fg-strong transition-colors"
+              :aria-pressed="showWorkspaceEditor"
+              title="Toggle editor"
+              @click="toggleWorkspaceEditor"
+            >
+              <PencilSquareIcon
+                class="w-4 h-4"
+                aria-hidden="true"
+              />
+              <span class="sr-only">Toggle editor pane</span>
+            </button>
+            <button
+              type="button"
+              :class="showWorkspacePreview ? 'text-fg-strong bg-muted' : 'text-fg-muted'"
+              class="p-1.5 rounded hover:text-fg-strong transition-colors"
+              :aria-pressed="showWorkspacePreview"
+              title="Toggle preview"
+              @click="toggleWorkspacePreview"
+            >
+              <EyeIcon
+                class="w-4 h-4"
+                aria-hidden="true"
+              />
+              <span class="sr-only">Toggle preview pane</span>
+            </button>
+          </div>
+        </div>
+        <!-- Split editor / live-preview body. resize-y on the container grows
+             both panes together, keeping them height-aligned. -->
+        <div class="flex resize-y overflow-hidden h-96 min-h-32">
+          <div
+            v-if="showWorkspaceEditor"
+            class="flex min-w-0"
+            :class="showWorkspacePreview ? 'w-1/2 border-r border-border' : 'w-full'"
+          >
+            <label
+              :for="agentWorkspaceTextareaId"
+              class="flex w-full min-w-0"
+            >
+              <span class="sr-only">Workspace file contents</span>
+              <textarea
+                :id="agentWorkspaceTextareaId"
+                v-model="workspaceContent"
+                class="w-full h-full px-4 py-3 bg-transparent text-sm text-fg-primary font-mono
+                       resize-none focus:outline-hidden"
+              />
+            </label>
+          </div>
+          <div
+            v-if="showWorkspacePreview"
+            class="min-w-0 overflow-auto px-4 py-3"
+            :class="showWorkspaceEditor ? 'w-1/2' : 'w-full'"
+          >
+            <!-- eslint-disable vue/no-v-html -- renderMarkdown output is DOMPurify-sanitized -->
+            <div
+              v-if="workspaceContent"
+              class="md-preview text-sm text-fg-primary"
+              v-html="renderMarkdown(workspaceContent)"
+            />
+            <!-- eslint-enable vue/no-v-html -->
+            <p
+              v-else
+              class="text-sm text-fg-muted italic"
+            >
+              Nothing to preview yet.
+            </p>
+          </div>
+        </div>
+        <div class="px-4 py-2 border-t border-border flex">
+          <button
+            :disabled="!workspaceDirty"
+            class="p-1.5 text-emerald-700 dark:text-emerald-400 hover:text-emerald-600 dark:hover:text-emerald-300 disabled:opacity-40 disabled:hover:text-emerald-700 dark:disabled:hover:text-emerald-400 transition-colors"
+            :title="workspaceDirty ? 'Save file' : 'No changes to save'"
+            @click="saveWorkspaceFile"
+          >
+            <Save
+              class="w-5 h-5"
+              aria-hidden="true"
+            />
+          </button>
+        </div>
+        <ApiErrorAlert
+          :error="workspaceError"
+          class="px-4 pb-2.5"
+        />
+      </div>
+
+      <AgentWorkspaceManager :agent-id="editing?.id ?? null" />
+    </div>
+
+    <!-- System prompt breakdown dialog uses ARIA dialog semantics on a div because the native HTML dialog element has open and close behaviour that conflicts with v-if-driven rendering. Screen readers still announce role dialog with aria-modal true. -->
+    <!-- eslint-disable-next-line vuejs-accessibility/click-events-have-key-events, vuejs-accessibility/no-static-element-interactions -- modal backdrop; Escape is handled globally via document keydown listener -->
+    <div
+      v-if="promptBreakdownOpen"
+      class="fixed inset-0 z-50 flex items-start justify-center bg-black/70 p-6 overflow-y-auto"
+      role="dialog"
+      aria-modal="true"
+      @click.self="closePromptBreakdown()"
+    >
+      <!-- Wider for the two views that put content side by side: the raw/rendered
+           prompt split, and the chart's legend-donut-legend row. Both leave their
+           columns too narrow at 4xl. -->
+      <div
+        class="bg-surface-elevated border border-border w-full my-6 text-fg-primary"
+        :class="promptTextOpen || promptBreakdownView === 'chart' ? 'max-w-6xl' : 'max-w-4xl'"
+      >
+        <div class="px-4 py-3 border-b border-border flex items-center justify-between gap-3">
+          <div class="min-w-0">
+            <h3 class="text-sm font-medium text-fg-strong truncate">
+              System prompt — {{ promptBreakdownAgent?.name }}
+            </h3>
+            <p class="text-xs text-fg-muted truncate">
+              {{ promptBreakdownAgent?.modelProvider }} / {{ promptBreakdownAgent?.modelId }}
+            </p>
+          </div>
+          <div class="flex items-center gap-2 shrink-0">
+            <label
+              for="prompt-breakdown-channel"
+              class="flex items-center gap-1.5 text-xs text-fg-muted"
+            >
+              <span>channel</span>
+              <select
+                id="prompt-breakdown-channel"
+                v-model="promptBreakdownChannel"
+                class="px-2 py-1 bg-muted border border-input text-xs text-fg-strong
+                       focus:outline-hidden focus:border-ring transition-colors"
+                title="Preview the prompt as assembled for a specific channel"
+                @change="loadPromptBreakdown()"
+              >
+                <option value="web">
+                  web
+                </option>
+                <option value="telegram">
+                  telegram
+                </option>
+                <option value="slack">
+                  slack
+                </option>
+                <option value="whatsapp">
+                  whatsapp
+                </option>
+              </select>
+            </label>
+            <div
+              v-if="promptBreakdownData && !promptTextOpen"
+              class="flex border border-input"
+              role="group"
+              aria-label="Breakdown view"
+            >
+              <button
+                v-for="v in (['table', 'chart'] as const)"
+                :key="v"
+                class="px-2 py-1 text-xs capitalize"
+                :class="promptBreakdownView === v
+                  ? 'bg-muted text-fg-strong'
+                  : 'text-fg-muted hover:text-fg-strong'"
+                :aria-pressed="promptBreakdownView === v"
+                @click="promptBreakdownView = v"
+              >
+                {{ v }}
+              </button>
+            </div>
+            <button
+              v-if="promptBreakdownData && !promptTextOpen"
+              class="px-2 py-1 text-xs text-fg-muted border border-input hover:text-fg-strong hover:border-neutral-500"
+              title="Read the full assembled system prompt for this agent"
+              data-testid="view-full-prompt"
+              @click="openPromptText()"
+            >
+              View Full
+            </button>
+            <!-- Raw / rendered pane toggles, mirroring the workspace file editor.
+                 At least one stays on, so neither can be un-toggled into an
+                 empty panel. -->
+            <div
+              v-if="promptTextOpen && promptText"
+              class="flex items-center gap-1"
+            >
+              <button
+                type="button"
+                :class="showPromptRaw ? 'text-fg-strong bg-muted' : 'text-fg-muted'"
+                class="p-1.5 hover:text-fg-strong transition-colors"
+                :aria-pressed="showPromptRaw"
+                title="Toggle raw markdown"
+                data-testid="toggle-prompt-raw"
+                @click="togglePromptRaw()"
+              >
+                <CodeBracketIcon
+                  class="w-4 h-4"
+                  aria-hidden="true"
+                />
+                <span class="sr-only">Toggle raw markdown pane</span>
+              </button>
+              <button
+                type="button"
+                :class="showPromptRendered ? 'text-fg-strong bg-muted' : 'text-fg-muted'"
+                class="p-1.5 hover:text-fg-strong transition-colors"
+                :aria-pressed="showPromptRendered"
+                title="Toggle rendered markdown"
+                data-testid="toggle-prompt-rendered"
+                @click="togglePromptRendered()"
+              >
+                <EyeIcon
+                  class="w-4 h-4"
+                  aria-hidden="true"
+                />
+                <span class="sr-only">Toggle rendered markdown pane</span>
+              </button>
+            </div>
+            <button
+              v-if="promptTextOpen"
+              class="px-2 py-1 text-xs text-fg-muted border border-input hover:text-fg-strong hover:border-neutral-500"
+              @click="closePromptText()"
+            >
+              Back
+            </button>
+            <button
+              v-if="promptTextOpen && promptText"
+              class="px-2 py-1 text-xs text-fg-muted border border-input hover:text-fg-strong hover:border-neutral-500"
+              title="Copy the full system prompt"
+              @click="copyPromptText()"
+            >
+              Copy
+            </button>
+            <button
+              class="p-1 text-fg-muted hover:text-fg-strong"
+              title="Close"
+              @click="closePromptBreakdown()"
+            >
+              <XMarkIcon
+                class="w-4 h-4"
+                aria-hidden="true"
+              />
+            </button>
+          </div>
+        </div>
+
+        <div
+          v-if="promptBreakdownLoading"
+          class="px-4 py-6 text-sm text-fg-muted"
+        >
+          Loading…
+        </div>
+
+        <div
+          v-else-if="promptBreakdownError"
+          class="px-4 py-6 text-sm text-red-700 dark:text-red-400"
+        >
+          {{ promptBreakdownError }}
+        </div>
+
+        <!--
+          Full assembled prompt. Replaces the breakdown body rather than opening a
+          nested dialog — one overlay keeps the Escape handler and focus trap
+          single-owner, and Back returns to the numbers in place.
+        -->
+        <div
+          v-else-if="promptTextOpen"
+          class="px-4 py-4"
+        >
+          <p
+            v-if="promptTextLoading"
+            class="text-sm text-fg-muted"
+          >
+            Loading…
+          </p>
+          <p
+            v-else-if="promptTextError"
+            class="text-sm text-red-700 dark:text-red-400"
+          >
+            {{ promptTextError }}
+          </p>
+          <template v-else>
+            <p class="text-xs text-fg-muted mb-2">
+              The exact system prompt string for
+              <span class="font-mono">{{ promptBreakdownChannel }}</span>, as the model
+              receives it. Tool schemas travel separately and are not part of this text.
+            </p>
+            <!-- Panes scroll independently: the raw string and its rendered form
+                 have very different heights, so a shared scroller would strand
+                 one of them. -->
+            <div class="flex h-[60vh] bg-muted border border-border">
+              <div
+                v-if="showPromptRaw"
+                class="min-w-0 overflow-auto"
+                :class="showPromptRendered ? 'w-1/2 border-r border-border' : 'w-full'"
+              >
+                <pre
+                  class="p-3 text-[11px] leading-relaxed font-mono text-fg-primary whitespace-pre-wrap break-words"
+                  data-testid="full-prompt-text"
+                >{{ promptText }}</pre>
+              </div>
+              <div
+                v-if="showPromptRendered"
+                class="min-w-0 overflow-auto p-3"
+                :class="showPromptRaw ? 'w-1/2' : 'w-full'"
+              >
+                <!-- eslint-disable vue/no-v-html -- renderMarkdown output is DOMPurify-sanitized -->
+                <div
+                  class="md-preview text-[13px] text-fg-primary"
+                  data-testid="full-prompt-rendered"
+                  v-html="promptTextHtml"
+                />
+                <!-- eslint-enable vue/no-v-html -->
+              </div>
+            </div>
+          </template>
+        </div>
+
+        <div
+          v-else-if="promptBreakdownData"
+          class="px-4 py-4 space-y-5"
+        >
+          <!-- Totals strip -->
+          <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
+            <div class="bg-muted border border-border px-3 py-2">
+              <div class="text-[10px] text-fg-muted uppercase tracking-wide">
+                Total chars
+              </div>
+              <div class="text-sm font-mono text-fg-strong">
+                {{ formatChars(promptBreakdownData.totalChars) }}
+              </div>
+              <div class="text-xs text-fg-muted">
+                prompt + tool schemas
+              </div>
+            </div>
+            <div class="bg-muted border border-border px-3 py-2">
+              <div class="text-[10px] text-fg-muted uppercase tracking-wide">
+                ≈ tokens
+              </div>
+              <div class="text-sm font-mono text-amber-700 dark:text-amber-300">
+                {{ formatTokens(promptBreakdownData.totalTokenEstimate) }}
+              </div>
+              <div class="text-xs text-fg-muted">
+                chars/4 heuristic
+              </div>
+            </div>
+            <div
+              class="bg-muted border border-border px-3 py-2"
+              title="Bytes above the core-memory boundary — the fully static segment. It carries its own cache breakpoint, so editing a core memory does not re-prefill it."
+            >
+              <div class="text-[10px] text-fg-muted uppercase tracking-wide">
+                Static prefix
+              </div>
+              <div class="text-sm font-mono text-emerald-700 dark:text-emerald-400">
+                {{ formatChars(promptBreakdownData.staticPrefixChars) }}
+              </div>
+              <div class="text-xs text-fg-muted">
+                ≈ {{ formatTokens(Math.round(promptBreakdownData.staticPrefixChars / 4)) }} tokens
+              </div>
+            </div>
+            <div
+              v-if="promptBreakdownData.coreMemoryChars > 0"
+              class="bg-muted border border-border px-3 py-2"
+              title="Core memories — cached on its own breakpoint, so a memory write re-prefills only this block rather than the static prefix above it"
+            >
+              <div class="text-[10px] text-fg-muted uppercase tracking-wide">
+                Core memories
+              </div>
+              <div class="text-sm font-mono text-amber-700 dark:text-amber-400">
+                {{ formatChars(promptBreakdownData.coreMemoryChars) }}
+              </div>
+              <div class="text-xs text-fg-muted">
+                ≈ {{ formatTokens(Math.round(promptBreakdownData.coreMemoryChars / 4)) }} tokens
+              </div>
+            </div>
+            <div
+              class="bg-muted border border-border px-3 py-2"
+              title="Bytes after the cache boundary — per-turn-variable content (memories) that never hits the cache"
+            >
+              <div class="text-[10px] text-fg-muted uppercase tracking-wide">
+                Variable suffix
+              </div>
+              <div class="text-sm font-mono text-rose-700 dark:text-rose-400">
+                {{ formatChars(promptBreakdownData.variableSuffixChars) }}
+              </div>
+              <div class="text-xs text-fg-muted">
+                ≈ {{ formatTokens(Math.round(promptBreakdownData.variableSuffixChars / 4)) }} tokens
+              </div>
+            </div>
+          </div>
+
+          <!--
+            Chart view: ONE pie over both series. Sections and tool schemas are
+            disjoint halves of the same total, so a single chart is the only one
+            that reads as a composition — two charts invited the reader to treat
+            each as its own 100%. Shares normalise within the merged series
+            (no :total), so the arcs close exactly.
+          -->
+          <div v-if="promptBreakdownView === 'chart'">
+            <h4 class="text-[11px] text-fg-muted uppercase tracking-wide mb-1.5">
+              Prompt sections + tool schemas
+            </h4>
+            <PromptSizeDonut
+              :entries="promptChartEntries"
+              label="Prompt composition"
+            />
+          </div>
+
+          <!-- Sections table -->
+          <div v-else>
+            <h4 class="text-[11px] text-fg-muted uppercase tracking-wide mb-1.5">
+              Prompt sections
+            </h4>
+            <div class="overflow-x-auto">
+              <table
+                class="w-full min-w-[28rem] text-xs font-mono table-fixed"
+              >
+                <colgroup>
+                  <col>
+                  <col class="w-24">
+                  <col class="w-24">
+                  <col class="w-24">
+                </colgroup>
+                <thead class="text-xs text-fg-muted border-b border-border">
+                  <tr>
+                    <th class="text-left py-1 pr-2">
+                      <button
+                        type="button"
+                        class="inline-flex items-center gap-1 whitespace-nowrap hover:text-fg-strong transition-colors"
+                        :class="sectionsSortBy === 'name' ? 'text-fg-strong' : ''"
+                        @click="cycleSectionsSort('name')"
+                      >
+                        Section
+                        <ChevronUpIcon
+                          v-if="sectionsSortBy === 'name' && sectionsSortDir === 'asc'"
+                          class="w-3 h-3"
+                          aria-hidden="true"
+                        />
+                        <ChevronDownIcon
+                          v-else-if="sectionsSortBy === 'name' && sectionsSortDir === 'desc'"
+                          class="w-3 h-3"
+                          aria-hidden="true"
+                        />
+                      </button>
+                    </th>
+                    <th class="text-right py-1 px-2">
+                      <button
+                        type="button"
+                        class="inline-flex items-center gap-1 whitespace-nowrap hover:text-fg-strong transition-colors"
+                        :class="sectionsSortBy === 'chars' ? 'text-fg-strong' : ''"
+                        @click="cycleSectionsSort('chars')"
+                      >
+                        Chars
+                        <ChevronUpIcon
+                          v-if="sectionsSortBy === 'chars' && sectionsSortDir === 'asc'"
+                          class="w-3 h-3"
+                          aria-hidden="true"
+                        />
+                        <ChevronDownIcon
+                          v-else-if="sectionsSortBy === 'chars' && sectionsSortDir === 'desc'"
+                          class="w-3 h-3"
+                          aria-hidden="true"
+                        />
+                      </button>
+                    </th>
+                    <th class="text-right py-1 px-2 whitespace-nowrap">
+                      ≈ Tokens
+                    </th>
+                    <th class="text-right py-1 pl-2 whitespace-nowrap">
+                      % of total
+                    </th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <template
+                    v-for="s in sortedSections"
+                    :key="'section-' + s.name"
+                  >
+                    <tr
+                      class="border-b border-neutral-900/50"
+                      :class="s.name === 'Skills' && promptBreakdownData.skills.length > 0 ? 'cursor-pointer hover:bg-neutral-900/30' : ''"
+                      @click="s.name === 'Skills' && promptBreakdownData.skills.length > 0 ? (skillsExpanded = !skillsExpanded) : null"
+                    >
+                      <td class="py-1 pr-2 text-fg-primary">
+                        {{ s.name }}<ChevronRightIcon
+                          v-if="s.name === 'Skills' && promptBreakdownData.skills.length > 0"
+                          class="inline-block w-2.5 h-2.5 ml-1 align-middle transition-transform"
+                          :class="skillsExpanded ? 'rotate-90' : ''"
+                          aria-hidden="true"
+                        />
+                      </td>
+                      <td class="py-1 px-2 text-right text-fg-muted">
+                        {{ formatChars(s.chars) }}
+                      </td>
+                      <td class="py-1 px-2 text-right text-amber-700 dark:text-amber-300">
+                        {{ formatTokens(s.tokens) }}
+                      </td>
+                      <td class="py-1 pl-2 text-right text-emerald-700 dark:text-emerald-400">
+                        {{ percentOfTotal(s.chars, promptBreakdownData.totalChars) }}
+                      </td>
+                    </tr>
+                    <!-- Inlined skill itemization: indented child rows under
+                       the Skills section row. Chars/tokens are *inside*
+                       the Skills row's totals, not additive — same pattern
+                       as the dashboard's per-model rollup under Total.
+                       The trailing "matching instructions" row absorbs
+                       the prose preamble + <available_skills> wrapper so
+                       all subrows together equal the parent. -->
+                    <tr
+                      v-for="sk in (s.name === 'Skills' && skillsExpanded ? promptBreakdownData.skills : [])"
+                      :key="'skill-' + sk.name"
+                    >
+                      <td class="py-0.5 pr-2 pl-6 text-fg-muted text-[11px]">
+                        <span class="text-fg-muted mr-1">└</span>{{ sk.name }}
+                      </td>
+                      <td class="py-0.5 px-2 text-right text-fg-muted text-[11px]">
+                        {{ formatChars(sk.chars) }}
+                      </td>
+                      <td class="py-0.5 px-2 text-right text-amber-700 dark:text-amber-300 text-[11px]">
+                        {{ formatTokens(sk.tokens) }}
+                      </td>
+                      <td class="py-0.5 pl-2 text-right text-[11px]" />
+                    </tr>
+                    <tr
+                      v-if="s.name === 'Skills' && skillsExpanded && promptBreakdownData.skills.length > 0 && skillsMatchingGap.chars > 0"
+                      class="border-b border-neutral-900/50"
+                    >
+                      <td class="py-0.5 pr-2 pl-6 text-fg-muted text-[11px]">
+                        <span class="text-fg-muted mr-1">└</span>matching instructions
+                      </td>
+                      <td class="py-0.5 px-2 text-right text-fg-muted text-[11px]">
+                        {{ formatChars(skillsMatchingGap.chars) }}
+                      </td>
+                      <td class="py-0.5 px-2 text-right text-amber-700 dark:text-amber-300 text-[11px]">
+                        {{ formatTokens(skillsMatchingGap.tokens) }}
+                      </td>
+                      <td class="py-0.5 pl-2 text-right text-[11px]" />
+                    </tr>
+                  </template>
+                  <tr class="border-t border-border">
+                    <td class="py-1 pr-2 text-fg-primary font-semibold">
+                      Total
+                    </td>
+                    <td class="py-1 px-2 text-right text-fg-primary font-semibold">
+                      {{ formatChars(sectionsAggregate.chars) }}
+                    </td>
+                    <td class="py-1 px-2 text-right text-amber-700 dark:text-amber-300 font-semibold">
+                      {{ formatTokens(sectionsAggregate.tokens) }}
+                    </td>
+                    <td class="py-1 pl-2 text-right text-emerald-700 dark:text-emerald-400 font-semibold">
+                      {{ percentOfTotal(sectionsAggregate.chars, promptBreakdownData.totalChars) }}
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- Tools table -->
+          <div v-if="promptBreakdownView === 'table' && promptBreakdownData.tools.length > 0">
+            <h4 class="text-[11px] text-fg-muted uppercase tracking-wide mb-1.5">
+              Tool schemas ({{ promptBreakdownData.tools.length }})
+            </h4>
+            <p class="text-xs text-fg-muted mb-1">
+              Sent separately as the <code class="text-fg-muted">tools</code> array, not part of the prompt string, but counted as input tokens by every provider.
+            </p>
+            <div class="overflow-x-auto">
+              <table
+                class="w-full min-w-[28rem] text-xs font-mono table-fixed"
+              >
+                <colgroup>
+                  <col>
+                  <col class="w-24">
+                  <col class="w-24">
+                  <col class="w-24">
+                </colgroup>
+                <thead class="text-xs text-fg-muted border-b border-border">
+                  <tr>
+                    <th class="text-left py-1 pr-2">
+                      <button
+                        type="button"
+                        class="inline-flex items-center gap-1 whitespace-nowrap hover:text-fg-strong transition-colors"
+                        :class="toolsSortBy === 'name' ? 'text-fg-strong' : ''"
+                        @click="cycleToolsSort('name')"
+                      >
+                        Tool
+                        <ChevronUpIcon
+                          v-if="toolsSortBy === 'name' && toolsSortDir === 'asc'"
+                          class="w-3 h-3"
+                          aria-hidden="true"
+                        />
+                        <ChevronDownIcon
+                          v-else-if="toolsSortBy === 'name' && toolsSortDir === 'desc'"
+                          class="w-3 h-3"
+                          aria-hidden="true"
+                        />
+                      </button>
+                    </th>
+                    <th class="text-right py-1 px-2">
+                      <button
+                        type="button"
+                        class="inline-flex items-center gap-1 whitespace-nowrap hover:text-fg-strong transition-colors"
+                        :class="toolsSortBy === 'chars' ? 'text-fg-strong' : ''"
+                        @click="cycleToolsSort('chars')"
+                      >
+                        Chars
+                        <ChevronUpIcon
+                          v-if="toolsSortBy === 'chars' && toolsSortDir === 'asc'"
+                          class="w-3 h-3"
+                          aria-hidden="true"
+                        />
+                        <ChevronDownIcon
+                          v-else-if="toolsSortBy === 'chars' && toolsSortDir === 'desc'"
+                          class="w-3 h-3"
+                          aria-hidden="true"
+                        />
+                      </button>
+                    </th>
+                    <th class="text-right py-1 px-2 whitespace-nowrap">
+                      ≈ Tokens
+                    </th>
+                    <th class="text-right py-1 pl-2 whitespace-nowrap">
+                      % of total
+                    </th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr
+                    v-for="t in sortedTools"
+                    :key="'tool-' + t.name"
+                    class="border-b border-neutral-900/50"
+                  >
+                    <td class="py-1 pr-2 text-fg-primary">
+                      {{ t.name }}
+                    </td>
+                    <td class="py-1 px-2 text-right text-fg-muted">
+                      {{ formatChars(t.chars) }}
+                    </td>
+                    <td class="py-1 px-2 text-right text-amber-700 dark:text-amber-300">
+                      {{ formatTokens(t.tokens) }}
+                    </td>
+                    <td class="py-1 pl-2 text-right text-emerald-700 dark:text-emerald-400">
+                      {{ percentOfTotal(t.chars, promptBreakdownData.totalChars) }}
+                    </td>
+                  </tr>
+                  <tr class="border-t border-border">
+                    <td class="py-1 pr-2 text-fg-primary font-semibold">
+                      Total
+                    </td>
+                    <td class="py-1 px-2 text-right text-fg-primary font-semibold">
+                      {{ formatChars(toolSchemasAggregate.chars) }}
+                    </td>
+                    <td class="py-1 px-2 text-right text-amber-700 dark:text-amber-300 font-semibold">
+                      {{ formatTokens(toolSchemasAggregate.tokens) }}
+                    </td>
+                    <td class="py-1 pl-2 text-right text-emerald-700 dark:text-emerald-400 font-semibold">
+                      {{ percentOfTotal(toolSchemasAggregate.chars, promptBreakdownData.totalChars) }}
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</template>
+
+<style>
+/*
+ * Typographic styles for the workspace markdown live-preview pane.
+ *
+ * Plain CSS against the design-token CSS variables (not Tailwind @apply, which
+ * the scoped-style flow can't see in Tailwind 4). Mirrors the per-surface prose
+ * convention used by pages/chat.vue (.prose-chat) and GuideRenderer
+ * (.guide-section): each markdown surface owns a namespaced block so styles
+ * don't leak. Because --fg-* / --border / --muted are redefined under `.dark`,
+ * the token references below flip for dark mode automatically — no mirrored
+ * `html.dark` overrides needed.
+ */
+.md-preview { overflow-wrap: anywhere; }
+.md-preview > :first-child { margin-top: 0; }
+.md-preview > :last-child { margin-bottom: 0; }
+
+.md-preview p { margin: 0.5em 0; line-height: 1.6; }
+
+.md-preview h1, .md-preview h2, .md-preview h3, .md-preview h4 {
+  font-weight: 600;
+  color: var(--fg-strong);
+  margin: 1em 0 0.5em;
+}
+.md-preview h1 { font-size: 1.25em; }
+.md-preview h2 { font-size: 1.1em; }
+.md-preview h3 { font-size: 1em; }
+.md-preview h4 { font-size: 0.9em; }
+
+.md-preview ul, .md-preview ol { margin: 0.5em 0; padding-left: 1.5em; }
+.md-preview ul { list-style: disc; }
+.md-preview ol { list-style: decimal; }
+.md-preview li { margin: 0.25em 0; line-height: 1.6; }
+
+.md-preview strong { color: var(--fg-strong); font-weight: 600; }
+.md-preview em { font-style: italic; }
+
+/* --ok (27% L), not emerald at 30%: that measured 4.09:1 on the card, under AA. */
+.md-preview a { color: var(--ok); text-decoration: underline; }
+html.dark .md-preview a { color: hsl(152 76% 60%); }
+
+.md-preview code {
+  font-family: ui-monospace, monospace;
+  font-size: max(0.85em, 0.75rem);
+  padding: 0.15em 0.4em;
+  border-radius: 0.25rem;
+  background: var(--muted);
+}
+
+.md-preview pre {
+  margin: 0.5em 0;
+  padding: 0.75em 1em;
+  overflow-x: auto;
+  border-radius: 0.25rem;
+  background: var(--muted);
+  border: 1px solid var(--border);
+}
+.md-preview pre code { background: none; padding: 0; font-size: max(0.85em, 0.75rem); }
+
+.md-preview blockquote {
+  margin: 0.5em 0;
+  padding-left: 0.75em;
+  border-left: 2px solid var(--border);
+  color: var(--fg-muted);
+}
+
+.md-preview hr { border: none; border-top: 1px solid var(--border); margin: 0.75em 0; }
+
+.md-preview img { max-width: 100%; height: auto; border-radius: 0.4em; margin: 0.5em 0; }
+
+.md-preview table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 0.5em 0;
+  font-size: 0.95em;
+}
+
+.md-preview th, .md-preview td {
+  padding: 0.4em 0.75em;
+  text-align: left;
+  vertical-align: top;
+  border-bottom: 1px solid var(--border);
+  overflow-wrap: break-word;
+}
+.md-preview th { color: var(--fg-strong); font-weight: 600; }
+</style>

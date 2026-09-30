@@ -1,0 +1,294 @@
+package tools;
+
+import agents.GeneratedAttachment;
+import agents.ToolAction;
+import agents.ToolContext;
+import agents.ToolRegistry;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+import models.Agent;
+import models.MessageAttachment;
+import org.jspecify.annotations.Nullable;
+import services.AttachmentService;
+import services.ConfigService;
+import services.Tx;
+import services.imagegen.ImageGenerationException;
+import services.imagegen.ImageGenerationRouter;
+import services.imagegen.ImageGenerationService;
+import services.imagegen.ReplicateImageModelCatalog;
+import utils.JsonArgs;
+
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+
+/**
+ * {@code generate_image} (JCLAW-228): generate an image from a text prompt via the configured
+ * {@code services.imagegen.ImageGenerationService} (Settings → Image Generation). The produced bytes
+ * ride back on the {@link ToolRegistry.ToolResult}; the tool-call commit path
+ * ({@code agents.ParallelToolExecutor}) inlines them on the assistant turn that called the tool as a
+ * {@code generated=true} {@code MessageAttachment} (JCLAW-227), so the user sees the image in chat the
+ * same way an uploaded one renders.
+ *
+ * <p>Default-OFF per agent ({@code ToolRegistry.computeDisabledTools}) — image generation can cost
+ * money / hit rate limits, so an operator opts each agent in via the agent editor.
+ */
+public class GenerateImageTool implements ToolRegistry.Tool {
+
+    private static final String ARG_PROMPT = "prompt";
+    private static final String ARG_WIDTH = "width";
+    private static final String ARG_HEIGHT = "height";
+    private static final String ARG_ASPECT = "aspect_ratio";
+    private static final String ARG_USE_REFERENCE = "use_reference_image";
+    private static final String ARG_SAVE_TO = "save_to";
+    private static final String ARG_MODEL = "model";
+
+    /** The only backend whose model can be chosen per call: the one with a catalog to check it against. */
+    private static final String REPLICATE = "replicate";
+
+    @Override public String name() { return "generate_image"; }
+    @Override public String category() { return "Utilities"; }
+    @Override public String icon() { return "image"; }
+
+    @Override
+    public List<ToolAction> actions() {
+        return List.of(new ToolAction("generate",
+                "Produce an image from a text prompt via the configured backend and show it inline"));
+    }
+
+    @Override
+    public String description() {
+        return """
+                Generate an image from a text prompt and show it to the user inline. Provide a \
+                detailed 'prompt'. Optionally set 'width' and 'height' in pixels, or an 'aspect_ratio' \
+                (1:1, 16:9, 9:16) used when width/height are omitted. To restyle or match the look of \
+                an image the user uploaded in this conversation, set 'use_reference_image' true \
+                (image-to-image style transfer / visual consistency); the most recently uploaded \
+                image is used as the reference. The image is produced by the operator-configured \
+                backend (OpenAI gpt-image-1, Black Forest Labs Flux, Replicate, or a self-hosted \
+                engine) and shown to the user as part of your reply. On the Replicate backend, \
+                'model' picks the model for this one image.""";
+    }
+
+    @Override
+    public String summary() {
+        return "Generate an image from a text prompt and show it to the user inline.";
+    }
+
+    @Override
+    public Map<String, Object> parameters() {
+        return Map.of(
+                SchemaKeys.TYPE, SchemaKeys.OBJECT,
+                SchemaKeys.PROPERTIES, Map.of(
+                        ARG_PROMPT, Map.of(SchemaKeys.TYPE, SchemaKeys.STRING,
+                                SchemaKeys.DESCRIPTION, "A detailed description of the image to generate."),
+                        ARG_WIDTH, Map.of(SchemaKeys.TYPE, SchemaKeys.INTEGER,
+                                SchemaKeys.DESCRIPTION, "Optional width in pixels."),
+                        ARG_HEIGHT, Map.of(SchemaKeys.TYPE, SchemaKeys.INTEGER,
+                                SchemaKeys.DESCRIPTION, "Optional height in pixels."),
+                        ARG_ASPECT, Map.of(SchemaKeys.TYPE, SchemaKeys.STRING,
+                                SchemaKeys.ENUM, List.of("1:1", "16:9", "9:16"),
+                                SchemaKeys.DESCRIPTION, "Optional aspect ratio, used when width/height are omitted."),
+                        ARG_USE_REFERENCE, Map.of(SchemaKeys.TYPE, SchemaKeys.BOOLEAN,
+                                SchemaKeys.DESCRIPTION, "When true, use the most recent image the user uploaded in this "
+                                        + "conversation as a reference for style transfer / visual consistency "
+                                        + "(image-to-image). Defaults to false (text-to-image)."),
+                        ARG_SAVE_TO, Map.of(SchemaKeys.TYPE, SchemaKeys.STRING,
+                                SchemaKeys.DESCRIPTION, "Optional filename, relative to your workspace, to also write "
+                                        + "the image to (e.g. \"tea.png\"). Use this whenever you need the file "
+                                        + "afterwards — to attach it, send it, or pass it to a command. Without it "
+                                        + "the image is only shown inline and NO file exists on disk; do not go "
+                                        + "looking for one."),
+                        ARG_MODEL, Map.of(SchemaKeys.TYPE, SchemaKeys.STRING,
+                                SchemaKeys.DESCRIPTION, "Optional model for this image only, as a Replicate owner/name "
+                                        + "slug (e.g. \"black-forest-labs/flux-kontext-pro\"). Works only when the image "
+                                        + "backend is Replicate, and only for a model in its catalog: an unknown one is "
+                                        + "refused with the list of available models. Omit it to use the configured model; "
+                                        + "choosing one here does not change that setting.")
+                ),
+                SchemaKeys.REQUIRED, List.of(ARG_PROMPT)
+        );
+    }
+
+    /** One outbound (possibly long-polling) generation per call; keep sequential within a round. */
+    @Override public boolean parallelSafe() { return false; }
+
+    @Override
+    public String execute(String argsJson, Agent agent) {
+        // execute() is the text-only fallback; the dispatcher uses executeRich() (which also carries
+        // the produced image). Delegating keeps a single code path.
+        return executeRich(argsJson, agent).text();
+    }
+
+    @Override
+    public ToolRegistry.ToolResult executeRich(String argsJson, Agent agent) {
+        JsonObject args;
+        try {
+            args = JsonParser.parseString(argsJson).getAsJsonObject();
+        } catch (RuntimeException _) {
+            return ToolRegistry.ToolResult.text("Error: invalid arguments for generate_image.");
+        }
+        var prompt = JsonArgs.optString(args, ARG_PROMPT);
+        if (prompt == null || prompt.isBlank()) {
+            return ToolRegistry.ToolResult.text("Error: 'prompt' is required.");
+        }
+
+        var serviceOpt = ImageGenerationRouter.configuredService();
+        if (serviceOpt.isEmpty()) {
+            return ToolRegistry.ToolResult.text(
+                    "Image generation is not configured. Ask the operator to enable a provider in "
+                            + "Settings → Image Generation.");
+        }
+
+        var requestedModel = JsonArgs.optString(args, ARG_MODEL);
+        var model = requestedModel == null || requestedModel.isBlank() ? null : requestedModel.trim();
+        if (model != null) {
+            var refusal = modelRefusal(model);
+            if (refusal != null) return ToolRegistry.ToolResult.text(refusal);
+        }
+
+        // JCLAW-694: optional image-to-image reference. When the model asks to reuse the user's
+        // uploaded image, resolve the most recent non-generated image in this conversation to raw
+        // bytes. Backends that don't yet support references degrade to text-to-image (the default
+        // ImageGenerationService.generate override ignores it).
+        ImageGenerationService.ReferenceImage reference;
+        try {
+            reference = resolveReferenceImage(args);
+        } catch (ReferenceUnavailable e) {
+            return ToolRegistry.ToolResult.text(e.getMessage());
+        }
+
+        var dims = resolveDimensions(args);
+        try {
+            // Null unless modelRefusal admitted a Replicate slug: each client otherwise resolves its
+            // own provider-scoped key, because one shared key once sent a Replicate slug to OpenAI.
+            var image = serviceOpt.get().generate(prompt, model, dims[0], dims[1], reference);
+            var metadata = buildMetadata(prompt, image.generatedBy(), dims[0], dims[1]);
+
+            // Optional workspace copy, for callers that need the file afterwards — a
+            // scheduled task has no chat surface to render the inline attachment into.
+            String savedPath = null;
+            var saveTo = JsonArgs.optString(args, ARG_SAVE_TO);
+            if (saveTo != null && !saveTo.isBlank()) {
+                try {
+                    savedPath = GeneratedMediaFile.write(agent, saveTo.trim(), image.bytes());
+                } catch (IllegalArgumentException e) {
+                    // Report rather than proceed. Silently returning the inline-only text
+                    // is what leaves a caller hunting the filesystem for a file that was
+                    // never written.
+                    return ToolRegistry.ToolResult.text(
+                            "Image generated, but saving it failed: " + e.getMessage());
+                }
+            }
+            // The image is delivered out-of-band (raw bytes -> generated attachment, rendered inline by
+            // the chat UI); the model never receives its URL. Say so explicitly: a model that
+            // "helpfully" re-embeds the image with markdown/HTML has to invent a URL, which resolves to
+            // nothing and renders as a broken-image link in the reply. Telling it the image is already
+            // shown removes the incentive to embed.
+            var text = "Image generated and displayed to the user inline. It is already shown — do not "
+                    + "re-embed or link it in your reply (no markdown image syntax, no HTML <img> tag); "
+                    + "just acknowledge or describe it in words.";
+            if (savedPath != null) {
+                // State the path explicitly: this is the only thing that stops a caller
+                // that needs a file from guessing at one.
+                text += " Also saved to " + savedPath + " — use exactly that path; no other "
+                        + "copy of this image exists on disk.";
+            }
+            return ToolRegistry.ToolResult.withImage(text, null,
+                    new GeneratedAttachment(image.bytes(), image.mimeType(), metadata));
+        } catch (ImageGenerationException e) {
+            return ToolRegistry.ToolResult.text("Image generation failed: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Why a per-call {@code model} cannot be used, or null when it can. It must name a model in the
+     * Replicate catalog while Replicate is the backend: a slug reaching another provider fails there,
+     * and one outside the catalog would run a Replicate model the operator never offered.
+     */
+    private static @Nullable String modelRefusal(String model) {
+        var provider = ConfigService.get("imagegen.provider");
+        if (!REPLICATE.equals(provider)) {
+            return "Error: 'model' can only be chosen on the Replicate image backend, and this instance uses '"
+                    + provider + "'. Omit 'model' to use the configured model.";
+        }
+        var slugs = ReplicateImageModelCatalog.availableModels().stream()
+                .map(ReplicateImageModelCatalog.ImageModel::slug).toList();
+        if (slugs.isEmpty()) {
+            return "Error: the Replicate model list is unavailable, so 'model' cannot be checked. "
+                    + "Omit 'model' to use the configured model.";
+        }
+        if (!slugs.contains(model)) {
+            return "Error: '" + model + "' is not an available Replicate image model. Choose one of: "
+                    + String.join(", ", slugs) + ". Or omit 'model' to use the configured model.";
+        }
+        return null;
+    }
+
+    /** Signals that the model requested a reference image but none is usable — surfaced to the
+     *  agent as a tool-visible message so it can ask the user to attach one. */
+    private static final class ReferenceUnavailable extends RuntimeException {
+        ReferenceUnavailable(String message) { super(message); }
+
+        /** The only constructor always supplies a message, so this narrows Throwable's @Nullable. */
+        @Override
+        public String getMessage() {
+            return Objects.requireNonNull(super.getMessage());
+        }
+    }
+
+    /**
+     * JCLAW-694: resolve the image-to-image reference when {@code use_reference_image} is set.
+     * Returns null (text-to-image) when the flag is absent/false. Uses the current conversation
+     * (via {@link ToolContext}) to find the most recent uploaded image and reads its bytes.
+     */
+    private static ImageGenerationService.@Nullable ReferenceImage resolveReferenceImage(JsonObject args) {
+        if (!JsonArgs.optBool(args, ARG_USE_REFERENCE)) return null;
+        var conversationId = ToolContext.conversationId();
+        // Tools execute on the dispatcher's virtual threads with no ambient EntityManager, so the
+        // attachment lookup + byte read must open their own JPA transaction (JCLAW-694). Returns
+        // null when there's no usable upload; the caller turns that into a tool-visible message.
+        var reference = Tx.run(() -> {
+            var attachment = MessageAttachment.findLatestUploadedImage(conversationId);
+            if (attachment == null) return null;
+            return new ImageGenerationService.ReferenceImage(
+                    AttachmentService.readBytes(attachment), attachment.mimeType);
+        });
+        if (reference == null) {
+            throw new ReferenceUnavailable(
+                    "No uploaded image found in this conversation to use as a reference. Ask the user "
+                            + "to attach an image, or generate without a reference (set use_reference_image false).");
+        }
+        return reference;
+    }
+
+    /** {width, height} from explicit pixels or an aspect ratio; nulls mean "provider default". */
+    private static Integer[] resolveDimensions(JsonObject args) {
+        Integer width = JsonArgs.optInteger(args, ARG_WIDTH);
+        Integer height = JsonArgs.optInteger(args, ARG_HEIGHT);
+        if (width != null && height != null) return new Integer[]{width, height};
+        var aspect = JsonArgs.optString(args, ARG_ASPECT);
+        if (aspect != null) {
+            // True ratios at a Flux-safe scale (each side a multiple of 16; long side 1536). Providers
+            // that take raw pixels (local Flux, BFL) render these exactly; Replicate maps them back to its
+            // own aspect_ratio label; OpenAI's gpt-image-1 snaps landscape/portrait to its fixed
+            // 1536x1024 / 1024x1536 (a 3:2 it can't avoid). The chip shows whatever actually came back.
+            return switch (aspect) {
+                case "16:9" -> new Integer[]{1536, 864}; // 1536/864 = 16/9 exactly
+                case "9:16" -> new Integer[]{864, 1536};
+                case "1:1" -> new Integer[]{1024, 1024};
+                default -> new Integer[]{width, height};
+            };
+        }
+        return new Integer[]{width, height};
+    }
+
+    private static String buildMetadata(String prompt, String generatedBy, Integer width, Integer height) {
+        var meta = new JsonObject();
+        meta.addProperty(ARG_PROMPT, prompt);
+        meta.addProperty("generatedBy", generatedBy);
+        if (width != null) meta.addProperty(ARG_WIDTH, width);
+        if (height != null) meta.addProperty(ARG_HEIGHT, height);
+        return meta.toString();
+    }
+}

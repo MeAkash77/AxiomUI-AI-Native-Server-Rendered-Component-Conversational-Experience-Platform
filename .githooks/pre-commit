@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+# Pre-commit hook: run frontend linters on staged files only via lint-staged.
+# Keeps the full test suites (backend + frontend) in pre-push — this hook must
+# stay fast (< 5 s typical) so rapid commits aren't disrupted.
+#
+# Enable once per clone:  git config core.hooksPath .githooks
+# Bypass for a single commit (use sparingly):  git commit --no-verify ...
+#
+# What runs: eslint --fix on staged *.{ts,js,vue,mjs}, stylelint --fix on
+# staged *.{css,vue}. Both fixers re-stage their own output, so formatting
+# drift auto-heals without manual re-stages. Non-frontend changes (app/**,
+# conf/**, test/**, etc.) don't match any glob and pass through instantly.
+#
+# What does NOT run: vue-tsc (can't run per-file cleanly), pnpm audit (not a
+# per-file check), test suites (already in pre-push).
+
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+FRONTEND_DIR="$REPO_ROOT/frontend"
+
+# pnpm package-manager integrity guard. Refuse commits that pin pnpm in
+# frontend/package.json while frontend/pnpm-lock.yaml carries no record of the
+# package manager itself.
+#
+# This used to check for a +sha512-... suffix on the pin, which is what corepack
+# verified tarballs against. pnpm 12 ignores that suffix entirely (measured) and
+# records its own per-platform releases in the lockfile instead, refusing to run
+# one whose bytes do not match a published, signed npm release. The lockfile
+# block is therefore the thing whose absence silently disables the gate, so it
+# is the thing to guard.
+#
+# Reads staged blobs via `git show :` — for a path that is not staged that
+# returns the index copy, i.e. HEAD's content, so a package.json-only commit is
+# still checked against the lockfile that will be in the tree.
+if git diff --cached --name-only --diff-filter=ACMR | grep -qx 'frontend/package.json'; then
+    staged_pin=$(git show ':frontend/package.json' \
+        | sed -n 's/.*"packageManager": *"\([^"]*\)".*/\1/p' | head -1)
+    if [[ -n "$staged_pin" ]]; then
+        # grep -c, not grep -q: this file runs under `set -o pipefail`, and
+        # `grep -q` closes the pipe on its first match, so `git show` dies of
+        # SIGPIPE and the pipeline reports failure on the SUCCESS path — which
+        # would block every commit that touches frontend/package.json.
+        lock_pm_records=$(git show ':frontend/pnpm-lock.yaml' 2>/dev/null \
+            | grep -c 'packageManagerDependencies:' || true)
+        if [[ "${lock_pm_records:-0}" -eq 0 ]]; then
+            echo "[jclaw pre-commit] frontend/package.json pins ${staged_pin} but frontend/pnpm-lock.yaml" >&2
+            echo "[jclaw pre-commit] records no packageManagerDependencies block." >&2
+            echo "[jclaw pre-commit] That block is what pnpm verifies its own binary against; without it" >&2
+            echo "[jclaw pre-commit] the package manager is unverified — refusing the commit." >&2
+            echo "" >&2
+            echo "[jclaw pre-commit] Fix with:" >&2
+            echo "[jclaw pre-commit]   cd frontend && pnpm install" >&2
+            echo "[jclaw pre-commit] then stage frontend/pnpm-lock.yaml and re-commit." >&2
+            exit 1
+        fi
+    fi
+fi
+
+# Heads-up check for newly-added files that an ignore layer would silently
+# strip from a downstream artifact. Catches the class of bug where a new
+# file at the repo root (e.g. .play-version) is covered by .distignore or
+# .dockerignore but is actually load-bearing for the dist tarball or the
+# Docker image. Informational only — most directory-rule matches (app/,
+# test/, frontend/) are intentional, so a hard block would just train you
+# to reach for --no-verify. .gitignore exclusion isn't checkable here:
+# ignored files never enter the index, so there's nothing for a pre-commit
+# hook to inspect for that layer.
+# bash 3.2-compatible array build — `mapfile` is bash 4+ and macOS ships
+# 3.2 by default, so this hook (which is shared across the team) avoids
+# the 4+ builtin to keep everyone's commits working.
+added_files=()
+while IFS= read -r line; do
+    added_files+=("$line")
+done < <(git diff --cached --name-only --diff-filter=A)
+if (( ${#added_files[@]} > 0 )); then
+    declare -a ignore_matches=()
+    for layer in ".distignore:playBundle" ".dockerignore:docker build"; do
+        ignore_file="${layer%%:*}"
+        artifact="${layer##*:}"
+        [[ -f "$REPO_ROOT/$ignore_file" ]] || continue
+        # git ls-files --cached --exclude-from=FILE --ignored applies
+        # gitignore-syntax patterns from FILE against the index. Restricting
+        # to just-added paths via the trailing pathspec keeps the output
+        # focused on this commit instead of scanning the whole tree.
+        while IFS= read -r match; do
+            [[ -n "$match" ]] && ignore_matches+=("${match}|${ignore_file}|${artifact}")
+        done < <(git ls-files --cached --exclude-from="$REPO_ROOT/$ignore_file" --ignored -- "${added_files[@]}")
+    done
+    if (( ${#ignore_matches[@]} > 0 )); then
+        echo "[jclaw pre-commit] Heads up — these newly-added files match an ignore rule" >&2
+        echo "[jclaw pre-commit] and will NOT ship in the corresponding artifact:" >&2
+        for m in "${ignore_matches[@]}"; do
+            f="${m%%|*}"; rest="${m#*|}"; igf="${rest%%|*}"; art="${rest##*|}"
+            printf '[jclaw pre-commit]   %-40s (%s — excluded from %s)\n' "$f" "$igf" "$art" >&2
+        done
+        echo "[jclaw pre-commit] If any are runtime-required (read by build.gradle.kts," >&2
+        echo "[jclaw pre-commit] application.conf, ./jclaw.sh, etc.), drop the matching" >&2
+        echo "[jclaw pre-commit] line from $igf. Otherwise this is intentional — proceed." >&2
+    fi
+fi
+
+# Skip when lint-staged isn't installed (e.g. a fresh clone before
+# `pnpm install` runs in frontend/). Fail open rather than blocking commits.
+if [[ ! -x "$FRONTEND_DIR/node_modules/.bin/lint-staged" ]]; then
+    echo "[jclaw pre-commit] lint-staged not installed yet — skipping." >&2
+    echo "[jclaw pre-commit] Run 'cd frontend && pnpm install' to enable this hook." >&2
+    exit 0
+fi
+
+# Short-circuit when nothing under frontend/ is staged — avoid the lint-staged
+# startup cost (~500 ms) when a commit only touches backend files.
+if ! git diff --cached --name-only --diff-filter=ACMR | grep -qE '^frontend/'; then
+    exit 0
+fi
+
+cd "$FRONTEND_DIR"
+
+# pnpm's installer appends its PATH export to a shell rc that a GUI git client
+# or a non-login shell never sources, so probe its install locations (the same
+# list as ./jclaw.sh's locate_pnpm) before concluding it is absent. Absent,
+# fail open like the lint-staged check above rather than blocking the commit.
+if ! command -v pnpm >/dev/null 2>&1; then
+    for candidate in \
+        "${PNPM_HOME:-}/bin/pnpm" \
+        "${PNPM_HOME:-}/pnpm" \
+        "$HOME/Library/pnpm/bin/pnpm" \
+        "$HOME/.local/share/pnpm/bin/pnpm" \
+        "$HOME/.local/share/pnpm/pnpm"
+    do
+        [[ -n "$candidate" && -x "$candidate" ]] || continue
+        export PATH="$(dirname "$candidate"):$PATH"
+        break
+    done
+fi
+if ! command -v pnpm >/dev/null 2>&1; then
+    echo "[jclaw pre-commit] pnpm not found — skipping lint-staged." >&2
+    echo "[jclaw pre-commit] Install it with: curl -fsSL https://get.pnpm.io/install.sh | sh -" >&2
+    exit 0
+fi
+exec pnpm exec lint-staged

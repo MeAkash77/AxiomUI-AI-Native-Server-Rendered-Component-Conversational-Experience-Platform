@@ -1,0 +1,1610 @@
+package llm;
+
+import agents.SystemPromptAssembler;
+import com.google.gson.FieldNamingPolicy;
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+import llm.LlmFailureClassifier.CallSite;
+import llm.LlmTypes.ChatCompletionChunk;
+import llm.LlmTypes.ChatMessage;
+import llm.LlmTypes.ChatRequest;
+import llm.LlmTypes.ChatResponse;
+import llm.LlmTypes.Choice;
+import llm.LlmTypes.ChunkChoice;
+import llm.LlmTypes.ChunkDelta;
+import llm.LlmTypes.EmbeddingRequest;
+import llm.LlmTypes.EmbeddingResponse;
+import llm.LlmTypes.FunctionCall;
+import llm.LlmTypes.ModelInfo;
+import llm.LlmTypes.ProviderConfig;
+import llm.LlmTypes.ProviderMetrics;
+import llm.LlmTypes.ToolCall;
+import llm.LlmTypes.ToolDef;
+import llm.LlmTypes.Usage;
+import llm.ToolCallChunkMerger.ToolCallBuilder;
+import llm.routing.SubscriptionUsage;
+import models.Agent;
+import models.MessageRole;
+import org.jspecify.annotations.Nullable;
+import services.EventLogger;
+import services.telemetry.GenAiSpans;
+import utils.HttpKeys;
+import utils.LatencyTrace;
+import utils.LlmErrorTemplates;
+import utils.LlmErrorTemplates.Remedy;
+import utils.PlayConfig;
+import utils.Strings;
+
+import java.io.IOException;
+import java.net.URI;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
+import java.util.function.Function;
+
+/**
+ * Abstract base for LLM provider integrations. Implements shared OpenAI-compatible
+ * HTTP, retry, streaming, and serialization logic. Subclasses override template methods
+ * to handle provider-specific differences (reasoning params, response parsing, etc.).
+ *
+ * <p>Outbound HTTP runs through {@link OkHttpLlmHttpDriver} (OkHttp 5.x +
+ * {@code okhttp-sse} for streaming). The previous JDK alternative and the
+ * {@code play.llm.client} flag that toggled between them were deleted in
+ * JCLAW-187 once cloud benchmarks confirmed parity (median 0.94x avg
+ * across 7 cloud runs, 0.85x local with NUM_PARALLEL=8). Validation for
+ * the streaming SSE path lives in {@code test/ChatStreamSseTest}.
+ */
+public abstract sealed class LlmProvider implements LlmStreamCarriers
+        permits OpenAiProvider, OllamaProvider, OpenRouterProvider, TogetherAiProvider {
+
+    protected static final Gson gson = new GsonBuilder()
+            .setFieldNamingPolicy(FieldNamingPolicy.LOWER_CASE_WITH_UNDERSCORES)
+            .create();
+
+    private static final int MAX_RETRIES = 3;
+    private static final long[] BACKOFF_MS = {1000, 2000, 4000};
+    // Upper bound on a server-supplied Retry-After. The header is
+    // externally controlled, so a hostile or misconfigured upstream can park
+    // the calling (virtual) thread for an unbounded interval — cap it so a
+    // rogue value can't wedge a request for minutes.
+    private static final long RETRY_AFTER_MAX_SECONDS = 60;
+
+    // OpenAI-compatible JSON field names used across request/response (de)serialization
+    // and chunk-usage augmentation. Centralized so a typo can't drift one call site
+    // off the wire shape without the compiler catching it.
+    private static final String JSON_USAGE = "usage";
+    private static final String JSON_MODEL = "model";
+    private static final String JSON_MESSAGES = "messages";
+    private static final String JSON_CONTENT = "content";
+    private static final String JSON_ROLE = "role";
+    private static final String JSON_TOOL_CALLS = "tool_calls";
+    private static final String JSON_TOOL_CALL_ID = "tool_call_id";
+    private static final String JSON_FINISH_REASON = "finish_reason";
+    private static final String JSON_PROMPT_TOKENS_DETAILS = "prompt_tokens_details";
+    private static final String JSON_COMPLETION_TOKENS_DETAILS = "completion_tokens_details";
+    // OpenAI tool-call type — the only value the spec defines today.
+    private static final String TYPE_FUNCTION = "function";
+
+    // Why: park retry waits on a platform-thread scheduler so a burst of 429s doesn't
+    // wedge the LLM virtual-thread dispatcher under JDK-8373224 (Thread.sleep on many
+    // concurrent VTs starves the FJP work queue and inflates tail latency).
+    private static final ScheduledExecutorService RETRY_SCHEDULER =
+            Executors.newSingleThreadScheduledExecutor(r -> {
+                var t = new Thread(r, "llm-retry-scheduler");
+                t.setDaemon(true);
+                return t;
+            });
+
+    protected final ProviderConfig config;
+
+    /**
+     * Declarative mapping from provider-name substring to constructor.
+     * Adding a new provider is a single-line entry in {@link FactoryHolder}.
+     *
+     * <p>Held in a nested class (initialization-on-demand idiom) so the
+     * subclass-constructor references don't fire during {@link LlmProvider}'s
+     * own class initialization — which Sonar flags as S2390 ("Classes should
+     * not access their own subclasses during class initialization") and the
+     * JVM is technically free to order in ways that produce surprising NPEs.
+     * {@code FactoryHolder} only loads when {@link #forConfig} first reads
+     * its {@code MAP}, by which time {@link LlmProvider} is fully initialized.
+     */
+    private static final class FactoryHolder {
+        static final Map<String, Function<ProviderConfig, LlmProvider>> MAP = Map.of(
+                "openrouter", OpenRouterProvider::new,
+                "ollama", OllamaProvider::new,
+                "together", TogetherAiProvider::new,
+                "openai", OpenAiProvider::new
+        );
+
+        private FactoryHolder() {}
+    }
+
+    protected LlmProvider(ProviderConfig config) {
+        this.config = config;
+    }
+
+    public ProviderConfig config() { return config; }
+
+    private final ChatWire openAiWire = new OpenAiWire();
+
+    /**
+     * The wire protocol {@code request} travels by (JCLAW-1158): OpenAI-compatible chat
+     * completions over SSE unless a provider overrides this. A request on another wire falls
+     * back to this one when that wire reports its endpoint absent before anything has streamed
+     * ({@link ChatWire#endpointAbsent}), in {@link #dispatchChat} and {@link #streamOnce}.
+     */
+    protected ChatWire wireFor(ChatRequest request) {
+        return openAiWire;
+    }
+
+    /**
+     * Factory method: creates the right {@link LlmProvider} subclass based on
+     * the provider name in the config. Matches against known substrings
+     * declaratively via {@link FactoryHolder}; falls back to
+     * {@link OpenAiProvider} for unknown/standard OpenAI-compatible providers.
+     *
+     * @param config the provider configuration to instantiate against
+     * @return the most specific {@link LlmProvider} subclass for
+     *         {@code config.name()}
+     */
+    public static LlmProvider forConfig(ProviderConfig config) {
+        var lowerName = config.name().toLowerCase();
+        for (var entry : FactoryHolder.MAP.entrySet()) {
+            if (lowerName.contains(entry.getKey())) {
+                return entry.getValue().apply(config);
+            }
+        }
+        return new OpenAiProvider(config);
+    }
+
+    // ─── Template methods (override in subclasses) ───────────────────────
+
+    /**
+     * Add provider-specific reasoning/thinking parameters to the request JSON.
+     *
+     * @param request      the outgoing request body the subclass may mutate
+     * @param thinkingMode operator-selected reasoning effort
+     *                     ({@code "low"}/{@code "medium"}/{@code "high"} or
+     *                     provider-specific extensions)
+     */
+    protected void addReasoningParams(JsonObject request, String thinkingMode) {
+        // Default: no reasoning support
+    }
+
+    /**
+     * Explicitly disable reasoning for models that think by default. Called
+     * when thinkingMode is off.
+     *
+     * @param request the outgoing request body the subclass may mutate
+     */
+    protected void disableReasoning(JsonObject request) {
+        // Default: no action (most providers don't need explicit disable)
+    }
+
+    /**
+     * Extract reasoning text from a streaming chunk delta.
+     * Called for each chunk during streaming.
+     *
+     * @param delta the streaming chunk delta object
+     * @return reasoning text fragment, or {@code null} if no reasoning in
+     *         this chunk
+     */
+    @SuppressWarnings("java:S1172") // template method — subclasses use the delta
+    protected @Nullable String extractReasoningFromDelta(ChunkDelta delta) {
+        return null;
+    }
+
+    /**
+     * Read an integer field from a usage JSON object, returning 0 when the
+     * field is missing or JSON null. Top-level form — {@code usage.field}.
+     *
+     * <p>Companion to the nested overload below. Callers that need a fallback chain
+     * (top-level, then nested) compose the two:
+     * {@code int top = readUsageInt(usage, "x"); return top > 0 ? top : readUsageInt(usage, "details", "x");}.
+     *
+     * <p>The "missing-or-null returns 0" semantic is correct for token-count
+     * fields specifically — providers either omit the field or report 0 when
+     * a category didn't apply, and both should be treated equivalently by
+     * downstream cost/usage aggregation.
+     *
+     * @param usageObj the provider's {@code usage} JSON object
+     * @param field    the top-level field name to read
+     * @return the field's int value, or {@code 0} when missing or null
+     */
+    protected static int readUsageInt(JsonObject usageObj, String field) {
+        if (usageObj == null || !usageObj.has(field) || usageObj.get(field).isJsonNull()) return 0;
+        return usageObj.get(field).getAsInt();
+    }
+
+    /**
+     * Read an integer field nested under one wrapping object — {@code usage.nestedObj.field}.
+     *
+     * @param usageObj  the provider's {@code usage} JSON object
+     * @param nestedObj the wrapping object's field name
+     * @param field     the inner field name
+     * @return the field's int value, or {@code 0} when any path component is
+     *         missing or null
+     */
+    protected static int readUsageInt(JsonObject usageObj, String nestedObj, String field) {
+        if (usageObj == null || !usageObj.has(nestedObj) || usageObj.get(nestedObj).isJsonNull()) return 0;
+        return readUsageInt(usageObj.getAsJsonObject(nestedObj), field);
+    }
+
+    /**
+     * Extract reasoning token count from a usage JSON object.
+     * Called when parsing the usage block in responses.
+     *
+     * @param usageObj the provider's {@code usage} JSON object
+     * @return the reasoning-token count, or {@code 0} when the provider
+     *         doesn't expose one
+     */
+    @SuppressWarnings("java:S1172") // template method — subclasses use the usage object
+    protected int extractReasoningTokens(JsonObject usageObj) {
+        return 0;
+    }
+
+    /**
+     * Shared "top-level then OpenAI-nested" reasoning-token read: prefer a
+     * top-level {@code usage.reasoning_tokens}, else fall back to
+     * {@code usage.completion_tokens_details.reasoning_tokens}. OpenRouter,
+     * Together, and OpenAI-routed usage all fit this chain — OpenAI never emits
+     * the top-level field, so it resolves to the nested path. Mirrors
+     * {@link #extractCacheCreationTokens}'s top-then-nested shape.
+     */
+    protected int readReasoningTokens(JsonObject usageObj) {
+        int top = readUsageInt(usageObj, JSON_REASONING_TOKENS);
+        return top > 0 ? top : readUsageInt(usageObj, JSON_COMPLETION_TOKENS_DETAILS, JSON_REASONING_TOKENS);
+    }
+
+    /**
+     * Extract the count of prompt tokens that were served from a provider-side
+     * prompt cache (cache <em>reads</em>). Defaults to the OpenAI-compat path
+     * ({@code usage.prompt_tokens_details.cached_tokens}) which is also what
+     * OpenRouter emits (with {@code usage: {include: true}}). Providers that
+     * report differently — or not at all — override this.
+     *
+     * @param usageObj the provider's {@code usage} JSON object
+     * @return cache-read tokens, or {@code 0} when none reported
+     */
+    protected int extractCachedTokens(JsonObject usageObj) {
+        return readUsageInt(usageObj, JSON_PROMPT_TOKENS_DETAILS, "cached_tokens");
+    }
+
+    /**
+     * Extract the count of prompt tokens written to the provider-side prompt cache on
+     * this turn (cache <em>writes</em>). Anthropic routes expose this as
+     * {@code usage.cache_creation_input_tokens} (top-level) and OpenRouter normalizes
+     * the same field through. OpenAI routes have no write concept — cache seeding is
+     * implicit and not billed — so the field is absent and this returns 0.
+     *
+     * <p>Cache writes are a disjoint subset of {@code prompt_tokens}, alongside cache
+     * reads. They are priced at a premium (Anthropic: 1.25× base for 5-min TTL).
+     *
+     * @param usageObj the provider's {@code usage} JSON object
+     * @return cache-write tokens, or {@code 0} when none reported
+     */
+    protected int extractCacheCreationTokens(JsonObject usageObj) {
+        // Three spellings, because providers disagree and OpenRouter changed theirs.
+        // Anthropic native: top-level cache_creation_input_tokens. Some normalizations
+        // nest it as prompt_tokens_details.cache_creation_tokens. OpenRouter today
+        // emits prompt_tokens_details.cache_write_tokens.
+        //
+        // JCLAW-901: only the first two were read, so cache WRITES came back 0 on every
+        // OpenRouter call. That is not a provider gap, which is what it was previously
+        // recorded as — a live probe on 2026-08-02 (anthropic/claude-haiku-4.5, a 4432-
+        // token prompt with cache_control) returned cache_write_tokens=4421 on the cold
+        // call and cached_tokens=4421 on the warm one. We were reading the wrong key.
+        int top = readUsageInt(usageObj, "cache_creation_input_tokens");
+        if (top > 0) return top;
+        int nested = readUsageInt(usageObj, JSON_PROMPT_TOKENS_DETAILS, "cache_creation_tokens");
+        return nested > 0 ? nested : readUsageInt(usageObj, JSON_PROMPT_TOKENS_DETAILS, "cache_write_tokens");
+    }
+
+    /**
+     * Extract what the provider says this call actually cost, in USD.
+     *
+     * <p>Defaults to OpenRouter's top-level {@code usage.cost}, which it returns for
+     * every request once {@code usage: {include: true}} is set — that opt-in is
+     * unconditional, so this covers OpenAI-, Anthropic-, Gemini- and DeepSeek-routed
+     * traffic through OpenRouter alike. Providers that report differently, or not at
+     * all, override this.
+     *
+     * <p>Why measure rather than compute: JClaw already derives cost from token counts
+     * times {@code ModelInfo} prices, which is inference about someone else's pricing.
+     * The provider's own figure survives price changes, promotional rates and BYOK, and
+     * it is what makes a cache saving quotable as money. The same probe above measured
+     * $0.00555725 cold against $0.00047310 warm on an identical prompt — an 11.7x
+     * difference the token counts alone cannot express without a pricing table.
+     *
+     * @param usageObj the provider's {@code usage} JSON object
+     * @return reported cost in USD, or {@code 0} when the provider reports none
+     */
+    protected double extractCostUsd(JsonObject usageObj) {
+        if (usageObj == null || !usageObj.has("cost") || usageObj.get("cost").isJsonNull()) return 0d;
+        try {
+            return usageObj.get("cost").getAsDouble();
+        } catch (Exception _) {
+            return 0d;
+        }
+    }
+
+    /**
+     * Add provider-specific prompt-caching directives to the outgoing request JSON.
+     * Called at the end of serializeRequest, after messages and reasoning have been
+     * attached. Subclasses add things like Anthropic's {@code cache_control}
+     * breakpoints (via OpenRouter) or Ollama's {@code keep_alive}. Default is no-op
+     * because OpenAI and most OpenAI-compat providers cache automatically.
+     *
+     * @param request     the outgoing request body the subclass may mutate
+     * @param chatRequest the higher-level request the JSON was built from
+     *                    (gives subclasses access to message metadata for
+     *                    deciding where to drop cache breakpoints)
+     */
+    protected void applyCacheDirectives(JsonObject request, ChatRequest chatRequest) {
+        // Default: no-op
+    }
+
+    /**
+     * Scrub {@link SystemPromptAssembler#CACHE_BOUNDARY_MARKER} from the first system
+     * message. Runs on every outbound request after {@link #applyCacheDirectives}, so a
+     * provider whose cache protocol already consumed the marker by splitting on it sees
+     * a no-op; every other route would otherwise ship the literal HTML comment, which
+     * some models echo back when asked to quote their instructions.
+     *
+     * <p>Only string content is handled — a block array means a subclass structured the
+     * system message itself and owns what the blocks contain.
+     */
+    static void stripCacheBoundaryMarker(JsonObject request) {
+        if (!request.has(JSON_MESSAGES) || !request.get(JSON_MESSAGES).isJsonArray()) return;
+        // JCLAW-976: every message, not only the first system one. The markers are provider
+        // protocol; a user turn or a replayed history row carrying one would otherwise ship
+        // the literal HTML comment — exactly what this scrub exists to prevent — and give the
+        // model a JClaw-looking sentinel to quote back.
+        for (var el : request.getAsJsonArray(JSON_MESSAGES)) {
+            if (!el.isJsonObject()) continue;
+            var msg = el.getAsJsonObject();
+            var content = msg.get(JSON_CONTENT);
+            if (content == null || !content.isJsonPrimitive()) continue;
+            var text = content.getAsString();
+            var scrubbed = text
+                    .replace(SystemPromptAssembler.CORE_MEMORY_BOUNDARY_MARKER, "")
+                    .replace(SystemPromptAssembler.CACHE_BOUNDARY_MARKER, "");
+            if (!scrubbed.equals(text)) {
+                msg.addProperty(JSON_CONTENT, scrubbed);
+            }
+        }
+    }
+
+    /** The first {@code role=system} message in a serialized request, or null when there is none. */
+    protected static @Nullable JsonObject findFirstSystemMessage(JsonObject request) {
+        if (!request.has(JSON_MESSAGES) || !request.get(JSON_MESSAGES).isJsonArray()) return null;
+        for (var el : request.getAsJsonArray(JSON_MESSAGES)) {
+            if (!el.isJsonObject()) continue;
+            var msg = el.getAsJsonObject();
+            if (msg.has(JSON_ROLE) && MessageRole.SYSTEM.value.equals(msg.get(JSON_ROLE).getAsString())) {
+                return msg;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Streaming chunks are Gson-deserialized field-by-field, which only catches
+     * top-level usage fields. Providers report reasoning and cached tokens under
+     * nested paths ({@code completion_tokens_details.reasoning_tokens},
+     * {@code prompt_tokens_details.cached_tokens}), so re-scan the raw chunk JSON
+     * via the template methods and replace Usage if we found more. Cheap — only
+     * runs on the final chunk that carries the usage block.
+     *
+     * <p>Takes the already-parsed {@link JsonObject} instead of the raw string so
+     * we don't pay {@link JsonParser#parseString} twice per chunk (once
+     * implicitly inside {@code gson.fromJson} and once here). Caller in
+     * {@link #chatStream} parses the SSE data field once and reuses the tree
+     * for both the field-mapping and the usage augmentation pass.
+     */
+    private ChatCompletionChunk augmentChunkUsage(ChatCompletionChunk chunk, JsonObject root) {
+        if (chunk.usage() == null) return chunk;
+        try {
+            if (!root.has(JSON_USAGE) || root.get(JSON_USAGE).isJsonNull()) return chunk;
+            var usageObj = root.getAsJsonObject(JSON_USAGE);
+            int reasoning = Math.max(chunk.usage().reasoningTokens(), extractReasoningTokens(usageObj));
+            int cached = Math.max(chunk.usage().cachedTokens(), extractCachedTokens(usageObj));
+            int cacheCreation = Math.max(chunk.usage().cacheCreationTokens(), extractCacheCreationTokens(usageObj));
+            double cost = Math.max(chunk.usage().costUsd(), extractCostUsd(usageObj));
+            // Provider metrics live only in the raw tree — Gson's field mapping has no
+            // component to bind them to — so this pass is their only way in on a stream.
+            var metrics = extractProviderMetrics(usageObj);
+            if (reasoning == chunk.usage().reasoningTokens()
+                    && cached == chunk.usage().cachedTokens()
+                    && cacheCreation == chunk.usage().cacheCreationTokens()
+                    && cost == chunk.usage().costUsd()
+                    && metrics.isEmpty()) {
+                return chunk;
+            }
+            var augmented = new Usage(
+                    chunk.usage().promptTokens(),
+                    chunk.usage().completionTokens(),
+                    chunk.usage().totalTokens(),
+                    reasoning,
+                    cached,
+                    cacheCreation,
+                    cost,
+                    metrics);
+            return new ChatCompletionChunk(chunk.id(), chunk.model(), chunk.choices(), augmented);
+        } catch (Exception _) {
+            return chunk;
+        }
+    }
+
+    /** OpenAI-compatible chat completions: the JSON request, SSE {@code data:} frames back. */
+    private final class OpenAiWire implements ChatWire {
+
+        @Override
+        public String name() {
+            return "openai-compat";
+        }
+
+        @Override
+        public URI uri() {
+            return buildUri(HttpKeys.CHAT_COMPLETIONS_PATH);
+        }
+
+        @Override
+        public String serialize(ChatRequest request) {
+            return serializeRequest(request);
+        }
+
+        @Override
+        public ChatResponse parseResponse(String body, @Nullable String channel) {
+            return deserializeResponse(body);
+        }
+
+        @Override
+        public void stream(String json, CallSite site,
+                           Consumer<ChatCompletionChunk> onChunk, Runnable onComplete, Consumer<Throwable> onError,
+                           Consumer<Runnable> publishCancel, @Nullable String channel) {
+            OkHttpLlmHttpDriver.streamSse(uri(), HttpKeys.BEARER_PREFIX + config.apiKey(), json, site,
+                    data -> {
+                        // The server closes the stream right after the [DONE]
+                        // sentinel, so we skip parsing it here.
+                        if ("[DONE]".equals(data)) return;
+                        // Parse once; augmentChunkUsage reuses the tree rather than re-parsing the final-usage chunk.
+                        try {
+                            var root = JsonParser.parseString(data).getAsJsonObject();
+                            var chunk = gson.fromJson(root, ChatCompletionChunk.class);
+                            if (chunk != null) onChunk.accept(augmentChunkUsage(chunk, root));
+                        } catch (Exception _) {
+                            // Skip malformed chunks
+                        }
+                    },
+                    onComplete, onError, publishCancel, channel);
+        }
+    }
+
+    // ─── Synchronous chat ────────────────────────────────────────────────
+
+    public ChatResponse chat(String model, List<ChatMessage> messages, @Nullable List<ToolDef> tools,
+                             @Nullable Integer maxTokens, @Nullable String thinkingMode,
+                             @Nullable String channel) {
+        return chat(model, messages, tools, maxTokens, thinkingMode, null, channel);
+    }
+
+    /**
+     * Synchronous chat with an optional custom timeout (seconds).
+     *
+     * <p>Runs under this provider's circuit breaker ({@link LlmResilience#guard}): the whole
+     * call including its retry loop is one recorded outcome, and while the breaker is open
+     * this throws an {@link LlmException.ServerError} without reaching the wire.
+     *
+     * @param model          model id to request
+     * @param messages       conversation messages in chronological order
+     * @param tools          tool definitions exposed to the model; may be null
+     * @param maxTokens      completion-token cap, or null for provider default
+     * @param thinkingMode   reasoning-effort level, or null when off / N/A
+     * @param timeoutSeconds custom HTTP timeout in seconds, or null for the
+     *                       default 180s timeout
+     * @param channel        inbound chat channel (web, telegram, slack, …)
+     *                       that originated the call; the OkHttp
+     *                       dispatcher_wait metric (recorded by
+     *                       {@link utils.LlmCallEventListener}) is
+     *                       partitioned by it so each channel's dashboard
+     *                       view shows the dispatcher cost its chats
+     *                       actually paid. Pass {@code null} for callers
+     *                       without a chat-channel context (skill promotion,
+     *                       slash commands, scheduled summarization).
+     * @return the parsed chat completion response
+     */
+    public ChatResponse chat(String model, List<ChatMessage> messages, @Nullable List<ToolDef> tools,
+                             @Nullable Integer maxTokens, @Nullable String thinkingMode,
+                             @Nullable Integer timeoutSeconds, @Nullable String channel) {
+        return LlmResilience.guard(config.name(), () ->
+                dispatchChat(model, messages, tools, maxTokens, thinkingMode, timeoutSeconds, channel));
+    }
+
+    /** One whole chat call, retry loop included — the unit {@link LlmResilience#guard} records a single
+     *  breaker outcome for. Never call it directly: that bypasses the provider's breaker. */
+    @SuppressWarnings("java:S107") // same call surface as chat(), which this is the body of
+    private ChatResponse dispatchChat(String model, List<ChatMessage> messages, @Nullable List<ToolDef> tools,
+                                      @Nullable Integer maxTokens, @Nullable String thinkingMode,
+                                      @Nullable Integer timeoutSeconds, @Nullable String channel) {
+        var request = new ChatRequest(model, messages, tools, false, maxTokens, thinkingMode);
+        var wire = wireFor(request);
+        // JCLAW-882: the sync dispatch point. Counted before the wire call so a
+        // request that ends in an exception still shows as a call the harness
+        // decided to make — the NFR is about decisions, not successes.
+        LatencyTrace.countLlmCall();
+        var call = GenAiSpans.start(config, GenAiSpans.OPERATION_CHAT, model, false, maxTokens);
+        try (var _ = call.makeCurrent()) {
+            ChatResponse response;
+            try {
+                response = sendOnce(wire, request, timeoutSeconds, channel);
+            } catch (RuntimeException e) {
+                // JCLAW-1158: nothing answers at the wire's endpoint, so the same request travels
+                // the OpenAI-compatible wire, which every provider serves.
+                if (wire == openAiWire || !wire.endpointAbsent(e)) throw e;
+                noteEndpointAbsent(wire, e);
+                response = sendOnce(openAiWire, request, timeoutSeconds, channel);
+            }
+            noteCachedCall(LatencyTrace.current(), response.usage());
+            call.response(response.id(), response.model(), response.usage(), finishReasons(response));
+            call.succeeded();
+            return response;
+        } catch (RuntimeException e) {
+            call.failed(e);
+            throw e;
+        }
+    }
+
+    /** One request on one wire, the JCLAW-1076 tools retry included. */
+    private ChatResponse sendOnce(ChatWire wire, ChatRequest request,
+                                  @Nullable Integer timeoutSeconds, @Nullable String channel) {
+        String responseBody;
+        try {
+            responseBody = executeWithRetry(wire.uri(), wire.serialize(request), request.model(),
+                    timeoutSeconds, channel);
+        } catch (RuntimeException e) {
+            // JCLAW-1076: the provider has just told us this model can't use
+            // tools. Retry once without them rather than failing the turn. The
+            // retry carries no tools, so it cannot raise this error again.
+            if (!sentTools(request) || !ToolCapabilityMemo.isToolsUnsupported(e)) throw e;
+            ToolCapabilityMemo.record(config.name(), request.model());
+            var retry = withoutTools(request);
+            responseBody = executeWithRetry(wire.uri(), wire.serialize(retry), retry.model(),
+                    timeoutSeconds, channel);
+        }
+        // A provider can return a 200 whose body is garbage (truncated JSON, an
+        // HTML error page, a missing "choices" array). Parsing then throws a raw
+        // JsonSyntaxException / IllegalStateException — which chatWithFailover
+        // doesn't catch, so the failover never fires. Wrap it as an LlmException
+        // so provider-side garbage-with-200 is a failover trigger.
+        try {
+            return wire.parseResponse(responseBody, channel);
+        } catch (LlmException e) {
+            throw e;
+        } catch (RuntimeException e) {
+            throw new LlmException("Malformed 200 response from " + config.name(), e);
+        }
+    }
+
+    private static ChatRequest withoutTools(ChatRequest request) {
+        return new ChatRequest(request.model(), request.messages(), List.of(), request.stream(),
+                request.maxTokens(), request.thinkingMode());
+    }
+
+    private void noteEndpointAbsent(ChatWire wire, Throwable failure) {
+        EventLogger.warn("llm", "%s: no %s endpoint at %s (%s); this request falls back to OpenAI-compatible chat completions"
+                .formatted(config.name(), wire.name(), wire.uri(), failure.getMessage()));
+    }
+
+    private static List<String> finishReasons(ChatResponse response) {
+        if (response.choices() == null) return List.of();
+        return response.choices().stream()
+                .map(Choice::finishReason)
+                .filter(Objects::nonNull)
+                .distinct()
+                .toList();
+    }
+
+    /**
+     * Companion half of the JCLAW-882 call counter: a call whose prompt came out
+     * of the provider's cache costs a fraction of an uncached one, so the
+     * efficiency NFR needs the split rather than the total alone. No-op outside a
+     * turn or when the provider reports no cache reads.
+     */
+    private static void noteCachedCall(@Nullable LatencyTrace trace, @Nullable Usage usage) {
+        if (trace != null && usage != null && usage.cachedTokens() > 0) {
+            trace.noteCachedLlmCall();
+        }
+    }
+
+    // ─── Streaming chat ──────────────────────────────────────────────────
+
+    // S107: streaming chat needs the conversation shape (model, messages, tools,
+    // tuning) AND a triplet of callback consumers — the chunk/complete/error
+    // split mirrors the SSE event surface and reactive callers want them
+    // independent. Bundling into a Callbacks DTO would lose the lambda-literal
+    // call-site ergonomics every caller depends on.
+    /**
+     * Streaming chat under this provider's circuit breaker
+     * ({@link LlmResilience#beginStream}). While the breaker is open the failure arrives
+     * through {@code onError} rather than as a throw, so every caller's existing stream
+     * error path handles it; nothing reaches the wire.
+     */
+    @SuppressWarnings("java:S107")
+    public void chatStream(String model, List<ChatMessage> messages, @Nullable List<ToolDef> tools,
+                           Consumer<ChatCompletionChunk> onChunk,
+                           Runnable onComplete, Consumer<Exception> onError,
+                           @Nullable Integer maxTokens, @Nullable String thinkingMode,
+                           @Nullable String channel) {
+        chatStream(LlmResilience.beginStream(config.name()), model, messages, tools,
+                onChunk, onComplete, onError, maxTokens, thinkingMode, channel);
+    }
+
+    /**
+     * {@link #chatStream} on an admission already taken from this provider's breaker; {@code null}
+     * means it was refused. Split out for {@link #chatStreamAccumulateWithFailover}, which has to
+     * know whether the primary admits the stream without spending a second HALF_OPEN probe to ask.
+     */
+    @SuppressWarnings("java:S107") // same call surface as chatStream, plus the admission
+    private void chatStream(LlmResilience.@Nullable StreamGuard guard,
+                            String model, List<ChatMessage> messages, @Nullable List<ToolDef> tools,
+                            Consumer<ChatCompletionChunk> onChunk,
+                            Runnable onComplete, Consumer<Exception> onError,
+                            @Nullable Integer maxTokens, @Nullable String thinkingMode,
+                            @Nullable String channel) {
+        if (guard == null) {
+            onError.accept(LlmResilience.openBreakerFailure(config.name()));
+            return;
+        }
+        dispatchStream(guard, model, messages, tools, onChunk, onComplete, onError,
+                maxTokens, thinkingMode, channel);
+    }
+
+    /** One whole streaming call, the JCLAW-1076 tools retry included — the unit {@code guard} records a
+     *  single breaker outcome for. Never call it directly: that bypasses the provider's breaker. */
+    @SuppressWarnings("java:S107") // same call surface as chatStream, which this is the body of
+    private void dispatchStream(LlmResilience.StreamGuard guard,
+                                String model, List<ChatMessage> messages, @Nullable List<ToolDef> tools,
+                                Consumer<ChatCompletionChunk> onChunk,
+                                Runnable onComplete, Consumer<Exception> onError,
+                                @Nullable Integer maxTokens, @Nullable String thinkingMode,
+                                @Nullable String channel) {
+        // JCLAW-882: the streaming dispatch point. Counted here rather than inside
+        // the virtual thread below, because the turn binding lives on the calling
+        // thread — the stream thread and the provider's IO thread carry none.
+        LatencyTrace.countLlmCall();
+        var call = GenAiSpans.start(config, GenAiSpans.OPERATION_CHAT, model, true, maxTokens);
+        // JCLAW-1169: the guard is stamped here rather than in GenAiSpans.Call.chunk, which
+        // returns immediately when telemetry is off — the default.
+        // JCLAW-1181: a stream the sweep abandoned for silence has already ended its caller's
+        // turn, so anything the provider produces afterwards is addressed to nobody.
+        var settled = new AtomicBoolean();
+        Consumer<ChatCompletionChunk> observedChunk = chunk -> {
+            if (settled.get()) return;
+            guard.chunk();
+            call.chunk(chunk);
+            onChunk.accept(chunk);
+        };
+        // The breaker outcome and the span both land before the caller's callback: that
+        // callback is what releases whoever is waiting on the stream, and they must not see
+        // the latch before either.
+        Runnable observedComplete = () -> {
+            if (!settled.compareAndSet(false, true)) return;
+            guard.succeeded();
+            call.succeeded();
+            onComplete.run();
+        };
+        Consumer<Exception> observedError = e -> {
+            if (!settled.compareAndSet(false, true)) return;
+            guard.failed(e);
+            call.failed(e);
+            onError.accept(e);
+        };
+        // JCLAW-1183: the transport's own thread is parked in streamSse's untimed await, and only
+        // aborting its call gets it — and its socket — back. Settle first: the abort arrives as an
+        // onFailure, and whichever outcome reaches the latch first is the one the caller reads.
+        var cancelTransport = new AtomicReference<Runnable>();
+        guard.onAbandoned(quietMillis -> {
+            observedError.accept(LlmResilience.abandonedStreamFailure(config.name(), quietMillis));
+            // Null until the stream thread has an in-flight call to abort, which is the one
+            // state where there is no socket to give back.
+            var abortCall = cancelTransport.get();
+            if (abortCall != null) abortCall.run();
+        });
+        // The transport runs on its own virtual thread, which inherits no OTel context; the
+        // wrap carries the span so the HTTP client span nests under it.
+        var request = new ChatRequest(model, messages, tools, true, maxTokens, thinkingMode);
+        var wire = wireFor(request);
+        Thread.ofVirtual().name("llm-stream").start(call.context().wrap(() ->
+                streamOnce(wire, request, observedChunk, observedComplete, observedError,
+                        cancelTransport::set, channel, true)));
+    }
+
+    /**
+     * One streaming attempt on {@code wire}. {@code mayRetryWithoutTools} is false on the retry,
+     * so a tools-unsupported error can be handled at most once (JCLAW-1076); a wire whose
+     * endpoint turns out absent hands the request to the OpenAI-compatible wire, once and only
+     * while nothing has streamed (JCLAW-1158).
+     */
+    @SuppressWarnings("java:S107") // same shape as chatStream, plus the wire, the cancel handle and the retry latch
+    private void streamOnce(ChatWire wire, ChatRequest request,
+                            Consumer<ChatCompletionChunk> onChunk,
+                            Runnable onComplete, Consumer<Exception> onError,
+                            Consumer<Runnable> publishCancel,
+                            @Nullable String channel,
+                            boolean mayRetryWithoutTools) {
+        // Retrying after tokens have reached the user would replay them. A
+        // tools-unsupported 400 is a request rejection so nothing has streamed
+        // yet, but the latch makes that a guarantee rather than an assumption.
+        var emitted = new AtomicBoolean(false);
+        Consumer<Throwable> handleFailure = t -> {
+            var tools = request.tools();
+            var retryable = mayRetryWithoutTools && !emitted.get()
+                    && tools != null && !tools.isEmpty()
+                    && ToolCapabilityMemo.isToolsUnsupported(t);
+            if (retryable) {
+                ToolCapabilityMemo.record(config.name(), request.model());
+                streamOnce(wire, withoutTools(request), onChunk, onComplete, onError,
+                        publishCancel, channel, false);
+                return;
+            }
+            if (wire != openAiWire && !emitted.get() && wire.endpointAbsent(t)) {
+                noteEndpointAbsent(wire, t);
+                streamOnce(openAiWire, request, onChunk, onComplete, onError,
+                        publishCancel, channel, mayRetryWithoutTools);
+                return;
+            }
+            onError.accept(t instanceof Exception ex ? ex : new LlmException("Stream error", t));
+        };
+        try {
+            wire.stream(wire.serialize(request), callSite(request.model()),
+                    chunk -> {
+                        emitted.set(true);
+                        onChunk.accept(chunk);
+                    },
+                    onComplete, handleFailure, publishCancel, channel);
+        } catch (Exception e) {
+            handleFailure.accept(e);
+        }
+    }
+
+    // ─── Streaming with accumulation ─────────────────────────────────────
+
+    // S107: same shape as chatStream, minus chunk/complete/error consumers
+    // (accumulator owns those), plus onToken/onReasoning split because the
+    // frontend renders thinking and content tokens through different paths.
+    @SuppressWarnings("java:S107")
+    public StreamAccumulator chatStreamAccumulate(String model, List<ChatMessage> messages,
+                                                   @Nullable List<ToolDef> tools,
+                                                   Consumer<String> onToken,
+                                                   Consumer<String> onReasoning,
+                                                   @Nullable Integer maxTokens,
+                                                   @Nullable String thinkingMode,
+                                                   @Nullable String channel) {
+        return chatStreamAccumulate(LlmResilience.beginStream(config.name()), model, messages, tools,
+                onToken, onReasoning, maxTokens, thinkingMode, channel);
+    }
+
+    /** {@link #chatStreamAccumulate} on an admission already taken from this provider's breaker. */
+    @SuppressWarnings("java:S107") // same call surface as chatStreamAccumulate, plus the admission
+    private StreamAccumulator chatStreamAccumulate(LlmResilience.@Nullable StreamGuard guard,
+                                                   String model, List<ChatMessage> messages,
+                                                   @Nullable List<ToolDef> tools,
+                                                   Consumer<String> onToken,
+                                                   Consumer<String> onReasoning,
+                                                   @Nullable Integer maxTokens,
+                                                   @Nullable String thinkingMode,
+                                                   @Nullable String channel) {
+        var accumulator = new StreamAccumulator();
+        accumulator.promptTokenEstimate = TokenUsageEstimator.estimateChatRequest(model, messages, tools);
+        var contentBuilder = new StringBuilder();
+        var toolCallAccumulator = new HashMap<Integer, ToolCallBuilder>();
+        // JCLAW-882: the completion callback below fires on the provider's IO
+        // thread, which has no turn binding — capture the dispatching thread's
+        // trace so the cache-served half of the counter stays attributable.
+        var trace = LatencyTrace.current();
+
+        chatStream(guard, model, messages, tools,
+                chunk -> accumulateChunk(chunk, accumulator, contentBuilder, toolCallAccumulator,
+                        onToken, onReasoning),
+                () -> {
+                    accumulator.content = contentBuilder.toString();
+                    accumulator.toolCalls = toolCallAccumulator.values().stream()
+                            .map(ToolCallBuilder::build).toList();
+                    accumulator.completionTokenEstimate = TokenUsageEstimator.estimateCompletion(
+                            model, accumulator.content, accumulator.toolCalls, accumulator.reasoningText());
+                    accumulator.reasoningTokenEstimate = TokenUsageEstimator.estimateReasoning(
+                            model, accumulator.reasoningText());
+                    noteCachedCall(trace, accumulator.usage);
+                    accumulator.markComplete();
+                },
+                e -> {
+                    accumulator.error = e;
+                    accumulator.markComplete();
+                },
+                maxTokens, thinkingMode, channel);
+
+        return accumulator;
+    }
+
+    private void accumulateChunk(ChatCompletionChunk chunk,
+                                 StreamAccumulator accumulator,
+                                 StringBuilder contentBuilder,
+                                 Map<Integer, ToolCallBuilder> toolCallAccumulator,
+                                 Consumer<String> onToken,
+                                 Consumer<String> onReasoning) {
+        if (chunk.usage() != null) {
+            accumulator.usage = chunk.usage();
+            if (chunk.usage().reasoningTokens() > 0) {
+                accumulator.reasoningDetected = true;
+                accumulator.reasoningTokens = chunk.usage().reasoningTokens();
+            }
+        }
+        for (var choice : chunk.choices()) {
+            applyChoiceDelta(choice, accumulator, contentBuilder, toolCallAccumulator,
+                    onToken, onReasoning);
+        }
+    }
+
+    private void applyChoiceDelta(ChunkChoice choice,
+                                  StreamAccumulator accumulator,
+                                  StringBuilder contentBuilder,
+                                  Map<Integer, ToolCallBuilder> toolCallAccumulator,
+                                  Consumer<String> onToken,
+                                  Consumer<String> onReasoning) {
+        var delta = choice.delta();
+        // Skip empty-content chunks: OpenAI-compatible providers
+        // (e.g. OpenRouter routing Gemini-3-flash-preview, Kimi K2.5)
+        // emit `content: ""` interleaved with every reasoning chunk
+        // because the schema requires the field. Counting these as
+        // real content stamps firstContentNanos at the same instant
+        // as reasoningStartNanos → reasoningDurationMs collapses to 0
+        // → the frontend renders the generic "Thinking" label after
+        // reload. Mirrors the frontend's `if (!event.content) continue`
+        // guard at chat.vue:1116.
+        if (delta.content() != null && !delta.content().isEmpty()) {
+            accumulator.noteFirstContentChunk();
+            contentBuilder.append(delta.content());
+            onToken.accept(delta.content());
+        }
+        // Delegate reasoning extraction to the provider subclass.
+        // We buffer the text even when the consumer doesn't supply an
+        // onReasoning callback, because the length feeds the token-count
+        // estimate for providers (e.g. Ollama Cloud on glm-5.1) that
+        // stream reasoning but omit reasoning_tokens from usage.
+        var reasoningText = extractReasoningFromDelta(delta);
+        if (reasoningText != null) {
+            accumulator.reasoningDetected = true;
+            accumulator.appendReasoningText(reasoningText);
+            if (onReasoning != null) onReasoning.accept(reasoningText);
+        }
+        // JCLAW-120: Gemini-via-Ollama-Cloud streams parallel
+        // tool calls all at the same index. mergeToolCallChunks
+        // detects id / function-name mismatches and allocates
+        // fresh slots so parallel calls stay distinct.
+        ToolCallChunkMerger.mergeToolCallChunks(delta.toolCalls(), toolCallAccumulator);
+        if (choice.finishReason() != null) {
+            accumulator.finishReason = choice.finishReason();
+        }
+    }
+
+    // ─── Embeddings ──────────────────────────────────────────────────────
+
+    /** An embedding plus the model the provider reports having served it with. */
+    public record EmbeddingResult(float[] vector, String servedModel) {}
+
+    public float[] embeddings(String model, String input, @Nullable String channel) {
+        return embeddingsDetailed(model, input, channel).vector();
+    }
+
+    /**
+     * As {@link #embeddings}, but also surfacing the model named in the response
+     * (JCLAW-931). Only the probe needs it: a provider that silently substitutes a
+     * different embedding model answers 200 with a perfectly good vector, so the vector
+     * alone cannot tell an operator whether the model they picked is the one being used.
+     */
+    public EmbeddingResult embeddingsDetailed(String model, String input, @Nullable String channel) {
+        var request = new EmbeddingRequest(model, input);
+        var json = gson.toJson(request);
+        var call = GenAiSpans.start(config, GenAiSpans.OPERATION_EMBEDDINGS, model, false, null);
+        try (var _ = call.makeCurrent()) {
+            var responseBody = executeWithRetry("/embeddings", json, request.model(), null, channel);
+            EmbeddingResponse response;
+            try {
+                response = gson.fromJson(responseBody, EmbeddingResponse.class);
+            } catch (RuntimeException e) {
+                // Same garbage-with-200 concern as chat(): a malformed body must
+                // surface as an LlmException, not a raw JsonSyntaxException.
+                throw new LlmException("Malformed embeddings response from " + config.name(), e);
+            }
+            if (response == null || response.data() == null || response.data().isEmpty()) {
+                throw new LlmException("Empty embedding response");
+            }
+            call.response(null, response.model(), response.usage(), List.of());
+            call.succeeded();
+            return new EmbeddingResult(response.data().getFirst().embedding(), response.model());
+        } catch (RuntimeException e) {
+            call.failed(e);
+            throw e;
+        }
+    }
+
+    // ─── Failover (static utility) ───────────────────────────────────────
+
+    /**
+     * Where a turn goes when its primary fails it (JCLAW-1190): the provider the operator chose
+     * on the agent and the model registered there. The model is part of the choice rather than
+     * derived, because the primary's model id need not exist on the fallback.
+     */
+    public record Fallback(LlmProvider provider, String modelId) {
+
+        /**
+         * The operator's fallback for {@code agent}: null when none is set, or when the chosen
+         * provider has since lost its configuration — logged, so a fallback that silently
+         * stopped existing is visible.
+         */
+        public static @Nullable Fallback forAgent(@Nullable Agent agent) {
+            if (agent == null || agent.fallbackProvider == null || agent.fallbackModelId == null) return null;
+            var provider = ProviderRegistry.get(agent.fallbackProvider);
+            if (provider == null) {
+                EventLogger.warn("llm", agent.name, null,
+                        "Fallback provider '%s' is not configured; the agent has no fallback".formatted(agent.fallbackProvider));
+                return null;
+            }
+            return new Fallback(provider, agent.fallbackModelId);
+        }
+
+        /** A fallback that resolves to the primary itself is no fallback: it is the provider that just failed. */
+        public boolean coversFor(LlmProvider primary) {
+            return !provider.config().name().equals(primary.config().name());
+        }
+
+        String describe() {
+            return provider.config().name() + " / " + modelId;
+        }
+    }
+
+    // S107: failover wraps two providers around the standard 6-arg chat call;
+    // pushing the chat tuple into a DTO would force every caller of the
+    // primary {@link #chat} path to pre-build one, which they don't.
+    @SuppressWarnings("java:S107")
+    public static ChatResponse chatWithFailover(LlmProvider primary, @Nullable Fallback fallback,
+                                                 String model, List<ChatMessage> messages,
+                                                 @Nullable List<ToolDef> tools,
+                                                 @Nullable Integer maxTokens,
+                                                 @Nullable String thinkingMode,
+                                                 @Nullable String channel) {
+        try {
+            return primary.chat(model, messages, tools, maxTokens, thinkingMode, channel);
+        } catch (LlmException e) {
+            SubscriptionUsage.noteFailure(e);
+            if (fallback != null && fallback.coversFor(primary)) {
+                EventLogger.warn("llm", "Failing over from %s to %s: %s"
+                        .formatted(primary.config().name(), fallback.describe(), e.getMessage()));
+                return fallback.provider().chat(fallback.modelId(), messages, tools, maxTokens, thinkingMode, channel);
+            }
+            throw e;
+        }
+    }
+
+    /**
+     * Streaming twin of {@link #chatWithFailover}, narrowed to the one case where switching
+     * providers is safe (JCLAW-1182): the primary's breaker turning the call away before any
+     * token exists. General mid-stream failover is deliberately not offered — once tokens have
+     * reached the user another provider cannot silently take over, and re-answering from the top
+     * duplicates visible output. So this is "do not start on a provider already known to be
+     * open", not "recover from one that broke mid-answer".
+     *
+     * <p>The admission is taken once and handed to whichever provider runs it, so asking whether
+     * the primary is open never spends the HALF_OPEN probe the question would otherwise cost. The
+     * fallback takes its own admission through the public entry, which fails fast when its
+     * breaker is open too rather than bouncing back to the primary.
+     */
+    @SuppressWarnings("java:S107") // chatStreamAccumulate's call surface plus the fallback
+    public static StreamAccumulator chatStreamAccumulateWithFailover(
+            LlmProvider primary, @Nullable Fallback fallback,
+            String model, List<ChatMessage> messages, @Nullable List<ToolDef> tools,
+            Consumer<String> onToken, Consumer<String> onReasoning,
+            @Nullable Integer maxTokens, @Nullable String thinkingMode, @Nullable String channel) {
+        var admission = LlmResilience.beginStream(primary.config().name());
+        // A conversation-level provider override can make the effective primary the agent's own
+        // fallback; then the fallback is the breaker that just refused, not somewhere to go.
+        if (admission != null || fallback == null || !fallback.coversFor(primary)) {
+            return primary.chatStreamAccumulate(admission, model, messages, tools, onToken,
+                    onReasoning, maxTokens, thinkingMode, channel);
+        }
+        EventLogger.warn("llm", "Failing over from %s to %s: %s".formatted(
+                primary.config().name(), fallback.describe(),
+                LlmResilience.openBreakerFailure(primary.config().name()).getMessage()));
+        return fallback.provider().chatStreamAccumulate(fallback.modelId(), messages, tools, onToken,
+                onReasoning, maxTokens, thinkingMode, channel);
+    }
+
+    // ─── Shared internals ────────────────────────────────────────────────
+
+    /** Whether this request actually put a tools array on the wire — the precondition for the JCLAW-1076 retry. */
+    private boolean sentTools(ChatRequest request) {
+        return request.tools() != null && !request.tools().isEmpty()
+                && modelSupportsTools(request.model());
+    }
+
+    /**
+     * True unless the model is configured as unable to call tools (JCLAW-1074).
+     *
+     * <p>Sending a {@code tools} array to a chat-only model is a hard failure,
+     * not a degradation — Ollama answers {@code 400 "<model> does not support
+     * tools"} and the turn produces nothing. Withholding the array instead lets
+     * the model answer normally without them.
+     *
+     * <p>Unknown resolves to true, which is the opposite of
+     * {@code modelSupportsThinking}'s default and deliberate: an unlisted model
+     * here means "we have no capability data", and assuming no tools would
+     * silently disarm every agent on a provider that publishes none.
+     */
+    protected boolean modelSupportsTools(String modelId) {
+        if (modelId == null) return true;
+        // A model that already rejected tools this run is skipped up front, so
+        // the wasted first call happens once rather than every turn (JCLAW-1076).
+        if (ToolCapabilityMemo.isKnownIncapable(config().name(), modelId)) return false;
+        var models = config().models();
+        if (models == null) return true;
+        return models.stream()
+                .filter(m -> modelId.equals(m.id()))
+                .findFirst()
+                .map(ModelInfo::toolCallingSupported)
+                .orElse(true);
+    }
+
+    /**
+     * The reasoning-effort level to send when the operator has chosen none, for a
+     * model that reasons no matter what the request asks for.
+     *
+     * <p>Verified on ollama.com/v1 with {@code glm-5.3-flash} (n=4 per level,
+     * reasoning-field chars): {@code low} 180, {@code high} 650, {@code max} 2940,
+     * omitted 3195. Two things follow. Omitting the parameter inherits the
+     * vendor's default, which on this ladder is the most expensive rung — so
+     * sending nothing is not a neutral choice. And {@code reasoning_effort:"none"}
+     * yields 0: Ollama stops emitting the {@code reasoning} delta field while the
+     * model reasons anyway, so the chain-of-thought arrives as ordinary
+     * {@code content} and the thinking block never fills.
+     *
+     * <p>Sending the model's lowest advertised rung avoids both. Empty for every
+     * model that can genuinely stop reasoning, and for one absent from the
+     * catalog — both keep the normal disable path.
+     */
+    protected Optional<String> mandatoryThinkingLevel(String modelId) {
+        if (modelId == null) return Optional.empty();
+        var models = config().models();
+        if (models == null) return Optional.empty();
+        return models.stream()
+                .filter(m -> modelId.equals(m.id()))
+                .findFirst()
+                .filter(ModelInfo::alwaysThinks)
+                .map(ModelInfo::effectiveThinkingLevels)
+                .filter(levels -> !levels.isEmpty())
+                .map(List::getFirst);
+    }
+
+    protected String serializeRequest(ChatRequest request) {
+        var obj = new JsonObject();
+        obj.addProperty(JSON_MODEL, request.model());
+        obj.add(JSON_MESSAGES, serializeMessages(request.messages()));
+        if (request.tools() != null && !request.tools().isEmpty() && modelSupportsTools(request.model())) {
+            obj.add("tools", gson.toJsonTree(request.tools()));
+        }
+        if (request.stream()) {
+            obj.addProperty("stream", true);
+            var streamOptions = new JsonObject();
+            streamOptions.addProperty("include_usage", true);
+            obj.add("stream_options", streamOptions);
+        }
+        if (request.maxTokens() != null) {
+            obj.addProperty("max_tokens", request.maxTokens());
+        }
+        if (request.thinkingMode() != null && !request.thinkingMode().isBlank()) {
+            addReasoningParams(obj, request.thinkingMode());
+        } else {
+            mandatoryThinkingLevel(request.model()).ifPresentOrElse(
+                    level -> addReasoningParams(obj, level),
+                    () -> disableReasoning(obj));
+        }
+        applyCacheDirectives(obj, request);
+        stripCacheBoundaryMarker(obj);
+        return gson.toJson(obj);
+    }
+
+    private JsonArray serializeMessages(List<ChatMessage> messages) {
+        var array = new JsonArray();
+        for (var msg : messages) {
+            var obj = new JsonObject();
+            obj.addProperty(JSON_ROLE, msg.role());
+            if (msg.content() instanceof String s) {
+                obj.addProperty(JSON_CONTENT, s);
+            } else if (msg.content() != null) {
+                obj.add(JSON_CONTENT, gson.toJsonTree(msg.content()));
+            }
+            if (msg.toolCalls() != null && !msg.toolCalls().isEmpty()) {
+                obj.add(JSON_TOOL_CALLS, gson.toJsonTree(msg.toolCalls()));
+            }
+            if (msg.toolCallId() != null) {
+                obj.addProperty(JSON_TOOL_CALL_ID, msg.toolCallId());
+            }
+            if (msg.toolName() != null) {
+                obj.addProperty("name", msg.toolName());
+            }
+            array.add(obj);
+        }
+        return array;
+    }
+
+    protected ChatResponse deserializeResponse(String json) {
+        var obj = JsonParser.parseString(json).getAsJsonObject();
+        var id = obj.has("id") ? obj.get("id").getAsString() : null;
+        var model = obj.has(JSON_MODEL) ? obj.get(JSON_MODEL).getAsString() : null;
+
+        var choices = new ArrayList<Choice>();
+        if (obj.has("choices")) {
+            for (var choiceEl : obj.getAsJsonArray("choices")) {
+                var choiceObj = choiceEl.getAsJsonObject();
+                var index = choiceObj.get("index").getAsInt();
+                var finishReason = choiceObj.has(JSON_FINISH_REASON) && !choiceObj.get(JSON_FINISH_REASON).isJsonNull()
+                        ? choiceObj.get(JSON_FINISH_REASON).getAsString() : null;
+                var msgObj = choiceObj.getAsJsonObject("message");
+                var message = deserializeMessage(msgObj);
+                choices.add(new Choice(index, message, finishReason));
+            }
+        }
+
+        Usage usage = null;
+        if (obj.has(JSON_USAGE) && !obj.get(JSON_USAGE).isJsonNull()) {
+            usage = parseUsage(obj.getAsJsonObject(JSON_USAGE));
+        }
+
+        return new ChatResponse(id, model, choices, usage);
+    }
+
+    private ChatMessage deserializeMessage(JsonObject msgObj) {
+        var role = msgObj.get(JSON_ROLE).getAsString();
+        String content = null;
+        if (msgObj.has(JSON_CONTENT) && !msgObj.get(JSON_CONTENT).isJsonNull()) {
+            content = msgObj.get(JSON_CONTENT).getAsString();
+        }
+
+        List<ToolCall> toolCalls = null;
+        if (msgObj.has(JSON_TOOL_CALLS) && !msgObj.get(JSON_TOOL_CALLS).isJsonNull()) {
+            toolCalls = new ArrayList<>();
+            for (var tcEl : msgObj.getAsJsonArray(JSON_TOOL_CALLS)) {
+                var tcObj = tcEl.getAsJsonObject();
+                var tcId = tcObj.get("id").getAsString();
+                var tcType = tcObj.has("type") ? tcObj.get("type").getAsString() : TYPE_FUNCTION;
+                var fnObj = tcObj.getAsJsonObject(TYPE_FUNCTION);
+                var fnName = fnObj.get("name").getAsString();
+                var fnArgs = fnObj.get("arguments").getAsString();
+                toolCalls.add(new ToolCall(tcId, tcType, new FunctionCall(fnName, fnArgs)));
+            }
+        }
+
+        String toolCallId = null;
+        if (msgObj.has(JSON_TOOL_CALL_ID) && !msgObj.get(JSON_TOOL_CALL_ID).isJsonNull()) {
+            toolCallId = msgObj.get(JSON_TOOL_CALL_ID).getAsString();
+        }
+
+        return new ChatMessage(role, content, toolCalls, toolCallId, null);
+    }
+
+    /**
+     * Build the absolute request URL by joining {@link ProviderConfig#baseUrl}
+     * with {@code path}. Tolerates either a trailing slash on baseUrl or a
+     * leading slash on path; emits exactly one slash between them.
+     *
+     * @param path API path beneath the provider's base URL (e.g.
+     *             {@code "/chat/completions"})
+     * @return the absolute URI for the request
+     */
+    protected URI buildUri(String path) {
+        var url = config.baseUrl().endsWith("/")
+                ? config.baseUrl() + path.substring(1)
+                : config.baseUrl() + path;
+        return URI.create(url);
+    }
+
+    /** @param model the model id this request carries on the wire — passed in rather than derived,
+     *               because an unpinned task inherits its agent's current model and a failure has
+     *               to name the one actually rejected (JCLAW-1134). */
+    protected String executeWithRetry(String path, String json, String model,
+                                      @Nullable Integer timeoutSeconds, @Nullable String channel) {
+        return executeWithRetry(buildUri(path), json, model, timeoutSeconds, channel);
+    }
+
+    /** The same retry loop against an absolute endpoint, for a wire not rooted at {@link ProviderConfig#baseUrl} (JCLAW-1158). */
+    protected String executeWithRetry(URI uri, String json, String model,
+                                      @Nullable Integer timeoutSeconds, @Nullable String channel) {
+        var auth = HttpKeys.BEARER_PREFIX + config.apiKey();
+        var timeout = Duration.ofSeconds(timeoutSeconds != null ? timeoutSeconds : 180);
+        var site = callSite(model);
+        Exception lastException = null;
+
+        for (int attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+            boolean alreadyBackedOff = false;
+            try {
+                var outcome = attemptRequest(uri, auth, json, timeout, channel, attempt, site);
+                if (outcome.body() != null) return outcome.body();
+                if (outcome.error() != null) lastException = outcome.error();
+                alreadyBackedOff = outcome.alreadyBackedOff();
+            } catch (LlmException e) {
+                throw e;
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                throw new LlmException("Interrupted during request to " + config.name(), ie);
+            } catch (Exception e) {
+                lastException = e;
+            }
+
+            // The 429 path already parked for the (clamped) Retry-After, so
+            // don't stack the standard backoff on top of it.
+            if (attempt < MAX_RETRIES && !alreadyBackedOff) {
+                backoffBeforeRetry(attempt);
+            }
+        }
+
+        throw exhausted("All retries exhausted for " + config.name(), lastException, site);
+    }
+
+    /** The exhausted-retries failure, carrying the last attempt's category and its remedy: every
+     *  retryable branch reports through {@link AttemptOutcome} rather than throwing, so this is
+     *  the only route a ServerError / RateLimited / Transport has to a caller. */
+    private static LlmException exhausted(String message, @Nullable Exception last, CallSite site) {
+        var failure = last instanceof LlmException llm && llm.failure() != null
+                ? llm.failure()
+                : site.failure(Remedy.UNCLASSIFIED, null);
+        return switch (last) {
+            case LlmException.RateLimited _ -> new LlmException.RateLimited(message, last, failure);
+            case LlmException.ServerError _ -> new LlmException.ServerError(message, last, failure);
+            case LlmException.Transport _ -> new LlmException.Transport(message, last, failure);
+            case null, default -> new LlmException(message, last, failure);
+        };
+    }
+
+    /** This provider's identity plus the model of the call being made, for a failure to name. */
+    private CallSite callSite(@Nullable String model) {
+        return new CallSite(config.name(), model, contextWindowOf(model));
+    }
+
+    /** The declared context window for {@code model}, or null when the catalog doesn't list it. */
+    private @Nullable Integer contextWindowOf(@Nullable String model) {
+        var models = config.models();
+        if (model == null || models == null) return null;
+        return models.stream()
+                .filter(m -> model.equals(m.id()))
+                .findFirst()
+                .map(ModelInfo::contextWindow)
+                .filter(window -> window > 0)
+                .orElse(null);
+    }
+
+    /**
+     * Outcome of a single attempt: either {@code body} is a success body, or {@code error}
+     * carries a retryable error. {@code alreadyBackedOff} is true when the attempt already
+     * waited (the 429 path parks for Retry-After itself), so {@code executeWithRetry} must
+     * not stack the standard backoff on top.
+     */
+    private record AttemptOutcome(@Nullable String body, @Nullable Exception error,
+                                  boolean alreadyBackedOff) {}
+
+    /**
+     * Whether a 429 body identifies a permanently exhausted balance rather than a rate that is
+     * merely too high (JCLAW-929) — the one distinction the retry loop makes on a 429.
+     *
+     * <p>The codes that decide it moved to {@link LlmFailureClassifier} in JCLAW-1134, which
+     * classifies the same body for the operator's remedy; this stays as the retry loop's name
+     * for the branch, so one list settles both.
+     */
+    private static boolean isPermanentQuotaError(@Nullable String body) {
+        return LlmFailureClassifier.classify(429, body) == Remedy.QUOTA_EXHAUSTED;
+    }
+
+    /**
+     * Execute one request attempt. Returns a body on 200; on 429 parks for the
+     * (clamped) Retry-After and returns an error outcome flagged already-backed-off so the
+     * caller records a 429 {@link LlmException} without double-waiting; throws on 4xx; or
+     * returns an error outcome on 5xx for the caller to retry.
+     *
+     * <p>Each branch carries its {@link LlmException} subclass, so a caller can tell a
+     * provider fault from a request of ours that will never succeed. Only the
+     * non-retryable branch throws: a thrown {@code LlmException} aborts the retry loop.
+     */
+    @SuppressWarnings("java:S107") // one request's inputs, plus the identity its failure reports
+    private AttemptOutcome attemptRequest(URI uri, String auth, String json, Duration timeout,
+                                          @Nullable String channel, int attempt, CallSite site)
+            throws InterruptedException {
+        OkHttpLlmHttpDriver.HttpReply reply;
+        try {
+            reply = OkHttpLlmHttpDriver.send(uri, auth, json, timeout, channel);
+        } catch (IOException e) {
+            return new AttemptOutcome(null, new LlmException.Transport(
+                    "Transport failure calling %s: %s".formatted(config.name(), e.getMessage()), e,
+                    site.failure(Remedy.UNCLASSIFIED, null)), false);
+        }
+
+        if (reply.statusCode() == 200) return new AttemptOutcome(reply.body(), null, false);
+
+        if (reply.statusCode() == 429) {
+            if (isPermanentQuotaError(reply.body())) {
+                throw new LlmException.ClientError("HTTP 429 from %s (permanent, not retried): %s".formatted(
+                        config.name(), sanitizeErrorBody(reply.body(), config.apiKey())),
+                        site.failure(Remedy.QUOTA_EXHAUSTED, null));
+            }
+            var defaultBackoff = backoffMsFor(attempt) / 1000;
+            var requested = reply.retryAfterSeconds().orElse(defaultBackoff);
+            var retryAfter = Math.min(requested, RETRY_AFTER_MAX_SECONDS);
+            if (retryAfter < requested) {
+                EventLogger.warn("llm", "Retry-After from %s clamped %ds → %ds".formatted(
+                        config.name(), requested, retryAfter));
+            }
+            EventLogger.warn("llm", "Rate limited by %s, retrying after %ds".formatted(config.name(), retryAfter));
+            parkForMillis(retryAfter * 1000);
+            return new AttemptOutcome(null,
+                    new LlmException.RateLimited("HTTP 429 from %s: rate limited (retry-after %ds)".formatted(
+                            config.name(), retryAfter), null,
+                            site.failure(Remedy.RATE_LIMITED, retryAfter)),
+                    true);
+        }
+
+        if (reply.statusCode() >= 400 && reply.statusCode() < 500) {
+            var body = sanitizeErrorBody(reply.body(), config.apiKey());
+            throw new LlmException.ClientError("HTTP %d from %s: %s".formatted(reply.statusCode(), config.name(), body),
+                    site.classifying(reply.statusCode(), reply.body()), reply.statusCode(), body);
+        }
+
+        return new AttemptOutcome(null, new LlmException.ServerError("HTTP %d from %s: %s".formatted(
+                reply.statusCode(), config.name(), sanitizeErrorBody(reply.body(), config.apiKey())), null,
+                site.failure(Remedy.UNCLASSIFIED, null)), false);
+    }
+
+    /**
+     * JCLAW-730: scrub the provider secret and cap the length of an upstream
+     * error body before it enters an {@link LlmException} message — which flows
+     * on into event logs and the UI. Provider 4xx/5xx bodies are
+     * attacker-influenceable and can be large or echo the request (including the
+     * API key), so truncating and redacting the key keeps them from flooding the
+     * logs or leaking the credential downstream.
+     */
+    private static String sanitizeErrorBody(String body, String secret) {
+        return Strings.redactAndTruncate(body, secret);
+    }
+
+    /** Retry backoff for {@code attempt} in ms — the {@link #BACKOFF_MS} schedule
+     *  scaled by {@code llm.retry.backoff-percent} (default 100 = the full 1s/2s/4s
+     *  waits). {@code %test} sets it to 0 so functional tests that hit an unreachable
+     *  provider don't sleep through the backoff: the retry COUNT is unchanged
+     *  ({@link #MAX_RETRIES}), only the delay collapses. */
+    private static long backoffMsFor(int attempt) {
+        var base = BACKOFF_MS[Math.min(attempt, BACKOFF_MS.length - 1)];
+        return base * PlayConfig.intOr("llm.retry.backoff-percent", 100) / 100;
+    }
+
+    private void backoffBeforeRetry(int attempt) {
+        try {
+            var backoff = backoffMsFor(attempt);
+            EventLogger.warn("llm", "Retry %d/%d for %s after %dms"
+                    .formatted(attempt + 1, MAX_RETRIES, config.name(), backoff));
+            parkForMillis(backoff);
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            throw new LlmException("Interrupted during retry", ie);
+        }
+    }
+
+    private static void parkForMillis(long delayMs) throws InterruptedException {
+        try {
+            RETRY_SCHEDULER.schedule(() -> null, delayMs, TimeUnit.MILLISECONDS).get();
+        } catch (ExecutionException e) {
+            throw new LlmException("Retry scheduler failed", e.getCause() != null ? e.getCause() : e);
+        }
+    }
+
+    // ─── Usage parsing ────────────────────────────────────────────────────
+
+    /** Usage key carrying the reasoning-token count, at top level and under the details object. */
+    private static final String JSON_REASONING_TOKENS = "reasoning_tokens";
+
+    /**
+     * Leaf key names already carried by a dedicated {@link Usage} component, in every
+     * spelling the providers use. {@link #extractProviderMetrics} skips these so a
+     * field is never reported twice under two names.
+     */
+    private static final Set<String> MAPPED_USAGE_KEYS = Set.of(
+            "prompt_tokens", "completion_tokens", "total_tokens",
+            JSON_REASONING_TOKENS, "cached_tokens",
+            "cache_creation_input_tokens", "cache_creation_tokens", "cache_write_tokens",
+            "cost");
+
+    /**
+     * Collect the numeric usage fields this provider reports that no {@link Usage}
+     * component covers (JCLAW-1147).
+     *
+     * <p>Collection is by shape rather than by allow-list, because an allow-list goes
+     * stale silently: OpenRouter alone currently reports seven such fields
+     * ({@code cost_details.upstream_inference_cost} and the audio/image/video token
+     * breakdowns), and the set grows without notice. Walking one level of nesting
+     * matches the paths {@link #readUsageInt(JsonObject, String, String)} already
+     * reads, and keys are namespaced by their parent so {@code cost_details.*} cannot
+     * collide with a same-named top-level field.
+     *
+     * <p>Only JSON numbers are taken. That is what keeps the turn-level sum in
+     * {@link llm.LlmTypes.ProviderMetrics#plus} honest — it also happens to exclude
+     * flags such as OpenRouter's {@code is_byok}, which is a boolean on the wire and
+     * would be meaningless added across rounds.
+     *
+     * <p>Override to refine when a provider reports a field that is not additive.
+     */
+    protected ProviderMetrics extractProviderMetrics(JsonObject usageObj) {
+        if (usageObj == null) return ProviderMetrics.EMPTY;
+        var out = new LinkedHashMap<String, Double>();
+        for (var entry : usageObj.entrySet()) {
+            var value = entry.getValue();
+            if (value == null || value.isJsonNull()) continue;
+            if (value.isJsonObject()) {
+                collectNumerics(value.getAsJsonObject(), entry.getKey() + ".", out);
+            } else {
+                collectNumeric(entry.getKey(), entry.getKey(), value, out);
+            }
+        }
+        return out.isEmpty() ? ProviderMetrics.EMPTY : new ProviderMetrics(out);
+    }
+
+    private static void collectNumerics(JsonObject obj, String prefix, Map<String, Double> out) {
+        for (var entry : obj.entrySet()) {
+            collectNumeric(entry.getKey(), prefix + entry.getKey(), entry.getValue(), out);
+        }
+    }
+
+    private static void collectNumeric(String leafKey, String path,
+                                       JsonElement value, Map<String, Double> out) {
+        if (MAPPED_USAGE_KEYS.contains(leafKey)) return;
+        if (value == null || !value.isJsonPrimitive() || !value.getAsJsonPrimitive().isNumber()) return;
+        try {
+            out.put(path, value.getAsDouble());
+        } catch (NumberFormatException _) {
+            // A provider sending a non-parsable number must not fail the whole turn.
+        }
+    }
+
+    /**
+     * Instance method: parse a usage JSON object using this provider's template
+     * methods ({@link #extractReasoningTokens}, {@link #extractCachedTokens},
+     * {@link #extractCacheCreationTokens}, {@link #extractCostUsd}). Subclass
+     * overrides are honored, so provider-specific JSON paths are handled correctly.
+     *
+     * @param usageObj the provider's {@code usage} JSON object
+     * @return the parsed {@link Usage} record with all token-count categories and
+     *         the provider-reported cost populated
+     */
+    public Usage parseUsage(JsonObject usageObj) {
+        return new Usage(
+                readUsageInt(usageObj, "prompt_tokens"),
+                readUsageInt(usageObj, "completion_tokens"),
+                readUsageInt(usageObj, "total_tokens"),
+                extractReasoningTokens(usageObj),
+                extractCachedTokens(usageObj),
+                extractCacheCreationTokens(usageObj),
+                extractCostUsd(usageObj),
+                extractProviderMetrics(usageObj));
+    }
+
+    /**
+     * A failed provider call. The subclasses name where the fault lies, because a
+     * circuit breaker layered on these calls must not count a request this codebase
+     * got wrong against a provider that is perfectly healthy (JCLAW-1166). Everything
+     * remains an {@code LlmException}, so a {@code catch (LlmException)} — the
+     * retry-abort in {@link #executeWithRetry} and the {@link #chatWithFailover}
+     * trigger — is unaffected by the distinction.
+     */
+    public static class LlmException extends RuntimeException {
+
+        private final LlmErrorTemplates.@Nullable Failure failure;
+
+        public LlmException(String message) { this(message, null, null); }
+        public LlmException(String message, @Nullable Throwable cause) { this(message, cause, null); }
+
+        public LlmException(String message, @Nullable Throwable cause,
+                            LlmErrorTemplates.@Nullable Failure failure) {
+            super(message, cause);
+            this.failure = failure;
+        }
+
+        /**
+         * The remedy this failure needs, with the provider and model of the call that produced it
+         * (JCLAW-1134), or null for a failure that never reached a provider call. Orthogonal to
+         * the subclass: the subclass says whose fault it was, this says what to do about it.
+         */
+        public LlmErrorTemplates.@Nullable Failure failure() { return failure; }
+
+        /** A 4xx, or a 429 naming an exhausted balance: our request, and retrying never fixes it. */
+        public static final class ClientError extends LlmException {
+            private final int status;
+            private final @Nullable String body;
+
+            public ClientError(String message) { this(message, null, 0, null); }
+            public ClientError(String message, LlmErrorTemplates.@Nullable Failure failure) {
+                this(message, failure, 0, null);
+            }
+            /** @param status the HTTP status behind this error, or 0 when there was none
+             *  @param body   the sanitized answer body, for a caller that has to tell one 4xx from another */
+            public ClientError(String message, LlmErrorTemplates.@Nullable Failure failure,
+                               int status, @Nullable String body) {
+                super(message, null, failure);
+                this.status = status;
+                this.body = body;
+            }
+            public int status() { return status; }
+            public @Nullable String body() { return body; }
+        }
+
+        /** A 5xx: the provider is unwell. */
+        public static class ServerError extends LlmException {
+            public ServerError(String message) { super(message); }
+            public ServerError(String message, @Nullable Throwable cause) { super(message, cause); }
+            public ServerError(String message, @Nullable Throwable cause,
+                               LlmErrorTemplates.@Nullable Failure failure) {
+                super(message, cause, failure);
+            }
+        }
+
+        /**
+         * The provider's circuit breaker refused the call before the wire (JCLAW-1188). A
+         * {@code ServerError} so failover and every other 5xx path behave exactly as before,
+         * and a distinct class so a retry-on-5xx rule can tell a refusal from a wire failure:
+         * retrying a refusal re-enters the same open breaker and can spend a HALF_OPEN permit.
+         */
+        public static class BreakerOpen extends ServerError {
+            public BreakerOpen(String message) { super(message); }
+        }
+
+        /**
+         * The operator opened this provider's breaker by hand (JCLAW-1170): a refusal, and a
+         * distinct class so an operator's decision is never read back as the provider having
+         * failed.
+         */
+        public static final class ManuallyIsolated extends BreakerOpen {
+            public ManuallyIsolated(String message) { super(message); }
+        }
+
+        /** A retryable 429 — over the rate, not out of credit. */
+        public static final class RateLimited extends LlmException {
+            public RateLimited(String message) { super(message); }
+            public RateLimited(String message, @Nullable Throwable cause) { super(message, cause); }
+            public RateLimited(String message, @Nullable Throwable cause,
+                               LlmErrorTemplates.@Nullable Failure failure) {
+                super(message, cause, failure);
+            }
+        }
+
+        /** No HTTP answer at all: refused connection, socket timeout, TLS failure. */
+        public static final class Transport extends LlmException {
+            public Transport(String message, @Nullable Throwable cause) { super(message, cause); }
+            public Transport(String message, @Nullable Throwable cause,
+                             LlmErrorTemplates.@Nullable Failure failure) {
+                super(message, cause, failure);
+            }
+        }
+    }
+}

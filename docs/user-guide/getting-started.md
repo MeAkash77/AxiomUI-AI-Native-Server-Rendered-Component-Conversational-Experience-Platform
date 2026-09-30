@@ -1,0 +1,79 @@
+# Getting Started
+
+Welcome to JClaw! This user guide will help you understand how JClaw works and make the most of its functionality.
+
+## What is JClaw?
+
+JClaw is a workbench for building, running, and observing AI agents. You configure agents (their model, system prompt, and tools), give them work to do through [Chat](/chat) or external channels, and watch what they do across the rest of the app.
+
+JClaw Pro is a single-operator workbench: one **admin** login, the built-in **main** agent, and any custom agents you create.
+
+## How the rest of the guide is organized
+
+The whole product layers on a single core loop: you send a message in [Chat](/chat) and an agent answers. Every other capability in JClaw is a layer on top of that:
+
+1. **[Chat](/guide#chat)** is the base experience — pick an agent, send messages, get answers.
+2. **[Prompts](/guide#prompts)** is your library of saved, reusable prompts you drop into the composer.
+3. **[Agents](/guide#agents)** is where you configure the entities answering you — model, prompt, tools, skills.
+4. **[Conversations & Channels](/guide#conversations-and-channels)** is your chat history *and* how to make agents reachable from Slack, Telegram, and WhatsApp instead of just the web app.
+5. **[Subagents](/guide#subagents)**, **[Tasks](/guide#tasks)**, and **[Reminders](/guide#reminders)** are three flavors of "stuff happens outside the current chat turn" — parallel work *now*, scheduled work *later*, and pure scheduled notifications. [Subagents, Tasks, or Reminders?](/guide#subagents-tasks-reminders) is the side-by-side comparison if you're not sure which fits.
+6. **[Scrapes](/guide#scrapes)** is where you start, watch and read background scrapes — a website read page by page, well beyond what fits in one chat turn.
+7. **[Skills, Tools & MCP Servers](/guide#skills-tools-mcp)** is how you extend what agents can do beyond plain text — web search, shell exec, external systems.
+8. **[Apps](/guide#apps)** is how a repeatable ask becomes a small self-contained web app — the agent builds it, JClaw hosts it.
+9. **[Settings](/guide#settings)** is the operator's control panel for everything above.
+10. **[Memories](/guide#memory)** is what your agents have captured about you and your work, and where you curate it.
+11. **[Logs & Dashboard](/guide#logs-and-dashboard)** is how you watch what's happening across the whole platform.
+
+Read in that order if it's your first time. Skim if you're hunting for a specific thing.
+
+## Your first five minutes
+
+1. **Set a theme.** The toggle is in the top-right of every page (system / light / dark).
+2. **Visit [Settings](/settings) and add at least one LLM provider.** Without an API key (or a local provider like Ollama configured), no agent can answer. See the [Settings](/guide#settings) section of this guide for what each provider needs.
+3. **Visit [Agents](/agents) and create or enable an agent.** Pick a model, describe its role in the `AGENT.md` workspace file, and turn on whatever tools you need. The default agent template is a sensible starting point.
+4. **Open [Chat](/chat), pick that agent from the Agent dropdown in the header, and say hello.** Your conversation is saved, and you can reopen it later from [Conversations](/conversations).
+
+That's the minimum loop. Everything else in this guide is how to do more with it.
+
+### Staying signed in
+
+Your session lasts an hour of **inactivity**, not an hour in total — every request pushes the window out, so a tab you keep working in never signs you out. Leave it alone for an hour and you'll log in again.
+
+Changing or resetting the admin password signs out every other session immediately. That is deliberate: it is what makes a password change a way to revoke access you did not intend to give, rather than only a way to change what you type. Upgrading to v0.17.80 or later also asks everyone to sign in once more, because sessions issued before that release predate the check.
+
+## The sidebar at a glance
+
+The left sidebar is grouped by intent:
+
+| Group | What lives there |
+| --- | --- |
+| _(top)_ | [Dashboard](/) — the home overview, sits above the groups. |
+| **Chat** | [Chats](/chat) (live conversations), [Prompts](/prompts) (saved, reusable prompts you run into the composer), [Channels](/channels) (external chat surfaces like Slack), [Conversations](/conversations) (every prior thread). |
+| **Ops** | [Agents](/agents), [Subagents](/subagents), [Scrapes](/scrapes) (background website crawls), [Apps](/apps), [Tasks](/tasks), [Reminders](/reminders) (your scheduled nudges), [Skills](/skills), [Tools](/tools), [MCP Servers](/mcp-servers). |
+| **Admin** | [Settings](/settings), [Memories](/memories) (captured agent memories), [Logs](/logs). |
+| **Help** | Feedback, Guided Tour, this **User Guide**. |
+
+At the bottom, two diagnostic rows: your JClaw version (with a pip for API status — green when online, red when offline, amber when a newer release is available, which links to **Settings → Maintenance**) and the Play framework version (with a green/amber pip showing whether it matches the pinned `.play-version`). Red on the first dot means the backend is unreachable — most pages will fail until it recovers. Below them are your username and **Sign out** (an exit icon when the sidebar is collapsed).
+
+Up in the top bar, the **Search…** box on the right — beside the theme toggle — opens the command palette. <kbd>⌘</kbd>+<kbd>K</kbd> (<kbd>Ctrl</kbd>+<kbd>K</kbd> on Windows and Linux) opens or closes it from any page.
+
+## The Guided Tour
+
+The first time you sign in, JClaw offers a short on-rails tour that highlights the main pages in sequence. You can re-launch it any time from the sidebar under **Help → Guided Tour**.
+
+The tour is fast (a few minutes) and complementary to this guide:
+
+- **Guided Tour** — "where is everything?"
+- **User Guide** (this) — "how do I use it?"
+
+## Where to go next
+
+The natural next step is [Chat](/guide#chat) — the base loop everything else builds on.
+
+:::tip
+Every page title in the top breadcrumb takes you back to that page. The **JClaw** crumb is always home (the [Dashboard](/)).
+:::
+
+:::note Beta software
+JClaw is still pre-1.0. UI labels and behaviors may shift between releases. If something you see doesn't match what this guide says, the **Feedback** link in the sidebar is the fastest way to flag it.
+:::

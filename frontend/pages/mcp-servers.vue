@@ -1,0 +1,1097 @@
+<script setup lang="ts">
+import type { Breaker, McpServer, McpTestResult } from '~/types/api'
+import { isSensitiveKey } from '~/utils/secrets'
+import { ArrowPathIcon, BeakerIcon, BoltIcon, ChevronDownIcon, ChevronRightIcon, PlusIcon, TrashIcon, XMarkIcon } from '@heroicons/vue/24/outline'
+
+const { data: servers, refresh } = await useFetch<McpServer[]>('/api/mcp-servers')
+const { mutate, error: mutationError } = useApiMutation()
+// The row switch and delete: kept apart from the form's mutation so its error is not shown twice.
+const { mutate: mutateServer, errorDetails: serverError } = useApiMutation()
+const { confirm } = useConfirm()
+
+type TransportKind = 'STDIO' | 'HTTP'
+
+// A secret loaded from the server keeps the name and mask it came with (JCLAW-1331).
+interface KeyValueRow { key: string, value: string, savedKey?: string, savedMask?: string }
+interface FormState {
+  id: number | null
+  name: string
+  enabled: boolean
+  transport: TransportKind
+  command: string
+  argsRaw: string
+  envRows: KeyValueRow[]
+  url: string
+  headerRows: KeyValueRow[]
+}
+
+const editing = ref<FormState | null>(null)
+const expandedRowId = ref<number | null>(null)
+/**
+ * Disclosure state for the per-tool list. Independent of expandedRowId
+ * (which governs the edit panel) so the operator can have the tools list
+ * open on one row while editing another — different intents, different
+ * affordances.
+ */
+const expandedToolsRowId = ref<number | null>(null)
+function toggleToolsExpand(id: number) {
+  expandedToolsRowId.value = expandedToolsRowId.value === id ? null : id
+}
+const testResult = ref<McpTestResult | null>(null)
+const testResultForId = ref<number | null>(null)
+const testing = ref(false)
+const saveError = ref<string | null>(null)
+
+/**
+ * Banner auto-dismiss for the inline test-result row. After this many ms
+ * the banner clears itself and the row collapses back to its normal
+ * shape — operators don't have to manually dismiss long stack-trace
+ * failure messages. Tracked as a ref-held timer ID so overlapping test
+ * invocations cancel the prior auto-clear (otherwise a second test
+ * scheduled at T+0 would be wiped by the first test's T+0+5s timer).
+ */
+const TEST_RESULT_DISMISS_MS = 6000
+let testResultDismissTimer: ReturnType<typeof setTimeout> | null = null
+
+function clearTestResultDismissTimer() {
+  if (testResultDismissTimer !== null) {
+    clearTimeout(testResultDismissTimer)
+    testResultDismissTimer = null
+  }
+}
+
+function clearTestResult() {
+  clearTestResultDismissTimer()
+  testResult.value = null
+  testResultForId.value = null
+}
+
+function scheduleTestResultDismiss() {
+  clearTestResultDismissTimer()
+  testResultDismissTimer = setTimeout(() => {
+    testResult.value = null
+    testResultForId.value = null
+    testResultDismissTimer = null
+  }, TEST_RESULT_DISMISS_MS)
+}
+
+onBeforeUnmount(clearTestResultDismissTimer)
+
+// Stable ID prefix used to scope every form input — both add and edit
+// flows share one editing form so reusing one prefix across both is
+// fine. The IDs satisfy `vuejs-accessibility/label-has-for` which wants
+// labels to both nest a control AND carry a matching `for=`.
+const formId = useId()
+
+function blankForm(): FormState {
+  return {
+    id: null,
+    name: '',
+    enabled: true,
+    transport: 'STDIO',
+    command: '',
+    argsRaw: '',
+    envRows: [{ key: '', value: '' }],
+    url: '',
+    headerRows: [{ key: '', value: '' }],
+  }
+}
+
+function savedSecret(key: string, mask: string): KeyValueRow {
+  return { key, value: '', savedKey: key, savedMask: mask }
+}
+
+// Renamed, a secret is no longer the one saved under that name, so it needs a value again.
+function isSavedSecret(row: KeyValueRow): boolean {
+  return row.savedMask !== undefined && row.key.trim() === row.savedKey
+}
+
+function formFromServer(s: McpServer): FormState {
+  // The server masks env values with sensitive names and every header value, as ConfigService does.
+  const envRows = Object.entries(s.env || {}).map(([key, value]) => isSensitiveKey(key) ? savedSecret(key, value) : { key, value })
+  if (envRows.length === 0) envRows.push({ key: '', value: '' })
+  const headerRows = Object.entries(s.headers || {}).map(([key, value]) => savedSecret(key, value))
+  if (headerRows.length === 0) headerRows.push({ key: '', value: '' })
+  return {
+    id: s.id,
+    name: s.name,
+    enabled: s.enabled,
+    transport: s.transport,
+    command: s.command || '',
+    argsRaw: (s.args || []).join('\n'),
+    envRows,
+    url: s.url || '',
+    headerRows,
+  }
+}
+
+function openAddForm() {
+  editing.value = blankForm()
+  expandedRowId.value = null
+  clearTestResult()
+  saveError.value = null
+}
+
+function openEditForm(s: McpServer) {
+  editing.value = formFromServer(s)
+  expandedRowId.value = s.id
+  clearTestResult()
+  saveError.value = null
+}
+
+function cancelEdit() {
+  editing.value = null
+  expandedRowId.value = null
+  clearTestResult()
+  saveError.value = null
+}
+
+function rowsToMap(rows: KeyValueRow[]): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const r of rows) {
+    // An untouched secret goes back as its mask, which the server swaps for the stored value.
+    if (r.key.trim()) out[r.key.trim()] = r.value === '' && isSavedSecret(r) ? r.savedMask! : r.value
+  }
+  return out
+}
+
+function buildPayload(form: FormState) {
+  const base: Record<string, unknown> = {
+    name: form.name.trim(),
+    enabled: form.enabled,
+    transport: form.transport,
+  }
+  if (form.transport === 'STDIO') {
+    base.command = form.command.trim()
+    base.args = form.argsRaw.split('\n').map(s => s.trim()).filter(s => s.length > 0)
+    base.env = rowsToMap(form.envRows)
+  }
+  else {
+    base.url = form.url.trim()
+    base.headers = rowsToMap(form.headerRows)
+  }
+  return base
+}
+
+async function saveForm() {
+  if (!editing.value) return
+  saveError.value = null
+  const form = editing.value
+  if (!form.name.trim()) {
+    saveError.value = 'Name is required'
+    return
+  }
+  const payload = buildPayload(form)
+  const result = form.id == null
+    ? await mutate<McpServer>('/api/mcp-servers', { method: 'POST', body: payload })
+    : await mutate<McpServer>(`/api/mcp-servers/${form.id}`, { method: 'PUT', body: payload })
+  if (result == null) {
+    saveError.value = mutationError.value || 'Save failed'
+    return
+  }
+  await refresh()
+  editing.value = null
+  expandedRowId.value = null
+  // A newly-created or edited server enters CONNECTING immediately; drop the
+  // watcher out of its idle wait so the badge tracks from the first tick.
+  kick()
+}
+
+async function toggleEnabled(s: McpServer) {
+  await mutateServer<McpServer>(`/api/mcp-servers/${s.id}`, {
+    method: 'PUT',
+    body: { enabled: !s.enabled },
+  })
+  await refresh()
+  kick()
+}
+
+// Live connection status for as long as the page is open. Owns its own timer
+// and unmount cleanup; kick() collapses its idle wait after a mutation.
+const { kick } = useMcpStatusWatcher(servers, refresh)
+
+// Tool-call breakers, keyed mcp:<server>. A server never called has none.
+const { byName: breakersByName, refresh: refreshBreakers } = useBreakers()
+const expandedBreakerRowId = ref<number | null>(null)
+
+function breakerOf(s: McpServer) {
+  return breakersByName.value.get(`mcp:${s.name}`)
+}
+
+/** A breaker that is not serving opens its row by itself; a serving one only on request. */
+function breakerRowShown(s: McpServer) {
+  const b = breakerOf(s)
+  return !!b && (b.state !== 'CLOSED' || expandedBreakerRowId.value === s.id)
+}
+
+function toggleBreakerRow(id: number) {
+  expandedBreakerRowId.value = expandedBreakerRowId.value === id ? null : id
+}
+
+const breakerIconClass: Record<Breaker['state'], string> = {
+  CLOSED: 'text-fg-muted hover:text-fg-strong',
+  HALF_OPEN: 'text-amber-700 dark:text-amber-400',
+  OPEN: 'text-red-700 dark:text-red-400',
+}
+const breakerAccentClass: Record<Breaker['state'], string> = {
+  CLOSED: 'border-l-border',
+  HALF_OPEN: 'border-l-amber-500',
+  OPEN: 'border-l-red-500',
+}
+
+async function deleteServer(s: McpServer) {
+  const ok = await confirm({
+    title: `Delete MCP server "${s.name}"?`,
+    message: 'Disconnects the server, removes it from the registry, and clears all per-agent allowlist entries. The action is audited as MCP_TOOL_UNREGISTER and cannot be undone.',
+    confirmText: 'Delete',
+    variant: 'danger',
+  })
+  if (!ok) return
+  await mutateServer(`/api/mcp-servers/${s.id}`, { method: 'DELETE' })
+  await refresh()
+}
+
+async function testServer(s: McpServer) {
+  clearTestResultDismissTimer()
+  testResult.value = null
+  testResultForId.value = s.id
+  testing.value = true
+  try {
+    const result = await mutate<McpTestResult>(`/api/mcp-servers/${s.id}/test`, {
+      method: 'POST',
+      body: {},
+    })
+    testResult.value = result
+    scheduleTestResultDismiss()
+  }
+  finally {
+    testing.value = false
+  }
+}
+
+async function testFromForm() {
+  if (editing.value?.id == null) {
+    saveError.value = 'Save first, then test connection.'
+    return
+  }
+  await testServer({ id: editing.value.id } as McpServer)
+}
+
+const statusBadgeClass: Record<McpServer['status'], string> = {
+  CONNECTED: 'text-green-700 dark:text-green-400 border-current',
+  CONNECTING: 'text-yellow-700 dark:text-yellow-400 border-current',
+  DISCONNECTED: 'text-fg-muted border-current',
+  ERROR: 'text-red-700 dark:text-red-400 border-current',
+}
+
+function addEnvRow() {
+  editing.value?.envRows.push({ key: '', value: '' })
+}
+function removeEnvRow(i: number) {
+  if (!editing.value) return
+  editing.value.envRows.splice(i, 1)
+  if (editing.value.envRows.length === 0) editing.value.envRows.push({ key: '', value: '' })
+}
+function addHeaderRow() {
+  editing.value?.headerRows.push({ key: '', value: '' })
+}
+function removeHeaderRow(i: number) {
+  if (!editing.value) return
+  editing.value.headerRows.splice(i, 1)
+  if (editing.value.headerRows.length === 0) editing.value.headerRows.push({ key: '', value: '' })
+}
+</script>
+
+<template>
+  <div>
+    <div class="flex items-center justify-between mb-6">
+      <h1 class="text-lg font-semibold text-fg-strong">
+        MCP Servers
+      </h1>
+      <button
+        type="button"
+        class="inline-flex items-center gap-1.5 text-xs px-3 py-1.5 bg-emerald-700 hover:bg-emerald-800 text-white"
+        @click="openAddForm"
+      >
+        <PlusIcon class="w-4 h-4" />
+        Add server
+      </button>
+    </div>
+
+    <p class="text-sm text-fg-muted mb-4">
+      MCP (Model Context Protocol) servers let your agents reach external systems —
+      Jira, Confluence, GitHub, your filesystem, and so on — through a standard
+      action protocol. Add a server here, and the actions it exposes become
+      available to any agent you grant access to. Each agent's allowed servers
+      are configured per-agent on the
+      <NuxtLink
+        to="/agents"
+        class="underline decoration-dotted hover:text-fg-strong"
+      >
+        Agents page
+      </NuxtLink>. Deleting a server disconnects it and revokes every agent's access.
+    </p>
+
+    <!-- Add form (when no row is being edited) -->
+    <div
+      v-if="editing && editing.id == null"
+      class="mb-6 border border-emerald-600/40 bg-surface-elevated p-4"
+    >
+      <div class="flex items-center justify-between mb-3">
+        <h2 class="text-sm font-semibold text-fg-strong">
+          New MCP server
+        </h2>
+        <button
+          type="button"
+          class="p-0.5 -m-0.5 text-fg-muted hover:text-fg-strong"
+          aria-label="Cancel"
+          @click="cancelEdit"
+        >
+          <XMarkIcon class="w-5 h-5" />
+        </button>
+      </div>
+
+      <form
+        class="space-y-4"
+        @submit.prevent="saveForm"
+      >
+        <div class="flex items-end gap-4">
+          <label
+            :for="`${formId}-name`"
+            class="flex-1 min-w-0 block"
+          >
+            <span class="block text-xs text-fg-muted mb-1">Name</span>
+            <input
+              :id="`${formId}-name`"
+              v-model="editing.name"
+              type="text"
+              required
+              pattern="^[a-zA-Z0-9_][a-zA-Z0-9_-]{0,63}$"
+              placeholder="github"
+              class="w-full bg-surface border border-input text-sm text-fg-strong px-2 py-1 focus:outline-hidden"
+            >
+          </label>
+          <label
+            :for="`${formId}-enabled`"
+            class="flex items-center gap-2"
+          >
+            <input
+              :id="`${formId}-enabled`"
+              v-model="editing.enabled"
+              type="checkbox"
+            >
+            <span class="text-xs text-fg-muted">Enabled</span>
+          </label>
+        </div>
+
+        <fieldset class="min-w-0">
+          <legend class="block text-xs text-fg-muted mb-1">
+            Transport
+          </legend>
+          <div class="flex gap-4">
+            <label
+              :for="`${formId}-stdio`"
+              class="flex items-center gap-2 text-sm"
+            >
+              <input
+                :id="`${formId}-stdio`"
+                v-model="editing.transport"
+                type="radio"
+                value="STDIO"
+              >
+              <span>STDIO</span>
+            </label>
+            <label
+              :for="`${formId}-http`"
+              class="flex items-center gap-2 text-sm"
+            >
+              <input
+                :id="`${formId}-http`"
+                v-model="editing.transport"
+                type="radio"
+                value="HTTP"
+              >
+              <span>HTTP (Streamable)</span>
+            </label>
+          </div>
+        </fieldset>
+
+        <div
+          v-if="editing.transport === 'STDIO'"
+          class="space-y-3 border-l-2 border-emerald-600/40 pl-3"
+        >
+          <label
+            :for="`${formId}-command`"
+            class="block"
+          >
+            <span class="block text-xs text-fg-muted mb-1">Command</span>
+            <input
+              :id="`${formId}-command`"
+              v-model="editing.command"
+              type="text"
+              required
+              placeholder="npx"
+              class="w-full bg-surface border border-input text-sm text-fg-strong px-2 py-1 font-mono focus:outline-hidden"
+            >
+          </label>
+          <label
+            :for="`${formId}-args`"
+            class="block"
+          >
+            <span class="block text-xs text-fg-muted mb-1">Arguments (one per line)</span>
+            <textarea
+              :id="`${formId}-args`"
+              v-model="editing.argsRaw"
+              rows="3"
+              placeholder="-y&#10;@modelcontextprotocol/server-github"
+              class="w-full bg-surface border border-input text-sm text-fg-strong px-2 py-1 font-mono focus:outline-hidden"
+            />
+          </label>
+          <fieldset class="min-w-0">
+            <legend class="block text-xs text-fg-muted mb-1">
+              Environment variables
+            </legend>
+            <div class="space-y-1.5">
+              <div
+                v-for="(row, i) in editing.envRows"
+                :key="`add-env-${i}`"
+                class="flex gap-2 items-center"
+              >
+                <input
+                  v-model="row.key"
+                  type="text"
+                  placeholder="KEY"
+                  aria-label="Environment variable name"
+                  class="flex-1 min-w-0 bg-surface border border-input text-xs text-fg-strong px-2 py-1 font-mono focus:outline-hidden"
+                >
+                <SecretField
+                  v-if="isSensitiveKey(row.key)"
+                  v-model="row.value"
+                  form
+                  :saved="isSavedSecret(row)"
+                  label="Environment variable value"
+                  placeholder="value"
+                  input-class="flex-1 min-w-0 bg-surface border border-input text-xs text-fg-strong px-2 py-1 font-mono focus:outline-hidden"
+                />
+                <input
+                  v-else
+                  v-model="row.value"
+                  type="text"
+                  placeholder="value"
+                  aria-label="Environment variable value"
+                  class="flex-1 min-w-0 bg-surface border border-input text-xs text-fg-strong px-2 py-1 font-mono focus:outline-hidden"
+                >
+                <button
+                  type="button"
+                  class="text-fg-muted hover:text-red-700 dark:hover:text-red-400 p-1"
+                  aria-label="Remove env var"
+                  @click="removeEnvRow(i)"
+                >
+                  <TrashIcon class="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+            <button
+              type="button"
+              class="mt-1.5 text-xs text-fg-muted hover:text-fg-strong inline-flex items-center gap-1"
+              @click="addEnvRow"
+            >
+              <PlusIcon class="w-3.5 h-3.5" />
+              Add env var
+            </button>
+          </fieldset>
+        </div>
+
+        <div
+          v-else
+          class="space-y-3 border-l-2 border-emerald-600/40 pl-3"
+        >
+          <label
+            :for="`${formId}-url`"
+            class="block"
+          >
+            <span class="block text-xs text-fg-muted mb-1">Endpoint URL</span>
+            <input
+              :id="`${formId}-url`"
+              v-model="editing.url"
+              type="url"
+              required
+              placeholder="https://mcp.example.com/v1/mcp"
+              class="w-full bg-surface border border-input text-sm text-fg-strong px-2 py-1 font-mono focus:outline-hidden"
+            >
+          </label>
+          <fieldset class="min-w-0">
+            <legend class="block text-xs text-fg-muted mb-1">
+              Headers
+            </legend>
+            <div class="space-y-1.5">
+              <div
+                v-for="(row, i) in editing.headerRows"
+                :key="`add-hdr-${i}`"
+                class="flex gap-2 items-center"
+              >
+                <input
+                  v-model="row.key"
+                  type="text"
+                  placeholder="Header-Name"
+                  aria-label="Header name"
+                  class="flex-1 min-w-0 bg-surface border border-input text-xs text-fg-strong px-2 py-1 font-mono focus:outline-hidden"
+                >
+                <SecretField
+                  v-model="row.value"
+                  form
+                  :saved="isSavedSecret(row)"
+                  label="Header value"
+                  placeholder="value"
+                  input-class="flex-1 min-w-0 bg-surface border border-input text-xs text-fg-strong px-2 py-1 font-mono focus:outline-hidden"
+                />
+                <button
+                  type="button"
+                  class="text-fg-muted hover:text-red-700 dark:hover:text-red-400 p-1"
+                  aria-label="Remove header"
+                  @click="removeHeaderRow(i)"
+                >
+                  <TrashIcon class="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+            <button
+              type="button"
+              class="mt-1.5 text-xs text-fg-muted hover:text-fg-strong inline-flex items-center gap-1"
+              @click="addHeaderRow"
+            >
+              <PlusIcon class="w-3.5 h-3.5" />
+              Add header
+            </button>
+          </fieldset>
+        </div>
+
+        <div
+          v-if="saveError"
+          class="text-xs text-red-700 dark:text-red-400 border border-current bg-red-400/5 p-2"
+        >
+          {{ saveError }}
+        </div>
+
+        <div class="flex items-center gap-2 pt-2">
+          <button
+            type="submit"
+            class="text-xs px-3 py-1.5 bg-emerald-700 hover:bg-emerald-800 text-white"
+          >
+            Create
+          </button>
+          <button
+            type="button"
+            class="text-xs px-3 py-1.5 text-fg-muted hover:text-fg-strong ml-auto"
+            @click="cancelEdit"
+          >
+            Cancel
+          </button>
+        </div>
+      </form>
+    </div>
+
+    <ApiErrorAlert
+      :error="serverError"
+      class="mb-4"
+    />
+    <div class="bg-surface-elevated border border-border overflow-x-auto">
+      <table class="w-full text-sm">
+        <thead>
+          <tr class="border-b border-border text-left text-xs text-fg-muted">
+            <th class="px-4 py-2.5 font-medium">
+              Name
+            </th>
+            <th class="px-4 py-2.5 font-medium">
+              Transport
+            </th>
+            <th class="px-4 py-2.5 font-medium">
+              Endpoint
+            </th>
+            <th class="px-4 py-2.5 font-medium">
+              Status
+            </th>
+            <th class="px-4 py-2.5 font-medium">
+              Tools
+            </th>
+            <th class="px-4 py-2.5 font-medium text-right">
+              Actions
+            </th>
+          </tr>
+        </thead>
+        <tbody class="divide-y divide-border">
+          <template
+            v-for="server in servers"
+            :key="server.id"
+          >
+            <tr>
+              <td class="px-4 py-2.5 text-fg-primary font-medium">
+                {{ server.name }}
+                <span
+                  v-if="server.duplicateOf"
+                  class="ml-2 text-[10px] text-amber-700 dark:text-amber-400 border border-amber-400/40 px-1 whitespace-nowrap"
+                  :title="`Same transport and configuration as ${server.duplicateOf}. It runs a second process and lists every action twice.`"
+                  data-testid="mcp-duplicate-of"
+                >duplicate of {{ server.duplicateOf }}</span>
+              </td>
+              <td class="px-4 py-2.5 text-fg-muted font-mono text-xs">
+                {{ server.transport }}
+              </td>
+              <td class="px-4 py-2.5 text-fg-muted font-mono text-xs truncate max-w-xs">
+                {{ server.transport === 'HTTP' ? server.url : `${server.command || ''} ${(server.args || []).join(' ')}`.trim() }}
+              </td>
+              <td class="px-4 py-2.5">
+                <div class="flex items-center gap-1.5">
+                  <span
+                    class="text-[10px] font-mono px-1.5 py-px rounded-sm border"
+                    :class="statusBadgeClass[server.status]"
+                    :title="server.lastError || ''"
+                  >{{ server.status }}</span>
+                  <button
+                    v-if="breakerOf(server)"
+                    type="button"
+                    class="p-0.5 transition-colors"
+                    :class="breakerIconClass[breakerOf(server)!.state]"
+                    :title="`Circuit breaker ${breakerOf(server)!.state.replace('_', ' ').toLowerCase()}`"
+                    :aria-label="`Circuit breaker for ${server.name}`"
+                    :aria-expanded="breakerRowShown(server)"
+                    :data-testid="`mcp-breaker-toggle-${server.name}`"
+                    @click="toggleBreakerRow(server.id)"
+                  >
+                    <BoltIcon
+                      class="w-3.5 h-3.5"
+                      aria-hidden="true"
+                    />
+                  </button>
+                </div>
+              </td>
+              <td class="px-4 py-2.5 text-fg-muted text-xs">
+                <button
+                  v-if="server.toolCount > 0"
+                  type="button"
+                  class="inline-flex items-center gap-1 hover:text-fg-strong transition-colors"
+                  :title="expandedToolsRowId === server.id ? 'Hide tool list' : 'Show tool list'"
+                  :aria-label="expandedToolsRowId === server.id ? `Hide ${server.toolCount} tools for ${server.name}` : `Show ${server.toolCount} tools for ${server.name}`"
+                  :aria-expanded="expandedToolsRowId === server.id"
+                  @click="toggleToolsExpand(server.id)"
+                >
+                  <ChevronRightIcon
+                    class="w-3 h-3 transition-transform"
+                    :class="{ 'rotate-90': expandedToolsRowId === server.id }"
+                  />
+                  {{ server.toolCount }}
+                </button>
+                <span v-else>0</span>
+              </td>
+              <td class="px-4 py-2.5 text-right">
+                <div class="flex items-center justify-end gap-3">
+                  <button
+                    type="button"
+                    class="relative w-9 h-5 rounded-full transition-colors"
+                    :class="server.enabled ? 'bg-emerald-600 hover:bg-emerald-500' : 'bg-muted hover:bg-neutral-300'"
+                    :title="server.enabled ? 'Disable' : 'Enable'"
+                    role="switch"
+                    :aria-checked="server.enabled"
+                    :aria-label="`${server.name} server`"
+                    @click="toggleEnabled(server)"
+                  >
+                    <span
+                      class="block w-4 h-4 rounded-full bg-white transition-transform"
+                      :class="server.enabled ? 'translate-x-4' : 'translate-x-0.5'"
+                    />
+                  </button>
+                  <button
+                    type="button"
+                    class="text-xs text-fg-muted hover:text-fg-strong transition-colors flex items-center gap-1"
+                    @click="expandedRowId === server.id ? cancelEdit() : openEditForm(server)"
+                  >
+                    Edit
+                    <ChevronDownIcon
+                      class="w-3 h-3 transition-transform"
+                      :class="expandedRowId === server.id ? 'rotate-180' : ''"
+                    />
+                  </button>
+                  <button
+                    type="button"
+                    class="text-fg-muted hover:text-fg-strong transition-colors disabled:opacity-50 disabled:cursor-wait"
+                    :title="testing && testResultForId === server.id ? 'Testing…' : 'Test connection'"
+                    :aria-label="`Test connection to ${server.name}`"
+                    :disabled="testing && testResultForId === server.id"
+                    @click="testServer(server)"
+                  >
+                    <ArrowPathIcon
+                      v-if="testing && testResultForId === server.id"
+                      class="w-4 h-4 animate-spin"
+                    />
+                    <BeakerIcon
+                      v-else
+                      class="w-4 h-4"
+                    />
+                  </button>
+                  <button
+                    type="button"
+                    class="text-fg-muted hover:text-red-700 dark:hover:text-red-400 transition-colors"
+                    :title="`Delete ${server.name}`"
+                    :aria-label="`Delete ${server.name}`"
+                    @click="deleteServer(server)"
+                  >
+                    <TrashIcon class="w-4 h-4" />
+                  </button>
+                </div>
+              </td>
+            </tr>
+
+            <tr
+              v-if="breakerRowShown(server)"
+              :data-testid="`mcp-breaker-row-${server.name}`"
+            >
+              <td
+                colspan="6"
+                class="bg-muted/30 px-4 py-2.5 border-l-2"
+                :class="breakerAccentClass[breakerOf(server)!.state]"
+              >
+                <div class="flex flex-wrap items-center gap-x-3 gap-y-1.5">
+                  <span class="text-xs text-fg-muted shrink-0">Circuit breaker</span>
+                  <BreakerControl
+                    :breaker="breakerOf(server)!"
+                    class="flex-1"
+                    :data-testid="`mcp-breaker-${server.name}`"
+                    @changed="refreshBreakers()"
+                  />
+                </div>
+              </td>
+            </tr>
+
+            <!-- Read-only per-tool list. Phase 6 removed individual
+                 toggling; this disclosure exists so the operator can
+                 still see what each server advertises (name + LLM
+                 description) without diving into the agent edit panel. -->
+            <tr v-if="expandedToolsRowId === server.id && server.tools.length">
+              <td
+                colspan="6"
+                class="bg-muted/30 px-0 py-0"
+              >
+                <!-- Tool catalogue: hairline-divided list inside a
+                     bordered card. Each entry is name (mono accent) +
+                     description (muted body), with a header bar that
+                     names the count so an operator can tell at a
+                     glance whether they're looking at the full set
+                     (e.g. 119 google-workspace actions) without
+                     scanning to the bottom. -->
+                <div class="border-y border-border">
+                  <div class="flex items-center justify-between px-4 py-2 bg-muted/40 border-b border-border">
+                    <span class="text-[11px] uppercase tracking-wider font-medium text-fg-muted">
+                      Tools
+                    </span>
+                    <span class="text-[11px] font-mono tabular-nums text-fg-muted">
+                      {{ server.tools.length }}
+                    </span>
+                  </div>
+                  <ol class="divide-y divide-border/60">
+                    <li
+                      v-for="(tool, idx) in server.tools"
+                      :key="tool.name"
+                      class="grid grid-cols-[2.5rem_1fr] items-baseline gap-x-3 px-4 py-2.5 hover:bg-muted/40 transition-colors"
+                    >
+                      <span class="text-[10px] font-mono tabular-nums text-fg-muted select-none">
+                        {{ String(idx + 1).padStart(3, '0') }}
+                      </span>
+                      <div class="flex flex-col gap-0.5 min-w-0">
+                        <span class="font-mono text-xs text-fg-strong">{{ tool.name }}</span>
+                        <span
+                          v-if="tool.description"
+                          class="text-xs text-fg-muted leading-relaxed"
+                        >{{ tool.description }}</span>
+                      </div>
+                    </li>
+                  </ol>
+                </div>
+              </td>
+            </tr>
+
+            <!-- Inline edit panel — same input structure as the add form -->
+            <tr v-if="expandedRowId === server.id && editing && editing.id === server.id">
+              <td
+                colspan="6"
+                class="bg-muted/30 p-4"
+              >
+                <form
+                  class="space-y-4"
+                  @submit.prevent="saveForm"
+                >
+                  <div class="flex items-end gap-4">
+                    <label
+                      :for="`edit-${server.id}-name`"
+                      class="flex-1 min-w-0 block"
+                    >
+                      <span class="block text-xs text-fg-muted mb-1">Name</span>
+                      <input
+                        :id="`edit-${server.id}-name`"
+                        v-model="editing.name"
+                        type="text"
+                        required
+                        pattern="^[a-zA-Z0-9_][a-zA-Z0-9_-]{0,63}$"
+                        class="w-full bg-surface border border-input text-sm text-fg-strong px-2 py-1 focus:outline-hidden"
+                      >
+                    </label>
+                    <label
+                      :for="`edit-${server.id}-enabled`"
+                      class="flex items-center gap-2"
+                    >
+                      <input
+                        :id="`edit-${server.id}-enabled`"
+                        v-model="editing.enabled"
+                        type="checkbox"
+                      >
+                      <span class="text-xs text-fg-muted">Enabled</span>
+                    </label>
+                  </div>
+
+                  <fieldset class="min-w-0">
+                    <legend class="block text-xs text-fg-muted mb-1">
+                      Transport
+                    </legend>
+                    <div class="flex gap-4">
+                      <label
+                        :for="`edit-${server.id}-stdio`"
+                        class="flex items-center gap-2 text-sm"
+                      >
+                        <input
+                          :id="`edit-${server.id}-stdio`"
+                          v-model="editing.transport"
+                          type="radio"
+                          value="STDIO"
+                        >
+                        <span>STDIO</span>
+                      </label>
+                      <label
+                        :for="`edit-${server.id}-http`"
+                        class="flex items-center gap-2 text-sm"
+                      >
+                        <input
+                          :id="`edit-${server.id}-http`"
+                          v-model="editing.transport"
+                          type="radio"
+                          value="HTTP"
+                        >
+                        <span>HTTP (Streamable)</span>
+                      </label>
+                    </div>
+                  </fieldset>
+
+                  <div
+                    v-if="editing.transport === 'STDIO'"
+                    class="space-y-3 border-l-2 border-emerald-600/40 pl-3"
+                  >
+                    <label
+                      :for="`edit-${server.id}-command`"
+                      class="block"
+                    >
+                      <span class="block text-xs text-fg-muted mb-1">Command</span>
+                      <input
+                        :id="`edit-${server.id}-command`"
+                        v-model="editing.command"
+                        type="text"
+                        required
+                        class="w-full bg-surface border border-input text-sm text-fg-strong px-2 py-1 font-mono focus:outline-hidden"
+                      >
+                    </label>
+                    <label
+                      :for="`edit-${server.id}-args`"
+                      class="block"
+                    >
+                      <span class="block text-xs text-fg-muted mb-1">Arguments (one per line)</span>
+                      <textarea
+                        :id="`edit-${server.id}-args`"
+                        v-model="editing.argsRaw"
+                        rows="3"
+                        class="w-full bg-surface border border-input text-sm text-fg-strong px-2 py-1 font-mono focus:outline-hidden"
+                      />
+                    </label>
+                    <fieldset class="min-w-0">
+                      <legend class="block text-xs text-fg-muted mb-1">
+                        Environment variables
+                      </legend>
+                      <div class="space-y-1.5">
+                        <div
+                          v-for="(row, i) in editing.envRows"
+                          :key="`edit-env-${i}`"
+                          class="flex gap-2 items-center"
+                        >
+                          <input
+                            v-model="row.key"
+                            type="text"
+                            placeholder="KEY"
+                            aria-label="Environment variable name"
+                            class="flex-1 min-w-0 bg-surface border border-input text-xs text-fg-strong px-2 py-1 font-mono focus:outline-hidden"
+                          >
+                          <SecretField
+                            v-if="isSensitiveKey(row.key)"
+                            v-model="row.value"
+                            form
+                            :saved="isSavedSecret(row)"
+                            label="Environment variable value"
+                            placeholder="value"
+                            input-class="flex-1 min-w-0 bg-surface border border-input text-xs text-fg-strong px-2 py-1 font-mono focus:outline-hidden"
+                          />
+                          <input
+                            v-else
+                            v-model="row.value"
+                            type="text"
+                            placeholder="value"
+                            aria-label="Environment variable value"
+                            class="flex-1 min-w-0 bg-surface border border-input text-xs text-fg-strong px-2 py-1 font-mono focus:outline-hidden"
+                          >
+                          <button
+                            type="button"
+                            class="text-fg-muted hover:text-red-700 dark:hover:text-red-400 p-1"
+                            aria-label="Remove env var"
+                            @click="removeEnvRow(i)"
+                          >
+                            <TrashIcon class="w-4 h-4" />
+                          </button>
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        class="mt-1.5 text-xs text-fg-muted hover:text-fg-strong inline-flex items-center gap-1"
+                        @click="addEnvRow"
+                      >
+                        <PlusIcon class="w-3.5 h-3.5" />
+                        Add env var
+                      </button>
+                    </fieldset>
+                  </div>
+
+                  <div
+                    v-else
+                    class="space-y-3 border-l-2 border-emerald-600/40 pl-3"
+                  >
+                    <label
+                      :for="`edit-${server.id}-url`"
+                      class="block"
+                    >
+                      <span class="block text-xs text-fg-muted mb-1">Endpoint URL</span>
+                      <input
+                        :id="`edit-${server.id}-url`"
+                        v-model="editing.url"
+                        type="url"
+                        required
+                        class="w-full bg-surface border border-input text-sm text-fg-strong px-2 py-1 font-mono focus:outline-hidden"
+                      >
+                    </label>
+                    <fieldset class="min-w-0">
+                      <legend class="block text-xs text-fg-muted mb-1">
+                        Headers
+                      </legend>
+                      <div class="space-y-1.5">
+                        <div
+                          v-for="(row, i) in editing.headerRows"
+                          :key="`edit-hdr-${i}`"
+                          class="flex gap-2 items-center"
+                        >
+                          <input
+                            v-model="row.key"
+                            type="text"
+                            placeholder="Header-Name"
+                            aria-label="Header name"
+                            class="flex-1 min-w-0 bg-surface border border-input text-xs text-fg-strong px-2 py-1 font-mono focus:outline-hidden"
+                          >
+                          <SecretField
+                            v-model="row.value"
+                            form
+                            :saved="isSavedSecret(row)"
+                            label="Header value"
+                            placeholder="value"
+                            input-class="flex-1 min-w-0 bg-surface border border-input text-xs text-fg-strong px-2 py-1 font-mono focus:outline-hidden"
+                          />
+                          <button
+                            type="button"
+                            class="text-fg-muted hover:text-red-700 dark:hover:text-red-400 p-1"
+                            aria-label="Remove header"
+                            @click="removeHeaderRow(i)"
+                          >
+                            <TrashIcon class="w-4 h-4" />
+                          </button>
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        class="mt-1.5 text-xs text-fg-muted hover:text-fg-strong inline-flex items-center gap-1"
+                        @click="addHeaderRow"
+                      >
+                        <PlusIcon class="w-3.5 h-3.5" />
+                        Add header
+                      </button>
+                    </fieldset>
+                  </div>
+
+                  <div
+                    v-if="testResult && testResultForId === server.id"
+                    class="text-xs p-2 border"
+                    :class="testResult.success ? 'text-green-700 dark:text-green-400 border-current bg-green-400/5' : 'text-red-700 dark:text-red-400 border-current bg-red-400/5'"
+                  >
+                    <div class="font-medium">
+                      {{ testResult.success ? '✓ Connection successful' : '✗ Connection failed' }}
+                    </div>
+                    <div class="font-mono mt-1">
+                      {{ testResult.message }}
+                    </div>
+                  </div>
+
+                  <div
+                    v-if="saveError"
+                    class="text-xs text-red-700 dark:text-red-400 border border-current bg-red-400/5 p-2"
+                  >
+                    {{ saveError }}
+                  </div>
+
+                  <div class="flex items-center gap-2 pt-2">
+                    <button
+                      type="submit"
+                      class="text-xs px-3 py-1.5 bg-emerald-700 hover:bg-emerald-800 text-white"
+                    >
+                      Save changes
+                    </button>
+                    <button
+                      type="button"
+                      class="text-xs px-3 py-1.5 border border-input text-fg-muted hover:text-fg-strong"
+                      :disabled="testing"
+                      @click="testFromForm"
+                    >
+                      {{ testing ? 'Testing…' : 'Test connection' }}
+                    </button>
+                    <button
+                      type="button"
+                      class="text-xs px-3 py-1.5 text-fg-muted hover:text-fg-strong ml-auto"
+                      @click="cancelEdit"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </form>
+              </td>
+            </tr>
+
+            <!-- Test result banner for collapsed rows -->
+            <tr v-else-if="testResult && testResultForId === server.id">
+              <td
+                colspan="6"
+                class="bg-muted/30 px-4 py-2 text-xs"
+                :class="testResult.success ? 'text-green-700 dark:text-green-400' : 'text-red-700 dark:text-red-400'"
+              >
+                {{ testResult.success ? '✓ ' : '✗ ' }}{{ testResult.message }}
+              </td>
+            </tr>
+          </template>
+        </tbody>
+      </table>
+      <div
+        v-if="!servers?.length"
+        class="px-4 py-8 text-center text-sm text-fg-muted"
+      >
+        No MCP servers configured. Use "Add server" to connect one.
+      </div>
+    </div>
+  </div>
+</template>

@@ -1,0 +1,1116 @@
+import type { MessageRoute, MessageUsage } from '~/utils/usage-cost'
+
+/** An LLM agent configured in the system. */
+export interface Agent {
+  id: number
+  name: string
+  /** Operator-supplied short description of the agent's purpose (max 255 chars), or null when unset. */
+  description?: string | null
+  modelProvider: string
+  modelId: string
+  enabled: boolean
+  isMain: boolean
+  /** Persisted reasoning-effort level ("low" | "medium" | "high" | provider-specific), or null when reasoning is off. */
+  thinkingMode: string | null
+  /** True when the selected provider has an API key configured (populated by GET /api/agents). */
+  providerConfigured?: boolean
+  /** JCLAW-465: effective per-agent content-compression enable (main on, custom off by default). */
+  compressionEnabled: boolean
+  /** JCLAW-463: effective per-type sub-toggles (master AND per-type, both default on under the master). */
+  compressionJson: boolean
+  compressionCode: boolean
+  /** JCLAW-464: effective Text sub-toggle + the text-compression aggressiveness ratio (0–1, default 0.3). */
+  compressionText: boolean
+  compressionTargetRatio: number
+  /** JCLAW-500: whether this agent may spawn subagents under the external ACP harness (runtime=acp). The main agent is always allowed; custom agents need this grant. */
+  acpAllowed: boolean
+  /** JCLAW-534: per-agent memory auto-capture enable (on by default). */
+  memoryAutocaptureEnabled: boolean
+  /** JCLAW-534: true when the extractor model is inherited from the agent's default model (no override set). */
+  memoryAutocaptureModelInherited: boolean
+  /** JCLAW-534: effective extractor provider/model — the agent's default when inherited, else the override. */
+  memoryAutocaptureProvider: string
+  memoryAutocaptureModel: string
+  /** JCLAW-1190: where a turn goes when the primary's breaker refuses it; both null means no fallback. */
+  fallbackProvider: string | null
+  fallbackModelId: string | null
+}
+
+/**
+ * One Telegram bot-agent-user binding, as surfaced by
+ * {@code GET /api/channels/telegram/bindings}. The full bot token and webhook
+ * secret are never returned by the API. {@link hasWebhookSecret} lets the UI
+ * render a "leave blank to keep existing" hint when editing a webhook binding.
+ */
+export interface TelegramBindingSummary {
+  id: number
+  agentId: number | null
+  agentName: string | null
+  telegramUserId: string
+  transport: string
+  /** Editable public base (scheme + host, no path) Telegram reaches this instance
+   *  at, e.g. https://host.tailnet.ts.net. The fixed path + secret are appended
+   *  to form the full webhook URL. Null for polling bindings. */
+  webhookBaseUrl: string | null
+  hasWebhookSecret: boolean
+  /**
+   * Full webhook URL JClaw registers with Telegram (JCLAW-338/339):
+   * base + /api/webhooks/telegram/{id}/{secret}. Non-null only for a WEBHOOK
+   * binding that has both a public base and a secret.
+   */
+  effectiveWebhookUrl: string | null
+  enabled: boolean
+  createdAt: string | null
+  updatedAt: string | null
+}
+
+/**
+ * One Slack bot-agent binding, as surfaced by
+ * {@code GET /api/channels/slack/bindings} (JCLAW-441). The bot token, signing
+ * secret, and app token are never returned — only the presence flags
+ * {@link hasSigningSecret} / {@link hasAppToken}. {@link effectiveRequestUrl} is
+ * the full Events API Request URL (base + /api/webhooks/slack/{id}) the operator
+ * pastes into the Slack app; non-null only for an HTTP binding with a public base.
+ */
+export interface SlackBindingSummary {
+  id: number
+  agentId: number | null
+  agentName: string | null
+  ownerUserId: string | null
+  /** HTTP (Events API webhook) or SOCKET (Socket Mode). */
+  transport: string
+  /** Editable public base (scheme + host, no path) Slack reaches this instance
+   *  at for the Events API. The fixed path + id are appended. Null for SOCKET. */
+  webhookBaseUrl: string | null
+  effectiveRequestUrl: string | null
+  hasSigningSecret: boolean
+  hasAppToken: boolean
+  /** The bot's own user id, cached from auth.test — used for the self-loop guard
+   *  and shown in the health probe. Null until a successful probe. */
+  botUserId: string | null
+  teamId: string | null
+  enabled: boolean
+  replyToMode: string | null
+  createdAt: string | null
+  updatedAt: string | null
+  /** JCLAW-458: non-blocking warning returned on create/update when the bot token can't list
+   *  channels for name-based delivery (missing channels:read/groups:read). Null when fine, and
+   *  absent on the list endpoint (computed only on save). */
+  deliveryScopeWarning?: string | null
+}
+
+/** One WhatsApp presence bound to one agent (JCLAW-444). The transport picks the
+ *  integration stack: CLOUD_API (official Cloud API) or WHATSAPP_WEB (unofficial
+ *  QR-paired Cobalt, ban-warned). Secrets are write-only — only presence flags
+ *  come back. */
+export interface WhatsAppBindingSummary {
+  id: number
+  agentId: number | null
+  agentName: string | null
+  /** CLOUD_API or WHATSAPP_WEB. */
+  transport: string
+  /** Cloud-API phone number id (an identifier, not a secret). Null for
+   *  WHATSAPP_WEB (paired later) and until set. */
+  phoneNumberId: string | null
+  hasAccessToken: boolean
+  hasAppSecret: boolean
+  hasVerifyToken: boolean
+  /** JCLAW-445: Meta's verified business name, populated after a successful
+   *  Graph verify probe on save. Cloud-API only; null until verified. */
+  verifiedName: string | null
+  /** JCLAW-445: Meta's human-readable phone number (e.g. +1 555-…). Cloud-API
+   *  only; null until verified. */
+  displayPhoneNumber: string | null
+  /** JCLAW-445: pre-approved template name used for replies sent outside
+   *  WhatsApp's 24-hour customer-service window. Cloud-API only; null when unset. */
+  templateName: string | null
+  /** JCLAW-445: BCP-47 language for {@link templateName}, e.g. en_US. */
+  templateLanguage: string | null
+  /** JCLAW-425: Cloud-API proactive-send recipient (E.164) — the agent's
+   *  per-agent outbound destination when a `message(channel="whatsapp")` has no
+   *  explicit target and no live conversation peer. An identifier, not a secret.
+   *  Cloud-API only (WhatsApp-Web uses its paired owner); null when unset. */
+  defaultTarget: string | null
+  enabled: boolean
+  createdAt: string | null
+  updatedAt: string | null
+}
+
+/** A conversation between a user and an agent. */
+export interface Conversation {
+  id: number
+  agentId: number
+  preview: string | null
+  channelType: string
+  agentName: string
+  peerId: string | null
+  messageCount: number
+  createdAt: string
+  updatedAt: string
+  /** Operator-set favorite marker, filterable from the list's filter bar with
+   *  `starred:true`. Optional for backwards-compat; absent → treat as false. */
+  starred?: boolean
+  /** Operator-set pin. Pinned conversations render in their own section above
+   *  the paginated list, capped at 10. Optional for backwards-compat; absent →
+   *  treat as false. */
+  pinned?: boolean
+  /** Conversation-scoped model override (JCLAW-108). Null when the conversation inherits the agent default. */
+  modelProviderOverride?: string | null
+  /** Companion to modelProviderOverride — see type docs above. */
+  modelIdOverride?: string | null
+  /** Conversation-scoped thinking override (JCLAW-1196): null inherits the agent default,
+   *  'off' turns reasoning off, otherwise an effort level. */
+  thinkingModeOverride?: string | null
+  /** JCLAW-267: parent Conversation id when this row is the child end of a
+   *  session-mode subagent spawn. The sidebar uses this to render a
+   *  "subagent of parent N" hint so operators can distinguish delegated
+   *  runs from user-initiated chats at a glance. Null/absent for top-level
+   *  conversations. */
+  parentConversationId?: number | null
+  /** Number of SessionCompaction rows for this conversation. Surfaced in
+   *  the chat-header context meter so the operator can tell whether the
+   *  displayed "current context" reading reflects a fresh prompt or a
+   *  post-compaction prefix (and how many times the conversation has been
+   *  compacted). Optional for backwards-compat; absent → treat as 0. */
+  compactionCount?: number
+}
+
+/**
+ * JCLAW-170: one structured search-result row, shipped by the backend
+ * alongside the LLM-visible markdown so the chat UI can render clickable
+ * chips with favicons. Every field is nullable since older search providers
+ * may not always populate all of them and the UI has to be defensive.
+ */
+export interface ToolCallResultChip {
+  title: string | null
+  url: string | null
+  snippet: string | null
+  faviconUrl: string | null
+}
+
+/** JCLAW-170: structured result payload attached to a tool call. For
+ *  {@code web_search}, carries a list of {@link ToolCallResultChip}s the UI
+ *  renders as clickable result chips. Absent for tools that don't emit a
+ *  structured view. */
+export interface ToolCallResultStructured {
+  provider?: string | null
+  results?: ToolCallResultChip[]
+  /** JCLAW-1272: the background job a {@code web_scrape} call with {@code background: true} queued. */
+  scrapeJob?: ScrapeJobRef | null
+}
+
+/** The job a background {@code web_scrape} call started, as its tool result names it. */
+export interface ScrapeJobRef {
+  id: number
+  url: string
+  folder: string
+}
+
+/** JCLAW-1272: a background scrape job's state. The last three are final; PAUSED and INTERRUPTED resume. */
+export type ScrapeJobState = 'PENDING' | 'RUNNING' | 'PAUSED' | 'INTERRUPTED' | 'SUCCEEDED' | 'FAILED' | 'CANCELLED'
+
+/** One background scrape job, as {@code GET /api/scrape-jobs} returns it (JCLAW-1272). */
+export interface ScrapeJob {
+  id: number
+  agentId: number
+  agentName: string
+  conversationId: number | null
+  url: string
+  state: ScrapeJobState
+  /** Pages attempted, whatever their outcome. */
+  pagesRead: number
+  /** Pages whose content was retrieved. */
+  pagesFetched: number
+  pagesDiscovered: number
+  stopReason: string | null
+  errorMessage: string | null
+  summary: string | null
+  folder: string
+  /** Workspace path of the file combining every page, once it exists. */
+  combinedFile: string | null
+  /** The {@code web_scrape} arguments the job runs with. */
+  options: ScrapeJobOptions
+  /** Time spent running, across every run; what its time limit counts. */
+  runtimeSeconds: number
+  /** Times a stopped app left it running since it was last resumed. */
+  interruptions: number
+  /** Where each run went out, a proxy's address or "direct"; null for a job from before that was recorded. */
+  egress: string[] | null
+  createdAt: string
+  startedAt: string | null
+  completedAt: string | null
+}
+
+export interface ScrapeJobOptions {
+  url: string
+  maxPages: number
+  maxDepth: number
+  maxMinutes: number
+  sameHostOnly: boolean
+  respectRobots: boolean
+  seedFromSitemap: boolean
+  language: string
+  format: 'markdown' | 'text' | 'json'
+  extract?: Record<string, string>
+  metadata: boolean
+}
+
+/** One page a scrape job attempted, in the order it read them. */
+export interface ScrapeJobPage {
+  id: number
+  /** 1-based position in fetch order; the polling cursor. */
+  index: number
+  url: string
+  depth: number
+  servedBy: string
+  outcome: 'FETCHED' | 'BLOCKED' | 'FAILED'
+  reason: string | null
+  chars: number
+  hasContent: boolean
+  fetchedAt: string
+}
+
+export interface ScrapeJobPageContent {
+  id: number
+  url: string
+  format: 'markdown' | 'text' | 'json'
+  content: string
+}
+
+/**
+ * JCLAW-170: one tool invocation the assistant made during the turn.
+ * Populated both live (via the {@code tool_call} SSE frame) and on
+ * conversation reload (from persisted {@code Message.toolCalls}
+ * plus the corresponding {@code tool_result_structured} row keyed by
+ * {@code id}). {@code icon} is the registry's semantic icon key ({@code
+ * "search"}, {@code "folder"}, etc.) that the chat UI maps to a Heroicon.
+ */
+export interface ToolCall {
+  id: string
+  name: string
+  icon: string
+  arguments: string
+  resultText?: string | null
+  resultStructured?: ToolCallResultStructured | null
+  /** Client-only: whether this individual tool call's body (chip grid or
+   *  result text) is expanded under the per-call header (JCLAW-170). */
+  _expanded?: boolean
+}
+
+/** Persisted attachment metadata surfaced under user messages on conversation
+ *  reload (JCLAW-279). The {@code uuid} is the opaque client key for the
+ *  {@code GET /api/attachments/{uuid}} download endpoint. */
+export interface MessageAttachment {
+  uuid: string
+  originalFilename: string
+  mimeType: string
+  sizeBytes: number
+  /** One of IMAGE, AUDIO, VIDEO, FILE — drives inline-vs-download disposition on the server. */
+  kind: 'IMAGE' | 'AUDIO' | 'VIDEO' | 'FILE'
+  /** JCLAW-227: true when produced by the generate_image tool rather than uploaded by the user. */
+  generated?: boolean
+  /** JCLAW-227: JSON metadata (prompt, model, provider) for a generated image; absent for uploads. */
+  generationMetadata?: string
+  /** JCLAW-234: id of the VideoGenerationJob backing a generated-video placeholder; the chat polls
+   *  /api/videogen/jobs?ids= for its status. Absent for every non-video attachment. */
+  generationJobId?: number
+  /** JCLAW-209: true once the bytes have been deleted from the workspace. The record is retained so
+   *  the chip can show a "deleted from workspace" marker; the file (and inline preview) is gone. */
+  deleted?: boolean
+}
+
+/**
+ * JCLAW-270: structured payload carried in {@link Message.metadata} when
+ * {@code messageKind === 'subagent_announce'}. Surfaced by the backend
+ * from the persisted async-spawn completion card.
+ */
+export interface SubagentAnnounceMetadata {
+  /** The id of the SubagentRun audit row this announce closes. */
+  runId: number
+  /** Short display name the parent supplied at spawn time (may be empty). */
+  label: string
+  /** Terminal status — one of COMPLETED, FAILED, TIMEOUT. Updates here when
+   *  the server adds a new terminal status. */
+  status: 'COMPLETED' | 'FAILED' | 'TIMEOUT'
+  /** Child's final reply (or error message), truncated to 4000 chars
+   *  with an ellipsis marker. Full reply available at
+   *  /conversations/{childConversationId}. */
+  reply: string
+  /** Id of the child Conversation row — drives the "View full" link. */
+  childConversationId: number
+  /** JCLAW-291: child's underlying reply was cut off by max_tokens. The
+   *  announce card surfaces a "Reply was truncated by the model" marker
+   *  when this is true. Distinct from the 4000-char display cap above —
+   *  this means the child's full output ran short, not just that the
+   *  display version was clipped. Absent when false. */
+  truncated?: boolean | null
+}
+
+/** A single message within a conversation. */
+/** What a web reply quotes; the server maps the kind to the label the agent reads (JCLAW-1299). */
+export type ChatQuoteKind = 'assistant' | 'user' | 'delivered' | 'reminder'
+
+export interface ChatQuote {
+  kind: ChatQuoteKind
+  text: string
+}
+
+export interface Message {
+  /** Server-assigned id. Absent on optimistic/streaming placeholders until the backend persists the row. */
+  id?: number
+  role: 'user' | 'assistant' | 'tool'
+  content: string | null
+  reasoning?: string | null
+  createdAt: string
+  usage?: MessageUsage | null
+  /** JCLAW-170: tool invocations on this assistant turn, hydrated from the
+   *  persisted message thread on load and appended via SSE during streaming. */
+  toolCalls?: ToolCall[]
+  /** JCLAW-279: persisted attachments on a user turn. Absent for assistant
+   *  and tool rows. */
+  attachments?: MessageAttachment[]
+  /** JCLAW-267: inline-subagent-run marker. When set, the chat view folds
+   *  consecutive messages sharing this id into a single collapsible
+   *  nested-turn block. Null/absent for every non-inline-subagent message
+   *  (the dominant case) — top-level turns and session-mode subagent
+   *  children render normally. */
+  subagentRunId?: number | null
+  /** JCLAW-270: discriminator for structured non-LLM-confusing messages
+   *  (e.g. async-spawn completion cards). When set, the chat view picks
+   *  a kind-specific render path instead of the assistant/user bubble. */
+  messageKind?: string | null
+  /** JCLAW-270: kind-specific JSON metadata. For {@code messageKind ===
+   *  'subagent_announce'} the shape is {@link SubagentAnnounceMetadata}. */
+  metadata?: SubagentAnnounceMetadata | Record<string, unknown> | null
+  /** JCLAW-291: model output was cut off by the provider's max_tokens budget
+   *  (finish_reason = length / max_tokens). The chat view renders a small
+   *  "Reply was truncated by the model" marker on rows where this is true,
+   *  applied uniformly to assistant bubbles, async announce cards, and
+   *  inline subagent block last messages. Absent on the wire when false
+   *  (the dominant case). */
+  truncated?: boolean | null
+  /** Frontend-only key assigned to optimistic/streaming placeholders. */
+  _key?: string
+  /** Client-only: the quote an optimistic user row was sent with, until the stored text replaces it. */
+  _quote?: ChatQuote
+  /** Client-only: whether the thinking/reasoning bubble is collapsed for this message. */
+  thinkingCollapsed?: boolean
+  /** Client-only: whether the tool-calls block is collapsed for this message (JCLAW-170). */
+  toolCallsCollapsed?: boolean
+  /** Client-only: elapsed stream thinking duration in ms, persisted only for the current render. */
+  _thinkingDurationMs?: number | null
+  /** Client-only: wall-clock ms when the current assistant stream began producing reasoning. */
+  _thinkingStartedAt?: number
+  /** Client-only: the router's choice from the stream's status frame, until the usage record carries it (JCLAW-1222). */
+  _route?: MessageRoute
+}
+
+/** A config entry from /api/config. */
+export interface ConfigEntry {
+  key: string
+  value: string
+}
+
+/** The shape returned by GET /api/config. */
+export interface ConfigResponse {
+  entries: ConfigEntry[]
+}
+
+/**
+ * One OCR backend in the GET /api/ocr/status response.
+ * `available` is the runtime probe (binary on PATH); `enabled` is the user
+ * toggle in the Config DB. The Settings page renders the toggle as
+ * uninteractive when `available=false`, so a host without the binary
+ * installed cannot have the backend turned on by accident.
+ */
+export interface OcrBackend {
+  name: string
+  displayName: string
+  available: boolean
+  enabled: boolean
+  version: string | null
+  reason: string | null
+  configKey: string
+  description: string
+  installHint: string
+}
+
+export interface OcrStatusResponse {
+  providers: OcrBackend[]
+}
+
+/** A single histogram for a latency segment, as returned by /api/metrics/latency. */
+export interface LatencyHistogram {
+  count: number
+  sum_ms: number
+  min_ms: number
+  max_ms: number
+  p50_ms: number
+  p90_ms: number
+  p99_ms: number
+  p999_ms: number
+  buckets?: Array<{ le_ms: number, count: number }>
+}
+
+/**
+ * Response shape from GET /api/metrics/latency.
+ * Nested by channel (web, telegram, task, ...) so each transport's
+ * distribution stays separable — see JCLAW-102.
+ */
+export type LatencyMetrics = Record<string, Record<string, LatencyHistogram>>
+
+/** A skill definition (returned by /api/skills). */
+export interface Skill {
+  name: string
+  description: string | null
+  version: string | null
+  /** Directory name on disk — typically the same as `name` but may differ for legacy skills. */
+  folderName?: string
+  author?: string
+  isGlobal?: boolean
+  location?: string
+  /** Tool names this skill depends on (from SKILL.md frontmatter). */
+  tools?: string[]
+  /** Shell commands this skill contributes to an installing agent's allowlist. */
+  commands?: string[]
+  /** Optional emoji or symbol from the SKILL.md `icon:` frontmatter; empty string when not declared. */
+  icon?: string
+  [key: string]: unknown
+}
+
+/** A file in a skill's file tree. */
+export interface SkillFile {
+  path: string
+  size: number
+  isText: boolean
+}
+
+/** Minimal tool reference as returned inside a SkillFilesResponse.tools array. */
+export interface SkillToolRef {
+  name: string
+  /** Optional short description provided by the backend for display. */
+  description?: string
+  [key: string]: unknown
+}
+
+/**
+ * Shape returned by GET /api/skills/:name/files (and the matching agent-scoped
+ * endpoint). Includes the file tree plus the tool dependencies and commands
+ * declared in the skill's SKILL.md frontmatter.
+ */
+export interface SkillFilesResponse {
+  files: SkillFile[]
+  tools: SkillToolRef[]
+  commands: string[]
+  author?: string
+}
+
+/**
+ * Shape returned by GET /api/skills/:name/files/:path (and the agent-scoped
+ * variant) — a single text file's contents for the inline file viewer.
+ */
+export interface SkillFileContent {
+  content: string
+}
+
+/**
+ * One importable skill, normalized across catalog sources, as returned by
+ * GET /api/skills/catalog/search.
+ */
+export interface CatalogSkill {
+  skillId: string
+  displayName: string
+  /** Provenance: `owner/repo` (GitHub) or `clawhub.ai/slug` (clawhub). */
+  source: string
+  /** GitHub owner, or clawhub owner handle; may be empty for some sources. */
+  owner: string
+  repo: string
+  /** Canonical web page for the skill (GitHub URL or clawhub page). */
+  url: string
+  /** Popularity signal used for browse ranking. */
+  installs: number
+  /** Derived topical category (catalogs have no category field). */
+  category: string
+  /** Originating catalog id (e.g. `mastra` | `clawhub`) — source badge + import routing. */
+  provider: string
+}
+
+/** One facet row: a topical category, its icon, and its count in the current
+ *  (query-applied, category-unfiltered) result set. The `category` value `All`
+ *  is the no-filter pseudo-facet. Static catalogs only. */
+export interface CategoryFacet {
+  category: string
+  icon: string
+  count: number
+}
+
+/** A configured catalog in the selector. `type` decides the nav model:
+ *  `static` = facets + jump-to-page; `dynamic` = live search + cursor Next/Prev. */
+export interface CatalogInfo {
+  id: string
+  displayName: string
+  type: 'static' | 'dynamic'
+}
+
+/**
+ * A page of catalog results (GET /api/skills/catalog/search). `ready=false`
+ * means a load/fetch failure. Static catalogs populate `total`/`facets`/
+ * `catalogSize`/`scrapedAt` (jump-to-page); dynamic catalogs populate
+ * `nextCursor` with `total=-1` and empty `facets` (cursor Next/Prev).
+ */
+export interface CatalogPage {
+  ready: boolean
+  results: CatalogSkill[]
+  /** Filtered result count (static); `-1` for dynamic (unknown — live). */
+  total: number
+  page: number
+  pageSize: number
+  /** Continuation token for the next page (dynamic), else null. */
+  nextCursor: string | null
+  /** Facet counts; empty for dynamic catalogs. */
+  facets: CategoryFacet[]
+  /** Loaded snapshot size (static); `-1` for dynamic. */
+  catalogSize: number
+  /** Snapshot timestamp (static); null for dynamic. */
+  scrapedAt: string | null
+}
+
+/** A channel configuration status. */
+export interface ChannelStatus {
+  channelType: string
+  enabled: boolean
+  config: Record<string, string>
+}
+
+/** A log event from /api/logs. */
+export interface LogEvent {
+  id: number
+  level: 'ERROR' | 'WARN' | 'INFO'
+  category: string
+  message: string
+  details: string | null
+  timestamp: string
+  agentId?: number | null
+}
+
+/** A tool binding for a specific agent, as returned by GET /api/agents/:id/tools. */
+export interface AgentTool {
+  name: string
+  /** Human-readable description from the backend tool registry — shown
+   *  inline beneath an MCP server's name in the read-only per-action
+   *  disclosure (Phase 6). May be empty for tools that don't advertise
+   *  one; the backend stamps an empty string in that case. */
+  description?: string
+  enabled: boolean
+  /** Optional grouping key: tools sharing one (currently MCP servers) fold
+   *  into a single agent-detail-page row with one toggle that flips every
+   *  member via PUT /api/agents/:id/tool-groups/:group. {@code undefined}
+   *  for native tools. */
+  group?: string
+  [key: string]: unknown
+}
+
+/** A skill binding for a specific agent, as returned by GET /api/agents/:id/skills. */
+export interface AgentSkill {
+  name: string
+  description?: string | null
+  enabled: boolean
+  isGlobal?: boolean
+  /** Tool names this skill depends on. */
+  tools?: string[]
+  /** Shell commands this skill contributes to the effective allowlist. */
+  commands?: string[]
+  /** Optional emoji or symbol from the SKILL.md `icon:` frontmatter; empty string when not declared. */
+  icon?: string
+  [key: string]: unknown
+}
+
+/** Shape returned by GET /api/agents/:id/workspace/:file. */
+export interface WorkspaceFileContent {
+  content: string
+}
+
+/**
+ * One node of GET /api/agents/:id/workspace-tree (JCLAW-1247). `path` is root-relative with
+ * forward slashes; `children` is an array for a dir and null for a file; `protected` marks the
+ * five Standing Orders files at the root, which are never delete targets.
+ */
+export interface WorkspaceEntry {
+  path: string
+  name: string
+  kind: 'file' | 'dir'
+  size: number
+  protected: boolean
+  children: WorkspaceEntry[] | null
+}
+
+/** Shape returned by GET /api/agents/:id/workspace-tree: `total` is the byte sum under the root. */
+export interface WorkspaceListing {
+  total: number
+  entries: WorkspaceEntry[]
+}
+
+/** Shape returned by GET /api/agents/:id/shell/effective-allowlist. */
+export interface EffectiveAllowlist {
+  global: string[]
+  bySkill: Record<string, string[]>
+}
+
+/** Single entry in the prompt-breakdown arrays. */
+export interface PromptBreakdownEntry {
+  name: string
+  chars: number
+  tokens: number
+}
+
+/** Shape returned by GET/POST /api/memories/core-migration. */
+export interface CoreMigrationStatus {
+  running: boolean
+  processed: number
+  total: number
+  /** This agent's live core count — the number the cap governs. */
+  liveCore: number
+  /** memory.coreload.maxCount. */
+  cap: number
+  /** liveCore > cap — what enables the migrate button. Not derivable from `running`. */
+  overCap: boolean
+  error: string | null
+}
+
+/** Shape returned by GET /api/agents/:id/prompt-breakdown. */
+export interface PromptBreakdown {
+  totalChars: number
+  totalTokenEstimate: number
+  cacheBoundaryMarker: string
+  cacheablePrefixChars: number
+  /** Bytes before the core-memory boundary — carries its own breakpoint, so a
+   *  core-memory write does not re-prefill it (JCLAW-978). Equals
+   *  cacheablePrefixChars when the agent has no core memories. */
+  staticPrefixChars: number
+  /** Bytes of the core-memory block: cached, but re-prefilled when it changes. */
+  coreMemoryChars: number
+  variableSuffixChars: number
+  sections: PromptBreakdownEntry[]
+  skills: PromptBreakdownEntry[]
+  tools: PromptBreakdownEntry[]
+}
+
+/** Shape returned by GET /api/config/:key — a single config entry. */
+export interface ConfigValueResponse {
+  value: string
+}
+
+/** A scheduled/run task row as returned by GET /api/tasks. */
+export interface Task {
+  id: number
+  name: string
+  type: string
+  status: string
+  /**
+   * Operational suspend flag, orthogonal to status. When true, a recurring
+   * task's scheduled fires are skipped (cadence preserved; resume clears the
+   * flag). Drives the Pause/Resume toggle and dims projected calendar fires.
+   */
+  paused: boolean
+  /**
+   * When true, a one-shot reminder is auto-deleted after a successful fire.
+   * Defaults true for reminders, false for regular tasks; only one-shot
+   * reminders are ever auto-deleted (recurring reminders and regular tasks
+   * keep their history).
+   */
+  autoDeleteOnComplete: boolean
+  /**
+   * JCLAW-260: instruction body. Plain text is a single step; a JSON array
+   * of strings is an ordered step list. Parse with {@code parseTaskSteps}.
+   */
+  description?: string | null
+  agentName: string | null
+  nextRunAt: string | null
+  retryCount: number
+  maxRetries: number
+  /**
+   * JCLAW-414: id of this task's currently-RUNNING TaskRun, or null when none
+   * is in flight. Drives the Actions column's Run-now ↔ Cancel-run icon swap.
+   */
+  runningRunId: number | null
+  /** JCLAW-261: per-task IANA timezone override. Null = fall back to default. */
+  timezone?: string | null
+  /**
+   * JCLAW-261: precomputed effective IANA zone for this task, resolved
+   * server-side through (per-task → Config → application.conf → JVM)
+   * so the UI doesn't reimplement the fallback chain. Always present.
+   */
+  effectiveTimezone?: string
+  /**
+   * JCLAW-1068: tool allow-list for this task's fires. A JSON array, a
+   * comma-separated list or a bare name — the shapes TaskTool stored before the
+   * field was read. Null means the agent's full toolset.
+   */
+  enabledToolNames?: string | null
+  /**
+   * JCLAW-1062: recorded provenance, which decides fire-time trust. 'web' is the
+   * operator origin; null classifies as UNKNOWN and fails closed for dangerous
+   * tools. Read-only — trust may fall on mutation, never rise (JCLAW-1021).
+   */
+  originChannel?: string | null
+  /**
+   * Per-task model pin. Null on both means the fire uses the agent's current
+   * model, so an edit to the agent re-points the task with it.
+   */
+  modelProvider?: string | null
+  modelId?: string | null
+  [key: string]: unknown
+}
+
+/**
+ * One TaskRun row as returned by GET /api/tasks/:id/runs (most-recent first).
+ * Mirrors the backend ApiTasksController.TaskRunView record.
+ */
+export interface TaskRunView {
+  id: number
+  status: string | null
+  startedAt: string | null
+  completedAt: string | null
+  durationMs: number | null
+  error: string | null
+  outputSummary: string | null
+  /** Newest turn's text for a still-RUNNING run — a live clip the row shows
+   *  before outputSummary exists. Null for terminal runs. */
+  latestTurnPreview: string | null
+  deliveryStatus: string | null
+  deliveryTarget: string | null
+  deliveryError: string | null
+  traceJson: string | null
+  createdAt: string | null
+}
+
+/**
+ * One task_run_message row as returned by GET /api/task-runs/:id/messages —
+ * the turn-by-turn execution trace. Mirrors the backend TaskRunMessageView.
+ */
+export interface TaskRunMessageView {
+  id: number
+  turnIndex: number
+  role: string | null
+  content: string | null
+  reasoning: string | null
+  toolCalls: string | null
+  toolResults: string | null
+  truncated: boolean
+  createdAt: string | null
+}
+
+/**
+ * One transcript-search hit from GET /api/task-runs/search — a matched
+ * task_run_message plus enough parent context to link back to the run.
+ * Mirrors the backend TranscriptSearchHit.
+ */
+export interface TranscriptSearchHit {
+  messageId: number
+  role: string | null
+  content: string | null
+  createdAt: string | null
+  taskRunId: number | null
+  taskId: number | null
+  taskName: string | null
+  agentId: number | null
+  agentName: string | null
+}
+
+/**
+ * One TaskRun for the Timeline view from GET /api/task-runs/recent
+ * (JCLAW-22 slice TL). Mirrors the backend RecentRunView.
+ */
+export interface RecentRunView {
+  id: number
+  taskId: number | null
+  taskName: string | null
+  status: string | null
+  startedAt: string | null
+  completedAt: string | null
+  durationMs: number | null
+}
+
+/**
+ * Dashboard KPI aggregate from GET /api/tasks/stats (JCLAW-22 slice K).
+ * successRate (0..1) and avgDurationMs are absent when there's nothing to
+ * average yet (no terminal / completed runs today).
+ */
+export interface TaskStats {
+  runsToday: number
+  successRate?: number | null
+  avgDurationMs?: number | null
+  pendingCount: number
+  runningCount: number
+  /**
+   * Live schedules suspended by the operator. Task.paused is a flag, not a
+   * status, so these rows are still PENDING/ACTIVE server-side — the backend
+   * excludes them from pendingCount/activeCount so the two never count one
+   * task twice.
+   */
+  pausedCount: number
+  activeCount: number
+  failedCount: number
+  /**
+   * Effective task-retention TTL in days, resolved server-side from
+   * tasks.retentionDays (TaskCleanupJob): absent/invalid collapses to the
+   * backend default, 0 means cleanup is disabled. The client renders this
+   * verbatim and never re-derives the default.
+   */
+  retentionDays: number
+}
+
+/**
+ * Provider billing-shape projection from GET /api/providers. Carries the
+ * selected paymentModality, monthly subscription price, and the supported-
+ * modality set used by the LLM Providers Settings cards.
+ */
+export interface ProviderInfo {
+  name: string
+  paymentModality: 'PER_TOKEN' | 'SUBSCRIPTION'
+  subscriptionMonthlyUsd: number
+  supportedModalities: ('PER_TOKEN' | 'SUBSCRIPTION')[]
+  /** Local by base URL, or by the operator's classification (JCLAW-939, JCLAW-1102). */
+  local: boolean
+}
+
+/** A single persisted model on a provider (stored inside provider.{name}.models JSON). */
+export interface ProviderModelDef {
+  id: string
+  name?: string
+  contextWindow?: number
+  maxTokens?: number
+  supportsThinking?: boolean
+  /**
+   * Pure reasoning models with no non-thinking mode. UI surfaces a locked-on
+   * thinking pill, and the backend sends the model's lowest advertised rung
+   * rather than an off signal — on Ollama the off value stops the reasoning
+   * being tagged without stopping it happening, and omitting the field
+   * inherits the vendor default, which is the priciest rung. The lock governs
+   * on/off only; effort levels stay selectable. Implies supportsThinking.
+   */
+  alwaysThinks?: boolean
+  supportsVision?: boolean
+  supportsAudio?: boolean
+  supportsVideo?: boolean
+  promptPrice?: number | null
+  completionPrice?: number | null
+  cachedReadPrice?: number | null
+  cacheWritePrice?: number | null
+  thinkingLevels?: string[]
+  [key: string]: unknown
+}
+
+/**
+ * Shape returned by POST /api/providers/:name/discover-models — includes the
+ * stored ProviderModelDef fields plus provider-detection hints and an
+ * optional ranking from the leaderboard.
+ */
+export interface DiscoveredModel extends ProviderModelDef {
+  isFree?: boolean
+  leaderboardRank?: number | null
+  thinkingDetectedFromProvider?: boolean
+  /**
+   * True when alwaysThinks was set from a provider-surfaced field
+   * (currently only OpenRouter's architecture.instruct_type for the R1
+   * family). False when set from the id-pattern fallback for o-series /
+   * QwQ — still saved automatically because the patterns are tight.
+   */
+  alwaysThinksDetectedFromProvider?: boolean
+  visionDetectedFromProvider?: boolean
+  audioDetectedFromProvider?: boolean
+  videoDetectedFromProvider?: boolean
+}
+
+/** Shape returned by POST /api/providers/:name/discover-models. */
+export interface DiscoverModelsResponse {
+  models: DiscoveredModel[]
+}
+
+/**
+ * One configured MCP (Model Context Protocol) server, as surfaced by
+ * {@code GET /api/mcp-servers}. Transport-specific fields are exploded
+ * out of the row's stored configJson so the admin form binds directly:
+ * {@code command/args/env} for STDIO, {@code url/headers} for HTTP.
+ * Status/lastError/lastConnected* are populated from the runtime
+ * McpConnectionManager — they're cross-cutting state not stored on the row.
+ */
+/** One circuit breaker as `GET /api/breakers` reports it (JCLAW-1170). */
+export interface Breaker {
+  /** Registry name, `<subsystem>:<target>`: what trip and reset take. */
+  name: string
+  /** Registry-name prefix: `llm`, `mcp` or `decision`. */
+  subsystem: string
+  /** What the breaker guards: a provider name, an MCP server name, a decision provider (`jev`). */
+  target: string
+  state: 'CLOSED' | 'OPEN' | 'HALF_OPEN'
+  samples: number
+  failures: number
+  slowCalls: number
+  /** What moved it into `state`; null before it has ever moved. */
+  reason: string | null
+  /** Whether `reason` was an operator's decision rather than the breaker acting alone. */
+  manual: boolean
+}
+
+export interface McpServer {
+  id: number
+  name: string
+  enabled: boolean
+  transport: 'STDIO' | 'HTTP'
+  /** STDIO only: subprocess executable. Empty for HTTP rows. */
+  command: string | null
+  /** STDIO only: subprocess args. Empty array for HTTP rows. */
+  args: string[]
+  /** STDIO only: environment vars. Empty object for HTTP rows. */
+  env: Record<string, string>
+  /** HTTP only: endpoint URL. null for STDIO rows. */
+  url: string | null
+  /** HTTP only: request headers. Empty object for STDIO rows. */
+  headers: Record<string, string>
+  /** Live connection state from McpConnectionManager. */
+  status: 'DISCONNECTED' | 'CONNECTING' | 'CONNECTED' | 'ERROR'
+  lastError: string | null
+  lastConnectedAt: string | null
+  lastDisconnectedAt: string | null
+  /** Number of MCP tools currently advertised by this server. */
+  toolCount: number
+  /**
+   * Per-tool details for every action this server currently advertises.
+   * Sourced from {@code McpConnectionManager.tools(serverName)} at the
+   * moment of the response — empty for DISCONNECTED servers. Drives the
+   * inline-expandable action list on the MCP Servers page and the
+   * read-only action display under each MCP server toggle on the
+   * agent detail page.
+   */
+  tools: McpToolInfo[]
+  createdAt: string | null
+  updatedAt: string | null
+  /**
+   * Name of the older server this one duplicates — same transport, same config — or
+   * null (JCLAW-982). A duplicate spawns a second process and puts every one of its
+   * tools into the catalogue twice, which is invisible unless two long endpoint
+   * strings are compared by eye.
+   */
+  duplicateOf: string | null
+}
+
+/** JCLAW-813: a saved prompt in the Prompts Library. The category glyph is a
+ *  frontend concern (value → Heroicon), so no icon field travels on the wire. */
+export interface Prompt {
+  id: number
+  title: string
+  content: string
+  tags: string | null
+  category: string
+  categoryLabel: string
+  createdAt: string | null
+  updatedAt: string | null
+}
+
+/**
+ * JCLAW-1071: one built-in slash command, from GET /api/slash-commands.
+ * Derived server-side from the `Commands.Command` enum — the same source
+ * Telegram's native dropdown is registered from.
+ */
+export interface SlashCommand {
+  /** The "/x" form the composer inserts. */
+  literal: string
+  /** Name without the leading slash. */
+  name: string
+  description: string
+}
+
+/** JCLAW-813: one entry in the fixed prompt-category list. */
+export interface PromptCategory {
+  value: string
+  label: string
+}
+
+/** One advertised tool on an MCP server. */
+export interface McpToolInfo {
+  name: string
+  description: string
+}
+
+/** Result of POST /api/mcp-servers/{id}/test — synchronous connection probe. */
+export interface McpTestResult {
+  success: boolean
+  toolCount: number
+  message: string
+  toolNames: string[]
+}
+
+/**
+ * Result of POST /api/providers/{name}/embedding-probe (JCLAW-931).
+ *
+ * `ok` is false both when the model does not serve embeddings and when the
+ * provider served a *different* model than the one asked for — LM Studio ignores
+ * the requested model on /v1/embeddings, so a 200 with a valid vector does not on
+ * its own mean the selection would be honoured. `error` carries the reason.
+ */
+export interface EmbeddingProbeResponse {
+  provider: string
+  model: string
+  ok: boolean
+  dimensions: number
+  error: string | null
+}
+
+/** Progress of a memory re-embed (JCLAW-933). `upToDate` is false after a model switch. */
+export interface MemoryReembedStatus {
+  running: boolean
+  processed: number
+  total: number
+  model: string
+  error: string | null
+  upToDate: boolean
+}
+
+/** A provider model's id paired with its display name. */
+export interface ModelRef {
+  id: string
+  name: string
+}
+
+/**
+ * GET /api/providers/{name}/embedding-models — the provider's advertised catalog with
+ * no capability filtering, for the memory embedding picker. Distinct from
+ * discover-models, which drops embedding models so a chat agent cannot be bound to one.
+ */
+export interface ProviderModelsResponse {
+  provider: string
+  models: ModelRef[]
+  count: number
+}
+
+/** JCLAW-1130/1131: the three actionable parts every API error carries under `template`. */
+export interface ApiErrorTemplate {
+  whatBroke: string
+  whatToCheck: string
+  /** Null when the failure has no retry path — a breached password is replaceable, not retryable. */
+  howToRetry: string | null
+}
+
+/** The canonical error body (`utils.ApiResponses.errorBody`). */
+export interface ApiErrorBody {
+  type: 'error'
+  code: string
+  message: string
+  template: ApiErrorTemplate
+}
+
+/**
+ * A failed call, normalized for rendering. `code` and `template` are null when the failure
+ * produced no envelope — a transport error, a timeout, a proxy's own status page — which is
+ * what tells a caller that `message` is raw HTTP status text rather than the server's own.
+ */
+export interface ApiErrorDetails {
+  code: string | null
+  message: string
+  template: ApiErrorTemplate | null
+  /** HTTP status of the refusal, or null when nothing answered. Play's bare notFound() sends no envelope, so a 404 is only readable here. */
+  status?: number | null
+  /** The form field a 400 is about, when the server names one, so a form can mark that field. */
+  field?: string | null
+}

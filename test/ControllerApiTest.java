@@ -1,0 +1,754 @@
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
+import play.mvc.Http;
+import play.test.Fixtures;
+import play.test.FunctionalTest;
+
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.nio.charset.StandardCharsets;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+
+/**
+ * Functional HTTP tests for the 8 API controllers that previously had zero coverage:
+ * ApiAgentsController, ApiProvidersController, ApiTasksController, ApiChannelsController,
+ * ApiLogsController, ApiSkillsController, ApiToolsController, ApiEventsController.
+ *
+ * Every test method authenticates first (login), then exercises the endpoint.
+ * The H2 in-memory DB is wiped between tests for isolation — the DefaultConfigJob
+ * seed data does NOT survive Fixtures.deleteDatabase(), so tests that need an agent
+ * create one via the API.
+ */
+class ControllerApiTest extends FunctionalTest {
+
+    @BeforeEach
+    void setup() {
+        Fixtures.deleteDatabase();
+        AuthFixture.seedAdminPassword("changeme");
+    }
+
+    // --- Auth helper ---
+
+    private void login() {
+        var body = """
+                {"username": "admin", "password": "changeme"}
+                """;
+        var response = POST("/api/auth/login", "application/json", body);
+        assertIsOk(response);
+    }
+
+    /**
+     * Create an agent via the API and return its id as a String.
+     * The "main" name is reserved by the controller, so callers that need the
+     * main agent must use {@link #createMainAgent()}.
+     */
+    private String createAgent(String name) {
+        var body = """
+                {"name": "%s", "modelProvider": "openrouter", "modelId": "gpt-4.1"}
+                """.formatted(name);
+        var resp = POST("/api/agents", "application/json", body);
+        assertIsOk(resp);
+        return extractId(getContent(resp));
+    }
+
+    /**
+     * Seed the built-in "main" agent the same way DefaultConfigJob does.
+     * Since the controller rejects POST with name="main" (409), we use a
+     * different name then look it up — but actually the controller checks
+     * case-insensitively, so we resort to creating it through the config
+     * endpoint trigger. Simplest: just call GET /api/status which triggers
+     * DefaultConfigJob startup seeding if not already run, then list agents.
+     *
+     * In practice, within FunctionalTest the Play app is already started and
+     * DefaultConfigJob has already run before the first request. But
+     * Fixtures.deleteDatabase() wipes the DB. The job only runs once at
+     * startup, so we must re-create the main agent manually.
+     *
+     * We work around the "main" name reservation by creating it with a
+     * non-reserved name and using the returned id. Tests that specifically
+     * need the "main" agent (e.g. delete-reject) will need to create an
+     * agent and attempt operations on it.
+     */
+    private String createTestAgent() {
+        return createAgent("test-agent");
+    }
+
+    // --- Unauthenticated access is rejected ---
+
+    @Test
+    void allEndpointsReject401WithoutAuth() {
+        assertEquals(401, GET("/api/agents").status.intValue());
+        assertEquals(401, GET("/api/tasks").status.intValue());
+        assertEquals(401, GET("/api/channels").status.intValue());
+        assertEquals(401, GET("/api/logs").status.intValue());
+        assertEquals(401, GET("/api/skills").status.intValue());
+        assertEquals(401, GET("/api/tools").status.intValue());
+    }
+
+    // =====================
+    // ApiAgentsController
+    // =====================
+
+    /**
+     * The top-level collection endpoints (agents, tasks, channels, skills)
+     * all return 200 + application/json with a JSON-array body. After
+     * deleteDatabase the array may be empty; the contract is only that it's
+     * a valid array.
+     */
+    @ParameterizedTest(name = "listReturnsJsonArray[{0}]")
+    @ValueSource(strings = {"/api/agents", "/api/tasks", "/api/channels", "/api/skills"})
+    void collectionEndpointReturnsJsonArray(String url) {
+        login();
+        var response = GET(url);
+        assertIsOk(response);
+        assertContentType("application/json", response);
+        assertTrue(getContent(response).startsWith("["));
+    }
+
+    @Test
+    void agentsListContainsCreatedAgent() {
+        login();
+        createAgent("listed-agent");
+        var response = GET("/api/agents");
+        assertIsOk(response);
+        assertTrue(getContent(response).contains("\"name\":\"listed-agent\""));
+    }
+
+    @Test
+    void agentsCrud() {
+        login();
+
+        // CREATE
+        var createBody = """
+                {"name": "crud-agent", "modelProvider": "openrouter", "modelId": "gpt-4.1"}
+                """;
+        var createResp = POST("/api/agents", "application/json", createBody);
+        assertIsOk(createResp);
+        assertContentType("application/json", createResp);
+        var content = getContent(createResp);
+        assertTrue(content.contains("\"name\":\"crud-agent\""));
+        assertTrue(content.contains("\"modelProvider\":\"openrouter\""));
+
+        var id = extractId(content);
+        assertNotNull(id, "Expected an id in the create response");
+
+        // GET by id
+        var getResp = GET("/api/agents/" + id);
+        assertIsOk(getResp);
+        assertTrue(getContent(getResp).contains("\"name\":\"crud-agent\""));
+
+        // UPDATE
+        var updateBody = """
+                {"name": "crud-agent-v2", "modelId": "gpt-4.1-nano"}
+                """;
+        var updateResp = PUT("/api/agents/" + id, "application/json", updateBody);
+        assertIsOk(updateResp);
+        assertTrue(getContent(updateResp).contains("\"name\":\"crud-agent-v2\""));
+        assertTrue(getContent(updateResp).contains("\"modelId\":\"gpt-4.1-nano\""));
+
+        // DELETE
+        var deleteResp = DELETE("/api/agents/" + id);
+        assertIsOk(deleteResp);
+        assertTrue(getContent(deleteResp).contains("\"status\":\"ok\""));
+
+        // GET after delete returns 404
+        var afterDelete = GET("/api/agents/" + id);
+        assertEquals(404, afterDelete.status.intValue());
+    }
+
+    /**
+     * Reserved-name / reserved-key POSTs that conflict with 409: creating an
+     * agent named "main", creating an agent named "__loadtest__", and saving
+     * the reserved provider.loadtest-mock config key.
+     */
+    @ParameterizedTest(name = "{0}")
+    @CsvSource(delimiter = '|', value = {
+            "createReservedMainName     | /api/agents | {\"name\": \"main\", \"modelProvider\": \"openrouter\", \"modelId\": \"gpt-4.1\"}",
+            "createReservedLoadtestName | /api/agents | {\"name\": \"__loadtest__\", \"modelProvider\": \"openrouter\", \"modelId\": \"gpt-4.1\"}",
+            "saveReservedLoadtestKey    | /api/config | {\"key\":\"provider.loadtest-mock.baseUrl\",\"value\":\"http://localhost:19999/v1\"}"
+    })
+    void reservedNamePostReturns409(String label, String url, String body) {
+        login();
+        var response = POST(url, "application/json", body);
+        assertEquals(409, response.status.intValue());
+    }
+
+    // JCLAW-115: agent-name slug validation rejects traversal-shaped input.
+    // The full rejection matrix lives in {@link #agentsCreateRejectsInvalidSlug}.
+
+    /**
+     * Every invalid-name shape the slug regex rejects: path traversal,
+     * absolute path, embedded slash, empty, lone dot, double dot,
+     * embedded whitespace, and overlong (65 chars = limit+1).
+     */
+    @ParameterizedTest(name = "agentsCreateRejects[{0}]")
+    @ValueSource(strings = {
+            "../etc",
+            "/etc/passwd",
+            "foo/bar",
+            "",
+            ".",
+            "..",
+            "has space"
+    })
+    void agentsCreateRejectsInvalidSlug(String name) {
+        login();
+        var body = """
+                {"name": "%s", "modelProvider": "openrouter", "modelId": "gpt-4.1"}
+                """.formatted(name);
+        var response = POST("/api/agents", "application/json", body);
+        assertEquals(400, response.status.intValue());
+    }
+
+    @Test
+    void agentsCreateRejectsOverlongName() {
+        login();
+        // 65 chars — one over the limit. Kept separate so the limit constant
+        // stays explicit in the test source rather than buried in a ValueSource.
+        var longName = "a".repeat(65);
+        var body = """
+                {"name": "%s", "modelProvider": "openrouter", "modelId": "gpt-4.1"}
+                """.formatted(longName);
+        var response = POST("/api/agents", "application/json", body);
+        assertEquals(400, response.status.intValue());
+    }
+
+    @Test
+    void agentsCreateAcceptsValidSlugNames() {
+        login();
+        // Happy-path sanity: the regex allows typical names operators use.
+        var body = """
+                {"name": "my-agent_01", "modelProvider": "openrouter", "modelId": "gpt-4.1"}
+                """;
+        var response = POST("/api/agents", "application/json", body);
+        assertIsOk(response);
+    }
+
+    @Test
+    void agentsUpdateRejectsRenameToTraversalName() {
+        login();
+        var id = createAgent("rename-src-115");
+        var body = """
+                {"name": "../etc"}
+                """;
+        var response = PUT("/api/agents/" + id, "application/json", body);
+        assertEquals(400, response.status.intValue());
+    }
+
+    @Test
+    void agentsUpdateAllowsUnchangedName() {
+        // JCLAW-115 grandfather clause: update requests that don't modify
+        // the name must pass regardless of whether the existing name meets
+        // the new regex (e.g. legacy agents). Here we flip thinkingMode
+        // without touching name.
+        login();
+        var id = createAgent("legacy-ok-115");
+        var body = """
+                {"thinkingMode": null}
+                """;
+        var response = PUT("/api/agents/" + id, "application/json", body);
+        assertIsOk(response);
+    }
+
+    // agentsCreateRejectsReservedLoadtestName merged into reservedNamePostReturns409
+    // (POST /api/agents with name __loadtest__).
+
+    @Test
+    void agentsUpdateRejectsRenameToReservedLoadtestName() {
+        login();
+        var id = createAgent("rename-src");
+        var body = """
+                {"name": "__loadtest__"}
+                """;
+        var response = PUT("/api/agents/" + id, "application/json", body);
+        assertEquals(409, response.status.intValue());
+    }
+
+    /**
+     * GETs for a non-existent resource all return 404: an unknown agent id,
+     * an unknown channel type, an unknown skill name, and the agent-scoped
+     * skills/tools listings for an unknown agent id.
+     */
+    @ParameterizedTest(name = "getReturns404[{0}]")
+    @ValueSource(strings = {
+            "/api/agents/999999",
+            "/api/channels/nonexistent",
+            "/api/skills/nonexistent-skill-xyz",
+            "/api/agents/999999/skills",
+            "/api/agents/999999/tools"
+    })
+    void nonExistentResourceGetReturns404(String url) {
+        login();
+        var response = GET(url);
+        assertEquals(404, response.status.intValue());
+    }
+
+    @Test
+    void agentsPromptBreakdown() {
+        login();
+        var id = createTestAgent();
+        var response = GET("/api/agents/" + id + "/prompt-breakdown?channelType=web");
+        assertIsOk(response);
+        assertContentType("application/json", response);
+    }
+
+    @Test
+    void agentsPromptBreakdownRejectsMissingChannel() {
+        login();
+        var id = createTestAgent();
+        assertEquals(400, GET("/api/agents/" + id + "/prompt-breakdown").status.intValue());
+        assertEquals(400, GET("/api/agents/" + id + "/prompt-breakdown?channelType=").status.intValue());
+        assertEquals(400, GET("/api/agents/" + id + "/prompt-breakdown?channelType=bogus").status.intValue());
+    }
+
+    // =====================
+    // ApiProvidersController
+    // =====================
+
+    /**
+     * Empty-body POSTs that reject on a missing prerequisite: discover-models
+     * on an unconfigured provider is a 400 (no base URL), while cancel/retry
+     * on a non-existent task id are 404s.
+     */
+    @ParameterizedTest(name = "{0}")
+    @CsvSource(delimiter = '|', value = {
+            "discoverModelsUnconfiguredProvider | /api/providers/nonexistent/discover-models | 400",
+            "cancelNonExistentTask              | /api/tasks/999999/cancel                   | 404",
+            "retryNonExistentTask               | /api/tasks/999999/retry                    | 404"
+    })
+    void emptyBodyPostRejection(String label, String url, int expectedStatus) {
+        login();
+        var response = POST(url, "application/json", "{}");
+        assertEquals(expectedStatus, response.status.intValue());
+    }
+
+    // =====================
+    // ApiTasksController
+    // =====================
+
+    // tasksList merged into collectionEndpointReturnsJsonArray (GET /api/tasks).
+
+    /**
+     * Filter/query-param variants of the list endpoints return 200 +
+     * application/json: the tasks list with status/limit/offset, the logs
+     * list with category/level/limit/offset, and the logs list with a
+     * search filter. Body shape is exercised by the no-filter tests; here we
+     * only assert the filtered request is accepted.
+     */
+    @ParameterizedTest(name = "filteredListOk[{0}]")
+    @ValueSource(strings = {
+            "/api/tasks?status=PENDING&limit=10&offset=0",
+            "/api/logs?category=system&level=INFO&limit=10&offset=0",
+            "/api/logs?search=test&limit=5"
+    })
+    void filteredListEndpointReturnsJson(String url) {
+        login();
+        var response = GET(url);
+        assertIsOk(response);
+        assertContentType("application/json", response);
+    }
+
+    // tasksCancelNonExistentReturns404 and tasksRetryNonExistentReturns404
+    // merged into emptyBodyPostRejection above.
+
+    // =====================
+    // ApiChannelsController
+    // =====================
+
+    // channelsList merged into collectionEndpointReturnsJsonArray (GET /api/channels).
+
+    @Test
+    void channelsCrud() {
+        login();
+
+        // SAVE (create) a channel config
+        var saveBody = """
+                {"config": {"botToken": "test-token-123"}, "enabled": true}
+                """;
+        var saveResp = PUT("/api/channels/telegram", "application/json", saveBody);
+        assertIsOk(saveResp);
+        var content = getContent(saveResp);
+        assertTrue(content.contains("\"channelType\":\"telegram\""));
+        assertTrue(content.contains("\"enabled\":true"));
+
+        // GET by type — botToken is masked in the response (JCLAW-780) so
+        // agent-reachable reads can't return raw secrets; the key still survives.
+        var getResp = GET("/api/channels/telegram");
+        assertIsOk(getResp);
+        var getBody = getContent(getResp);
+        assertTrue(getBody.contains("\"channelType\":\"telegram\""));
+        assertFalse(getBody.contains("test-token-123"), "raw botToken must not leak: " + getBody);
+        assertTrue(getBody.contains("test****"), "botToken must be masked: " + getBody);
+
+        // UPDATE (save again with different values)
+        var updateBody = """
+                {"config": {"botToken": "updated-token"}, "enabled": false}
+                """;
+        var updateResp = PUT("/api/channels/telegram", "application/json", updateBody);
+        assertIsOk(updateResp);
+        var updateContent = getContent(updateResp);
+        assertTrue(updateContent.contains("\"enabled\":false"));
+        assertFalse(updateContent.contains("updated-token"), "raw botToken must not leak: " + updateContent);
+        assertTrue(updateContent.contains("upda****"), "botToken must be masked: " + updateContent);
+
+        // LIST should now contain the channel
+        var listResp = GET("/api/channels");
+        assertIsOk(listResp);
+        assertTrue(getContent(listResp).contains("\"channelType\":\"telegram\""));
+    }
+
+    // channelsGetNonExistentReturns404 merged into nonExistentResourceGetReturns404
+    // (GET /api/channels/nonexistent).
+
+    // =====================
+    // ApiLogsController
+    // =====================
+
+    @Test
+    void logsList() {
+        login();
+        var response = GET("/api/logs");
+        assertIsOk(response);
+        assertContentType("application/json", response);
+        var content = getContent(response);
+        assertTrue(content.contains("\"events\""));
+        assertTrue(content.contains("\"limit\""));
+        assertTrue(content.contains("\"offset\""));
+    }
+
+    // logsListWithFilters and logsListWithSearchFilter merged into
+    // filteredListEndpointReturnsJson above.
+
+    // =====================
+    // ApiSkillsController
+    // =====================
+
+    // skillsList merged into collectionEndpointReturnsJsonArray (GET /api/skills).
+
+    // skillsGetNonExistentReturns404 merged into nonExistentResourceGetReturns404
+    // (GET /api/skills/nonexistent-skill-xyz).
+
+    @Test
+    void skillsListForAgent() {
+        login();
+        var id = createTestAgent();
+        var response = GET("/api/agents/" + id + "/skills");
+        assertIsOk(response);
+        assertContentType("application/json", response);
+    }
+
+    // skillsListForNonExistentAgentReturns404 merged into
+    // nonExistentResourceGetReturns404 (GET /api/agents/999999/skills).
+
+    @Test
+    void skillsDeleteNonExistentReturns404() {
+        login();
+        var response = DELETE("/api/skills/nonexistent-skill-xyz");
+        assertEquals(404, response.status.intValue());
+    }
+
+    // =====================
+    // ApiToolsController
+    // =====================
+
+    @Test
+    void toolsList() {
+        login();
+        var response = GET("/api/tools");
+        assertIsOk(response);
+        assertContentType("application/json", response);
+        var content = getContent(response);
+        assertTrue(content.startsWith("["));
+    }
+
+    @Test
+    void toolsMetaReturnsRichShape() throws Exception {
+        // Publish a known tool set so this test is independent of whatever
+        // the DefaultConfigJob did (or didn't) register in the test JVM.
+        // JCLAW-894: publish under the registry lock and let the helper restore —
+        // the old idiom snapshotted listTools() (the MERGED map) and republished it
+        // as natives, promoting any MCP tool into a slot nothing unpublishes.
+        ToolRegistrySync.withTools(java.util.List.of(
+                new tools.ShellExecTool(),
+                new tools.FileSystemTools(),
+                new tools.WebFetchTool(),
+                new tools.DateTimeTool()
+        ), () -> {
+            login();
+            var response = GET("/api/tools/meta");
+            assertIsOk(response);
+            assertContentType("application/json", response);
+            var content = getContent(response);
+            assertTrue(content.startsWith("["), "response is a JSON array");
+            // Backend taxonomy — every tool must carry category/icon/shortDescription/actions.
+            assertTrue(content.contains("\"category\""),         "carries category");
+            assertTrue(content.contains("\"icon\""),             "carries icon");
+            assertTrue(content.contains("\"shortDescription\""), "carries shortDescription");
+            assertTrue(content.contains("\"actions\""),          "carries actions");
+            // Concrete category values from the published tool set.
+            assertTrue(content.contains("\"System\""),    "exec is System-category");
+            assertTrue(content.contains("\"Files\""),     "filesystem is Files");
+            assertTrue(content.contains("\"Web\""),       "web_fetch is Web");
+            assertTrue(content.contains("\"Utilities\""), "datetime is Utilities");
+            // JCLAW-172: ShellExecTool no longer declares a requiresConfig
+            // gate (shell.enabled is gone — the tool registers
+            // unconditionally). The metadata response carries no
+            // shell.enabled marker for it now.
+            assertFalse(content.contains("\"shell.enabled\""),
+                    "shell.enabled gate must not surface after JCLAW-172");
+            // Presentational concerns must NOT leak into the backend response.
+            assertFalse(content.contains("bg-neutral"), "no Tailwind classes in API");
+            assertFalse(content.contains("<path"),      "no SVG markup in API");
+        });
+    }
+
+    @Test
+    void toolsMetaRequiresAuth() {
+        assertEquals(401, GET("/api/tools/meta").status.intValue());
+    }
+
+    @Test
+    void toolsListForAgent() {
+        login();
+        var id = createTestAgent();
+        var response = GET("/api/agents/" + id + "/tools");
+        assertIsOk(response);
+        assertContentType("application/json", response);
+        assertTrue(getContent(response).contains("\"enabled\""));
+    }
+
+    // toolsListForNonExistentAgentReturns404 merged into
+    // nonExistentResourceGetReturns404 (GET /api/agents/999999/tools).
+
+    @Test
+    void toolsUpdateForAgent() {
+        login();
+        var id = createTestAgent();
+
+        // Disable a tool
+        var body = """
+                {"enabled": false}
+                """;
+        var response = PUT("/api/agents/" + id + "/tools/exec", "application/json", body);
+        assertIsOk(response);
+        var content = getContent(response);
+        assertTrue(content.contains("\"name\":\"exec\""));
+        assertTrue(content.contains("\"enabled\":false"));
+        assertTrue(content.contains("\"status\":\"ok\""));
+
+        // Re-enable it
+        var reEnableBody = """
+                {"enabled": true}
+                """;
+        var reEnableResp = PUT("/api/agents/" + id + "/tools/exec", "application/json", reEnableBody);
+        assertIsOk(reEnableResp);
+        assertTrue(getContent(reEnableResp).contains("\"enabled\":true"));
+    }
+
+    // =====================
+    // ApiEventsController
+    // =====================
+
+    /**
+     * The SSE endpoint uses Play's async continuation (await) which blocks the
+     * FunctionalTest GET() call until the stream ends (24h timeout). We cannot
+     * exercise it via the standard GET() helper. Instead, verify that an
+     * unauthenticated request is rejected (covered in allEndpointsReject401WithoutAuth)
+     * and that the route is wired by confirming the 401 comes from AuthCheck, not a 404.
+     */
+    @Test
+    void eventsStreamRouteIsWired() {
+        // Without auth, AuthCheck returns 401 — proving the route exists and
+        // reaches the controller (a missing route would give 404).
+        var response = GET("/api/events");
+        assertEquals(401, response.status.intValue());
+    }
+
+    /**
+     * The fork sends response headers with the first chunk, and an EventSource fires its open event
+     * on the headers, so the stream must write at once rather than at its first 30 s heartbeat. The
+     * chunk handler stands in for a client that disconnects after one frame, which closes the stream
+     * and lets the request finish.
+     */
+    @Test
+    void eventsStreamWritesAFrameAsSoonAsItOpens() {
+        var login = POST("/api/auth/login", "application/json", """
+                {"username": "admin", "password": "changeme"}
+                """);
+        assertIsOk(login);
+        var request = newRequest();
+        request.method = "GET";
+        request.url = "/api/events";
+        request.path = "/api/events";
+        request.querystring = "";
+        request.body = new ByteArrayInputStream(new byte[0]);
+        request.cookies = login.cookies;
+        var response = new Http.Response();
+        response.out = new ByteArrayOutputStream();
+        var firstFrame = new AtomicReference<String>();
+        response.onWriteChunk(chunk -> {
+            firstFrame.compareAndSet(null, new String((byte[]) chunk, StandardCharsets.UTF_8));
+            throw new IllegalStateException("client disconnected");
+        });
+
+        long started = System.nanoTime();
+        makeRequest(request, response);
+        long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
+
+        assertEquals(200, response.status.intValue());
+        assertTrue(firstFrame.get() != null && firstFrame.get().startsWith(":"),
+                "the first frame must be the open comment, not a bus event: " + firstFrame.get());
+        assertTrue(elapsedMs < 10_000, "the first frame took " + elapsedMs + " ms, a heartbeat's wait");
+    }
+
+    // =====================
+    // ApiConfigController — loadtest-mock reserved key guards
+    // =====================
+
+    // configSaveOnLoadtestMockKeyReturns409 merged into reservedNamePostReturns409
+    // (POST /api/config with the reserved provider.loadtest-mock key).
+
+    @Test
+    void configDeleteOnLoadtestMockKeyReturns409() {
+        login();
+        services.ConfigService.set("provider.loadtest-mock.baseUrl", "http://127.0.0.1:19999/v1");
+        try {
+            var response = DELETE("/api/config/provider.loadtest-mock.baseUrl");
+            assertEquals(409, response.status.intValue());
+        } finally {
+            services.ConfigService.delete("provider.loadtest-mock.baseUrl");
+        }
+    }
+
+    @Test
+    void configListHidesLoadtestMockProviderKeys() {
+        login();
+        services.ConfigService.set("provider.loadtest-mock.baseUrl", "http://127.0.0.1:19999/v1");
+        var response = GET("/api/config");
+        assertIsOk(response);
+        assertFalse(getContent(response).contains("provider.loadtest-mock."),
+                "Reserved provider.loadtest-mock.* keys must not appear in /api/config");
+        services.ConfigService.delete("provider.loadtest-mock.baseUrl");
+    }
+
+    @Test
+    void configSaveProviderEnabledFlagRoundTrips() {
+        // JCLAW-110: the Settings toggle writes provider.NAME.enabled via the
+        // standard config API. The reserved-key guard is namespaced to the
+        // loadtest-mock prefix, so this POST must succeed for normal providers
+        // and the value must come back on GET.
+        login();
+        try {
+            var body = """
+                    {"key":"provider.openrouter.enabled","value":"false"}
+                    """;
+            var response = POST("/api/config", "application/json", body);
+            assertIsOk(response);
+
+            var getResp = GET("/api/config");
+            assertIsOk(getResp);
+            assertTrue(getContent(getResp).contains("provider.openrouter.enabled"),
+                    "round-tripped enabled key should appear in /api/config");
+        } finally {
+            services.ConfigService.delete("provider.openrouter.enabled");
+        }
+    }
+
+    // =====================
+    // ApiChatController slash-argument wiring (JCLAW-111)
+    // =====================
+
+    @Test
+    void chatSendRoutesModelStatusThroughFullDetailPath() {
+        // JCLAW-111: the sync REST chat handler used to call the no-args
+        // Commands.execute overload, which dropped the "status" argument
+        // and fell into the no-args summary branch. This test proves the
+        // args-carrying overload now fires and /model status returns the
+        // full model metadata.
+        login();
+        services.ConfigService.set("provider.openrouter.baseUrl", "https://openrouter.ai/api/v1");
+        services.ConfigService.set("provider.openrouter.apiKey", "sk-test");
+        services.ConfigService.set("provider.openrouter.models",
+                "[{\"id\":\"gpt-4.1\",\"name\":\"GPT 4.1\",\"contextWindow\":128000,\"maxTokens\":8192}]");
+        llm.ProviderRegistry.refresh();
+        var agentId = createAgent("slash-status-agent");
+        try {
+            var chatBody = """
+                    {"agentId": %s, "message": "/model status"}
+                    """.formatted(agentId);
+            var response = POST("/api/chat/send", "application/json", chatBody);
+            assertIsOk(response);
+            var content = getContent(response);
+            // Full-detail markers — absent from the no-args summary.
+            assertTrue(content.contains("Context window"),
+                    "/model status should render full detail including context window: " + content);
+            assertTrue(content.contains("128K"),
+                    "/model status should include formatted context window: " + content);
+        } finally {
+            services.ConfigService.delete("provider.openrouter.baseUrl");
+            services.ConfigService.delete("provider.openrouter.apiKey");
+            services.ConfigService.delete("provider.openrouter.models");
+            llm.ProviderRegistry.refresh();
+        }
+    }
+
+    @Test
+    void chatSendRoutesModelNameWriteThroughOverride() {
+        // JCLAW-111: /model openrouter/gpt-4.1 must reach the write-path
+        // branch (performModelSwitch) rather than being ignored as a no-args
+        // summary. We verify by inspecting the confirmation text — the
+        // summary and the switch confirmation are visibly distinct.
+        login();
+        services.ConfigService.set("provider.openrouter.baseUrl", "https://openrouter.ai/api/v1");
+        services.ConfigService.set("provider.openrouter.apiKey", "sk-test");
+        services.ConfigService.set("provider.openrouter.models",
+                "[{\"id\":\"gpt-4.1\",\"contextWindow\":128000}]");
+        llm.ProviderRegistry.refresh();
+        var agentId = createAgent("slash-switch-agent");
+        try {
+            var chatBody = """
+                    {"agentId": %s, "message": "/model openrouter/gpt-4.1"}
+                    """.formatted(agentId);
+            var response = POST("/api/chat/send", "application/json", chatBody);
+            assertIsOk(response);
+            var content = getContent(response);
+            assertTrue(content.contains("Switched this conversation"),
+                    "/model NAME should render the switch-confirmation text: " + content);
+        } finally {
+            services.ConfigService.delete("provider.openrouter.baseUrl");
+            services.ConfigService.delete("provider.openrouter.apiKey");
+            services.ConfigService.delete("provider.openrouter.models");
+            llm.ProviderRegistry.refresh();
+        }
+    }
+
+    @Test
+    void agentsListHidesLoadtestAgent() {
+        login();
+        services.Tx.run(() -> {
+            var a = new models.Agent();
+            a.name = "__loadtest__";
+            a.modelProvider = "loadtest-mock";
+            a.modelId = "mock-model";
+            a.save();
+        });
+        var response = GET("/api/agents");
+        assertIsOk(response);
+        assertFalse(getContent(response).contains("\"__loadtest__\""),
+                "Reserved agent __loadtest__ must not appear in /api/agents");
+    }
+
+    // =====================
+    // Helpers
+    // =====================
+
+    /** Extract the first "id":N value from a JSON string. */
+    private String extractId(String json) {
+        var matcher = java.util.regex.Pattern.compile("\"id\":(\\d+)").matcher(json);
+        return matcher.find() ? matcher.group(1) : null;
+    }
+}

@@ -1,0 +1,149 @@
+package controllers;
+
+import channels.TelegramPollingRunner;
+import com.google.gson.Gson;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.media.ArraySchema;
+import io.swagger.v3.oas.annotations.media.Content;
+import io.swagger.v3.oas.annotations.media.Schema;
+import io.swagger.v3.oas.annotations.parameters.RequestBody;
+import io.swagger.v3.oas.annotations.responses.ApiResponse;
+import models.ChannelConfig;
+import play.mvc.Controller;
+import play.mvc.With;
+import services.ChannelStatusService;
+import services.ConfigService;
+import services.EventLogger;
+import utils.ApiResponses;
+
+import java.util.List;
+import java.util.Set;
+
+import static controllers.AgentAccess.Level.OPEN;
+import static controllers.AgentAccess.Level.OPERATOR_ONLY;
+import static utils.GsonHolder.GSON;
+
+@With(AuthCheck.class)
+public class ApiChannelsController extends Controller {
+
+    private static final Gson gson = GSON;
+
+    private record ChannelView(Long id, String channelType, JsonElement config,
+                               boolean enabled, String createdAt, String updatedAt) {
+        static ChannelView of(ChannelConfig c) {
+            return new ChannelView(c.id, c.channelType,
+                    maskConfig(c.configJson),
+                    c.enabled, c.createdAt.toString(), c.updatedAt.toString());
+        }
+    }
+
+    /**
+     * JCLAW-780: parse the stored channel config and mask secret-bearing
+     * top-level fields (botToken, apiKey, signingSecret, …) before it reaches
+     * the agent-reachable {@link #list()} / {@link #get} responses. Sensitivity
+     * is key-driven via {@link ConfigService#maskValue}; non-string / nested
+     * values pass through unchanged (channel configs are flat string maps in
+     * practice).
+     */
+    private static JsonElement maskConfig(String configJson) {
+        var parsed = JsonParser.parseString(configJson);
+        if (!parsed.isJsonObject()) return parsed;
+        var out = new JsonObject();
+        for (var entry : parsed.getAsJsonObject().entrySet()) {
+            var v = entry.getValue();
+            if (v.isJsonPrimitive() && v.getAsJsonPrimitive().isString()) {
+                out.addProperty(entry.getKey(), ConfigService.maskValue(entry.getKey(), v.getAsString()));
+            } else {
+                out.add(entry.getKey(), v);
+            }
+        }
+        return out;
+    }
+
+    @ApiResponse(responseCode = "200", content = @Content(array = @ArraySchema(schema = @Schema(implementation = ChannelView.class))))
+    @Operation(summary = "List all stored channel configurations")
+    @AgentAccess(OPEN)
+    public static void list() {
+        List<ChannelConfig> configs = ChannelConfig.findAll();
+        var result = configs.stream().map(ChannelView::of).toList();
+        renderJSON(gson.toJson(result));
+    }
+
+    /** Dashboard summary of the channel kinds currently doing work. */
+    private record ActiveChannelsResponse(int count, Set<String> channelTypes) {}
+
+    /**
+     * GET /api/channels/active — channel kinds currently doing work,
+     * aggregated across the three sources of truth (web, telegram
+     * bindings, ChannelConfig). Dashboard-only consumer; the existing
+     * {@link #list()} endpoint stays as-is for the Channels admin page
+     * which legitimately wants the {@code ChannelConfig} rows directly.
+     *
+     * <p>Response: {@code {"count": N, "channelTypes": ["telegram", "web", ...]}}.
+     */
+    @ApiResponse(responseCode = "200", content = @Content(schema = @Schema(implementation = ActiveChannelsResponse.class)))
+    @Operation(summary = "Get the count and set of channel types currently doing work, aggregated across web, telegram, and ChannelConfig")
+    @AgentAccess(OPEN)
+    public static void active() {
+        var types = ChannelStatusService.activeChannelTypes();
+        renderJSON(gson.toJson(new ActiveChannelsResponse(types.size(), types)));
+    }
+
+    @SuppressWarnings("java:S2259")
+    @ApiResponse(responseCode = "200", content = @Content(schema = @Schema(implementation = ChannelView.class)))
+    @AgentAccess(value = OPERATOR_ONLY, reason = "channel config detail may include secrets")
+    public static void get(String channelType) {
+        var config = ChannelConfig.findByType(channelType);
+        if (config == null) notFound();
+        renderJSON(gson.toJson(ChannelView.of(config)));
+    }
+
+    @SuppressWarnings("java:S2259")
+    @ApiResponse(responseCode = "200", content = @Content(schema = @Schema(implementation = ChannelView.class)))
+    @RequestBody(required = true, content = @Content(schema = @Schema(implementation = ChannelConfig.class)))
+    @AgentAccess(value = OPERATOR_ONLY, reason = "writes channel config -- secrets / comms routing")
+    public static void save(String channelType) {
+        var body = JsonBodyReader.readJsonBody();
+        if (body == null) {
+            badRequest();
+            throw ApiResponses.unreachable();
+        }
+
+        // Evict cache before lookup so we get a managed (attached) entity for write
+        ChannelConfig.evictCache(channelType);
+        var config = ChannelConfig.findByType(channelType);
+        if (config == null) {
+            config = new ChannelConfig();
+            config.channelType = channelType;
+        }
+
+        if (body.has("config")) {
+            config.configJson = gson.toJson(body.getAsJsonObject("config"));
+        }
+        if (body.has("enabled")) {
+            config.enabled = body.get("enabled").getAsBoolean();
+        }
+        config.save();
+        ChannelConfig.evictCache(channelType); // evict again so next read sees the update
+
+        reconcileRunner(channelType);
+
+        EventLogger.info("channel", null, channelType, "Channel config updated");
+        renderJSON(gson.toJson(ChannelView.of(config)));
+    }
+
+    /**
+     * Start/stop the channel's polling runner to match the newly-saved config.
+     * Today only Telegram has a polling transport; extend here as other channels
+     * (Slack Socket Mode — JCLAW-83) land.
+     */
+    private static void reconcileRunner(String channelType) {
+        if ("telegram".equals(channelType)) {
+            TelegramPollingRunner.reconcile();
+        }
+    }
+
+}

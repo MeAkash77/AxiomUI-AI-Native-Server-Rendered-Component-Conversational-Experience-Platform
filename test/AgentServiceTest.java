@@ -1,0 +1,769 @@
+import models.Agent;
+import models.AgentBinding;
+import models.AgentToolConfig;
+import models.Conversation;
+import models.Message;
+import models.Task;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import play.test.Fixtures;
+import play.test.UnitTest;
+import services.AgentService;
+import services.ConfigService;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.Instant;
+
+/**
+ * Service-layer tests for {@link AgentService}: CRUD, lookup, sandboxed
+ * workspace path resolution, and the read/write helpers controllers and
+ * tools depend on.
+ *
+ * <p>These complement the FunctionalTest controller tests by exercising the
+ * service contract directly — invariants the HTTP layer can't easily assert
+ * (cascade-delete reach, three-layer path validation, file cache behavior)
+ * live here.
+ */
+class AgentServiceTest extends UnitTest {
+
+    @BeforeEach
+    void setup() {
+        Fixtures.deleteDatabase();
+        ConfigService.clearCache();
+    }
+
+    // =====================
+    // create()
+    // =====================
+
+    @Test
+    void createPersistsAgentWithProvidedFields() {
+        var agent = AgentService.create("svc-create-1", "openrouter", "gpt-4.1");
+        assertNotNull(agent.id, "id must be assigned by JPA");
+        assertEquals("svc-create-1", agent.name);
+        assertEquals("openrouter", agent.modelProvider);
+        assertEquals("gpt-4.1", agent.modelId);
+        assertNotNull(agent.createdAt);
+        assertNotNull(agent.updatedAt);
+    }
+
+    @Test
+    void createWithThinkingModeNullStoresNull() {
+        var agent = AgentService.create("svc-thinking-null", "openrouter", "gpt-4.1", null);
+        assertNull(agent.thinkingMode,
+                "explicit null thinkingMode must persist as null");
+    }
+
+    @Test
+    void createOverloadDefaultsThinkingModeToNull() {
+        var agent = AgentService.create("svc-thinking-default", "openrouter", "gpt-4.1");
+        assertNull(agent.thinkingMode,
+                "the 3-arg overload must delegate with null thinkingMode");
+    }
+
+    @Test
+    void createSeedsWorkspaceFilesWithoutOverwriting() {
+        var agent = AgentService.create("svc-workspace-seed", "openrouter", "gpt-4.1");
+        var dir = AgentService.workspacePath(agent.name);
+        assertTrue(Files.exists(dir.resolve("AGENT.md")));
+        assertTrue(Files.exists(dir.resolve("IDENTITY.md")));
+        assertTrue(Files.exists(dir.resolve("USER.md")));
+        assertTrue(Files.exists(dir.resolve("SOUL.md")));
+        assertTrue(Files.exists(dir.resolve("BOOTSTRAP.md")));
+        assertTrue(Files.exists(dir.resolve("skills")),
+                "createWorkspace must seed the skills/ subdirectory");
+    }
+
+    @Test
+    void createWithCreateWorkspaceFalseDoesNotMaterializeDirectory() {
+        // The 6-arg overload's createWorkspace=false branch is the seam
+        // SubagentSpawnTool uses to skip the SOUL/IDENTITY/etc. skeleton
+        // for spawned subagents. Verify that no on-disk artefacts land
+        // for that path even though the Agent row itself persists.
+        var agent = AgentService.create("svc-no-workspace", "openrouter", "gpt-4.1",
+                null, null, /* createWorkspace */ false);
+        assertNotNull(agent.id, "Agent row must still persist when workspace is skipped");
+        // The workspace root path resolves regardless (workspaceRoot() is
+        // an idempotent createDirectories on the data/agents/ root), but
+        // the agent's per-name directory must NOT exist.
+        var literalDir = AgentService.workspaceRoot().resolve("svc-no-workspace");
+        assertFalse(Files.exists(literalDir),
+                "createWorkspace=false must skip the on-disk directory; got " + literalDir);
+    }
+
+    @Test
+    void workspacePathForChildAgentResolvesToParentDirectory() {
+        // A subagent inherits the parent's on-disk workspace transparently:
+        // workspacePath(child.name) walks the parentAgent chain and returns
+        // the root parent's path. This is how tools that already pass
+        // agent.name to AgentService keep working after JCLAW-265 spawn —
+        // no per-tool routing required.
+        var parent = AgentService.create("svc-parent-of-child", "openrouter", "gpt-4.1");
+        var child = AgentService.create("svc-child-1", "openrouter", "gpt-4.1",
+                null, null, /* createWorkspace */ false);
+        child.parentAgent = parent;
+        child.save();
+
+        var parentPath = AgentService.workspacePath(parent.name);
+        var childPath = AgentService.workspacePath(child.name);
+        assertEquals(parentPath, childPath,
+                "subagent workspacePath must resolve to the parent's directory");
+        // The child must NOT have a folder of its own.
+        var literalChildDir = AgentService.workspaceRoot().resolve(child.name);
+        assertFalse(Files.exists(literalChildDir),
+                "subagent must have no on-disk workspace directory");
+    }
+
+    @Test
+    void workspacePathWalksMultiHopParentChainToRoot() {
+        // Defence in depth: the depthLimit=1 cap in SubagentSpawnTool
+        // prevents grandchildren in practice, but the walk must handle
+        // the case anyway — a future change to the limit shouldn't
+        // require touching workspacePath.
+        var root = AgentService.create("svc-root", "openrouter", "gpt-4.1");
+        var mid = AgentService.create("svc-mid", "openrouter", "gpt-4.1",
+                null, null, false);
+        mid.parentAgent = root;
+        mid.save();
+        var leaf = AgentService.create("svc-leaf", "openrouter", "gpt-4.1",
+                null, null, false);
+        leaf.parentAgent = mid;
+        leaf.save();
+
+        assertEquals(AgentService.workspacePath("svc-root"),
+                AgentService.workspacePath("svc-leaf"),
+                "two-hop chain leaf must resolve to root");
+    }
+
+    @Test
+    void workspacePathForUnknownNamePreservesPassThroughBehavior() {
+        // Pre-2026-05 callers that resolved workspace paths before an
+        // Agent row had been committed (admin tooling, certain test
+        // fixtures) relied on workspacePath(name) returning the literal
+        // directory under data/agents/<name>. Unknown names must keep
+        // that contract so the change is backward-compat.
+        var path = AgentService.workspacePath("svc-never-existed");
+        assertTrue(path.endsWith("svc-never-existed"),
+                "unknown name must resolve to its own literal directory: " + path);
+    }
+
+    @Test
+    void createDisablesBrowserToolForNonMainAgent() {
+        var agent = AgentService.create("svc-browser-non-main", "openrouter", "gpt-4.1");
+        AgentToolConfig browser = AgentToolConfig.find("agent.id = ?1 AND toolName = ?2",
+                agent.id, "browser").first();
+        assertNotNull(browser, "non-main agents must get a browser AgentToolConfig row");
+        assertFalse(browser.enabled,
+                "browser tool must be disabled by default for non-main agents (security)");
+    }
+
+    @Test
+    void createDoesNotAutoDisableBrowserForMainAgent() {
+        // Main agent must NOT receive the auto-disable row — it owns the
+        // browser session lifecycle for support workflows.
+        var main = new Agent();
+        main.name = Agent.MAIN_AGENT_NAME;
+        main.modelProvider = "openrouter";
+        main.modelId = "gpt-4.1";
+        main.enabled = true;
+        main.save();
+        AgentService.createWorkspace(Agent.MAIN_AGENT_NAME);
+
+        AgentToolConfig browser = AgentToolConfig.find("agent.id = ?1 AND toolName = ?2",
+                main.id, "browser").first();
+        assertNull(browser, "main agent should not receive a default-off browser row");
+    }
+
+    @Test
+    void createSetsMainAgentEnabledTrueRegardlessOfProviderState() {
+        // Main is a structural singleton that must always be enabled — even
+        // if its model isn't currently in any registered provider's catalog.
+        var main = new Agent();
+        main.name = Agent.MAIN_AGENT_NAME;
+        main.modelProvider = "nonexistent-provider";
+        main.modelId = "made-up-model";
+        // Use the create overload via direct save path since AgentService
+        // refuses the "main" name through its standard create flow.
+        main.enabled = main.isMain() || AgentService.isProviderConfigured("nonexistent-provider", "made-up-model");
+        main.save();
+        assertTrue(main.enabled,
+                "main agent must compute enabled=true even with no provider configured");
+    }
+
+    // =====================
+    // update()
+    // =====================
+
+@Test
+    void updateForcesMainAgentEnabledTrueRegardlessOfArgument() {
+        var main = new Agent();
+        main.name = Agent.MAIN_AGENT_NAME;
+        main.modelProvider = "openrouter";
+        main.modelId = "gpt-4.1";
+        main.enabled = true;
+        main.save();
+        AgentService.createWorkspace(Agent.MAIN_AGENT_NAME);
+
+        // Caller asks to disable; service-level invariant must override.
+        var updated = AgentService.update(main, main.name, main.modelProvider,
+                main.modelId, false, null, null);
+        assertTrue(updated.enabled,
+                "main agent must remain enabled even when the caller passes enabled=false");
+    }
+
+    // =====================
+    // findById / findByName / listAll / listEnabled
+    // =====================
+
+    @Test
+    void findByIdReturnsAgentOrNull() {
+        var agent = AgentService.create("svc-find-id", "openrouter", "gpt-4.1");
+        assertNotNull(AgentService.findById(agent.id));
+        assertNull(AgentService.findById(99_999_999L));
+    }
+
+    @Test
+    void findByNameReturnsAgentOrNull() {
+        AgentService.create("svc-find-name", "openrouter", "gpt-4.1");
+        assertNotNull(AgentService.findByName("svc-find-name"));
+        assertNull(AgentService.findByName("nonexistent-agent-xyz"));
+    }
+
+    @Test
+    void listAllReturnsEveryAgent() {
+        AgentService.create("svc-list-1", "openrouter", "gpt-4.1");
+        AgentService.create("svc-list-2", "openrouter", "gpt-4.1");
+        var all = AgentService.listAll();
+        assertEquals(2, all.size());
+    }
+
+    @Test
+    void listEnabledFiltersOutDisabledAgents() {
+        var a = AgentService.create("svc-enabled-true", "openrouter", "gpt-4.1");
+        a.enabled = true;
+        a.save();
+        var b = AgentService.create("svc-enabled-false", "openrouter", "gpt-4.1");
+        b.enabled = false;
+        b.save();
+
+        var enabled = AgentService.listEnabled();
+        assertEquals(1, enabled.size());
+        assertEquals("svc-enabled-true", enabled.getFirst().name);
+    }
+
+    // =====================
+    // delete() — cascades + workspace cleanup
+    // =====================
+
+    @Test
+    void deleteCascadesThroughChildRowsAndRemovesWorkspace() {
+        var agent = AgentService.create("svc-delete-cascade", "openrouter", "gpt-4.1");
+        var agentId = agent.id;
+        var agentName = agent.name;
+
+        // Stage child rows the same way a real conversation would.
+        var convo = new Conversation();
+        convo.agent = agent;
+        convo.channelType = "web";
+        convo.peerId = "delete-test-peer";
+        convo.save();
+
+        var msg = new Message();
+        msg.conversation = convo;
+        msg.role = "user";
+        msg.content = "hi";
+        msg.save();
+
+        var binding = new AgentBinding();
+        binding.agent = agent;
+        binding.channelType = "telegram";
+        binding.peerId = "delete-test-peer";
+        binding.save();
+
+        var task = new Task();
+        task.agent = agent;
+        task.name = "delete-cascade-task";
+        task.type = Task.Type.IMMEDIATE;
+        task.status = Task.Status.PENDING;
+        task.scheduledAt = Instant.now();
+        task.save();
+
+        // Verify pre-conditions.
+        assertTrue(Conversation.count("agent.id = ?1", agentId) > 0);
+        assertTrue(Message.count("conversation.id = ?1", convo.id) > 0);
+        assertTrue(AgentBinding.count("agent.id = ?1", agentId) > 0);
+        assertTrue(Task.count("agent.id = ?1", agentId) > 0);
+        // The auto-disabled browser row from create() also exists.
+        assertTrue(AgentToolConfig.count("agent.id = ?1", agentId) > 0);
+
+        var workspaceDir = AgentService.workspacePath(agentName);
+        assertTrue(Files.exists(workspaceDir),
+                "workspace dir must exist before delete");
+
+        AgentService.delete(agent);
+
+        // Every child row must be gone.
+        assertEquals(0L, Conversation.count("agent.id = ?1", agentId),
+                "conversations must cascade");
+        assertEquals(0L, Message.count("conversation.id = ?1", convo.id),
+                "messages must cascade");
+        assertEquals(0L, AgentBinding.count("agent.id = ?1", agentId),
+                "bindings must cascade");
+        assertEquals(0L, Task.count("agent.id = ?1", agentId),
+                "tasks must cascade");
+        assertEquals(0L, AgentToolConfig.count("agent.id = ?1", agentId),
+                "agent tool configs must cascade");
+        assertEquals(0L, Agent.count("id = ?1", agentId),
+                "agent row itself must be deleted");
+        assertFalse(Files.exists(workspaceDir),
+                "workspace dir must be removed after delete");
+    }
+
+    @Test
+    void deleteRemovesRemainingAgentScopedFkRows() {
+        // Repro for the H2 23503 referential-integrity violation seen when
+        // deleting a subagent run whose agent carried a ToolApprovalGrant:
+        // agent.delete() failed on the grant's agent_id FK because grants —
+        // and Notification / Telegram bindings — weren't cleared first.
+        var agent = AgentService.create("svc-delete-fk-rows", "openrouter", "gpt-4.1");
+        var agentId = agent.id;
+
+        var grant = new models.ToolApprovalGrant();
+        grant.agent = agent;
+        grant.toolName = "shell";
+        grant.save();
+
+        var note = new models.Notification();
+        note.agent = agent;
+        note.content = "test notification";
+        note.save();
+
+        // A TelegramBinding plus a TelegramTopicBinding that FKs it — exercises
+        // the delete ordering (the topic binding must go before its binding).
+        var tb = new models.TelegramBinding();
+        tb.agent = agent;
+        tb.botToken = "delete-fk-test-token";
+        tb.telegramUserId = "12345";
+        tb.save();
+
+        var topic = new models.TelegramTopicBinding();
+        topic.agent = agent;
+        topic.binding = tb;
+        topic.chatId = "chat-1";
+        topic.threadId = 7;
+        topic.save();
+
+        assertTrue(models.ToolApprovalGrant.count("agent.id = ?1", agentId) > 0);
+        assertTrue(models.Notification.count("agent.id = ?1", agentId) > 0);
+        assertTrue(models.TelegramBinding.count("agent.id = ?1", agentId) > 0);
+        assertTrue(models.TelegramTopicBinding.count("agent.id = ?1", agentId) > 0);
+
+        // Previously threw ConstraintViolationException on TOOL_APPROVAL_GRANT.
+        AgentService.delete(agent);
+
+        assertEquals(0L, models.ToolApprovalGrant.count("agent.id = ?1", agentId),
+                "tool-approval grants must cascade");
+        assertEquals(0L, models.Notification.count("agent.id = ?1", agentId),
+                "notifications must cascade");
+        assertEquals(0L, models.TelegramBinding.count("agent.id = ?1", agentId),
+                "telegram bindings must cascade");
+        assertEquals(0L, models.TelegramTopicBinding.count("agent.id = ?1", agentId),
+                "telegram topic bindings must cascade");
+        assertEquals(0L, Agent.count("id = ?1", agentId), "agent row must be deleted");
+    }
+
+    @Test
+    void deleteCascadesToSubagentDescendants() {
+        // Repro for the H2 23503 referential-integrity violation observed
+        // when deleting a parent that has spawned sub-agents — the Agent
+        // self-FK (parent_agent_id) blocks the parent's delete unless the
+        // descendants are removed first. AgentService.delete must walk the
+        // tree depth-first and clean up every descendant's own data along
+        // the way (not just the Agent row).
+        var parent = AgentService.create("svc-delete-cascade-parent", "openrouter", "gpt-4.1");
+        var child = AgentService.create("svc-delete-cascade-child", "openrouter", "gpt-4.1");
+        child.parentAgent = parent;
+        child.save();
+        var grandchild = AgentService.create("svc-delete-cascade-grand", "openrouter", "gpt-4.1");
+        grandchild.parentAgent = child;
+        grandchild.save();
+
+        // Give the grandchild its own conversation so we can confirm the
+        // recursive sweep cleans descendant data, not just the Agent row.
+        var grandchildConvo = services.ConversationService.create(grandchild, "web", "u-cascade");
+        var grandchildConvoId = grandchildConvo.id;
+
+        var parentId = parent.id;
+        var childId = child.id;
+        var grandchildId = grandchild.id;
+
+        // Pre-condition: chain is wired.
+        assertEquals(parentId,
+                ((Agent) Agent.findById(childId)).parentAgent.id,
+                "child's parentAgent must point to parent before delete");
+        assertEquals(childId,
+                ((Agent) Agent.findById(grandchildId)).parentAgent.id,
+                "grandchild's parentAgent must point to child before delete");
+        assertTrue(Conversation.count("id = ?1", grandchildConvoId) > 0,
+                "grandchild conversation must exist before delete");
+
+        // The delete that previously threw ConstraintViolationException.
+        AgentService.delete(parent);
+
+        // Every agent in the tree must be gone.
+        assertNull(Agent.findById(parentId),
+                "parent Agent row must be deleted");
+        assertNull(Agent.findById(childId),
+                "child Agent row must be cascaded");
+        assertNull(Agent.findById(grandchildId),
+                "grandchild Agent row must be cascaded (depth-first walk)");
+        // Descendant's own data must be cleaned up too — proves the recursive
+        // call hits the full delete() body, not just an Agent row drop.
+        assertEquals(0L, Conversation.count("id = ?1", grandchildConvoId),
+                "descendant's conversations must cascade as part of recursive delete");
+    }
+
+    @Test
+    void deletePurgesAgentScopedConfigKeysAndCache() {
+        var agent = AgentService.create("svc-delete-config", "openrouter", "gpt-4.1");
+        ConfigService.set("agent.svc-delete-config.shell.bypassAllowlist", "false");
+        // Sanity: the row landed.
+        assertEquals("false", ConfigService.get("agent.svc-delete-config.shell.bypassAllowlist"));
+
+        AgentService.delete(agent);
+
+        assertNull(ConfigService.get("agent.svc-delete-config.shell.bypassAllowlist"),
+                "agent.{name}.* keys must be removed and the cache invalidated");
+    }
+
+    // =====================
+    // isProviderConfigured()
+    // =====================
+
+    @Test
+    void isProviderConfiguredFalseWhenProviderUnknown() {
+        assertFalse(AgentService.isProviderConfigured("nonexistent-provider", "anything"));
+    }
+
+    // =====================
+    // Workspace path resolution — defense-in-depth
+    // =====================
+
+    @Test
+    void workspacePathReturnsCanonicalPathForValidName() {
+        var path = AgentService.workspacePath("svc-path-valid");
+        assertNotNull(path);
+        assertTrue(path.toString().endsWith("svc-path-valid"),
+                "resolved path must end with the agent name: " + path);
+    }
+
+    @Test
+    void workspacePathThrowsOnTraversalShapedName() {
+        var ex = assertThrows(SecurityException.class,
+                () -> AgentService.workspacePath("../escape-attempt"));
+        assertTrue(ex.getMessage().toLowerCase().contains("workspace"),
+                "exception must reference the workspace boundary: " + ex.getMessage());
+    }
+
+    @Test
+    void resolveContainedReturnsNullForDotDotEscape() {
+        var root = AgentService.workspaceRoot().toAbsolutePath();
+        assertNull(AgentService.resolveContained(root, "../../../etc/passwd"),
+                "resolveContained must return null on lexical escape");
+    }
+
+    @Test
+    void resolveContainedReturnsPathForLegalRelative() {
+        var root = AgentService.workspaceRoot().toAbsolutePath();
+        var resolved = AgentService.resolveContained(root, "svc-path-legal/AGENT.md");
+        assertNotNull(resolved);
+        assertTrue(resolved.toString().endsWith("AGENT.md"));
+    }
+
+    @Test
+    void acquireContainedThrowsOnDotDotEscape() {
+        var root = AgentService.workspaceRoot().toAbsolutePath();
+        assertThrows(SecurityException.class,
+                () -> AgentService.acquireContained(root, "../../../etc/passwd"));
+    }
+
+    @Test
+    void acquireWorkspacePathThrowsOnTraversal() {
+        AgentService.create("svc-acquire-traversal", "openrouter", "gpt-4.1");
+        assertThrows(SecurityException.class,
+                () -> AgentService.acquireWorkspacePath("svc-acquire-traversal", "../../etc/passwd"));
+    }
+
+    @Test
+    void resolveWorkspacePathReturnsNullOnTraversal() {
+        AgentService.create("svc-resolve-traversal", "openrouter", "gpt-4.1");
+        assertNull(AgentService.resolveWorkspacePath("svc-resolve-traversal", "../../../etc/passwd"));
+    }
+
+    // =====================
+    // readWorkspaceFile / writeWorkspaceFile
+    // =====================
+
+    @Test
+    void readWorkspaceFileReturnsSeededContent() {
+        AgentService.create("svc-read-seeded", "openrouter", "gpt-4.1");
+        var content = AgentService.readWorkspaceFile("svc-read-seeded", "AGENT.md");
+        assertNotNull(content);
+        assertTrue(content.contains("Agent Instructions") || content.contains("helpful AI assistant"),
+                "AGENT.md template content should be readable: " + content);
+    }
+
+    @Test
+    void readWorkspaceFileReturnsNullForMissingFile() {
+        AgentService.create("svc-read-missing", "openrouter", "gpt-4.1");
+        assertNull(AgentService.readWorkspaceFile("svc-read-missing", "does-not-exist.md"));
+    }
+
+    @Test
+    void readWorkspaceFileReturnsNullForTraversal() {
+        AgentService.create("svc-read-traversal", "openrouter", "gpt-4.1");
+        // The catch in readWorkspaceFile swallows SecurityException and returns null.
+        assertNull(AgentService.readWorkspaceFile("svc-read-traversal", "../../../etc/passwd"));
+    }
+
+    @Test
+    void writeWorkspaceFileRoundTripsAndInvalidatesCache() {
+        AgentService.create("svc-write-roundtrip", "openrouter", "gpt-4.1");
+
+        // Prime the cache with a read.
+        var seeded = AgentService.readWorkspaceFile("svc-write-roundtrip", "AGENT.md");
+        assertNotNull(seeded);
+
+        // Overwrite via the write helper.
+        AgentService.writeWorkspaceFile("svc-write-roundtrip", "AGENT.md",
+                "# replaced by test\n");
+
+        // Cache must have been evicted — the next read must surface the new
+        // content rather than the prior cached value.
+        var fresh = AgentService.readWorkspaceFile("svc-write-roundtrip", "AGENT.md");
+        assertEquals("# replaced by test\n", fresh,
+                "writeWorkspaceFile must invalidate the file cache");
+    }
+
+    @Test
+    void writeWorkspaceFileCreatesMissingParentDirectories() {
+        AgentService.create("svc-write-nested", "openrouter", "gpt-4.1");
+        AgentService.writeWorkspaceFile("svc-write-nested", "deep/nested/file.txt",
+                "nested-content");
+        var read = AgentService.readWorkspaceFile("svc-write-nested", "deep/nested/file.txt");
+        assertEquals("nested-content", read,
+                "writer must mkdir -p the parent and write the file");
+    }
+
+    // =====================
+    // createWorkspace vs resetWorkspace
+    // =====================
+
+    @Test
+    void createWorkspaceDoesNotOverwriteExistingFiles() {
+        var dir = AgentService.workspacePath("svc-create-no-overwrite");
+        // First create — seeds a default AGENT.md.
+        AgentService.createWorkspace("svc-create-no-overwrite");
+
+        // Mutate AGENT.md, then call createWorkspace again — the mutation
+        // must survive (overwrite=false in createWorkspace).
+        var agentMd = dir.resolve("AGENT.md");
+        try {
+            Files.writeString(agentMd, "# user-edited content\n");
+        } catch (Exception e) {
+            fail("setup write failed: " + e.getMessage());
+        }
+        AgentService.createWorkspace("svc-create-no-overwrite");
+        try {
+            assertEquals("# user-edited content\n", Files.readString(agentMd),
+                    "createWorkspace must NOT clobber existing files");
+        } catch (Exception e) {
+            fail("verification read failed: " + e.getMessage());
+        }
+    }
+
+    @Test
+    void resetWorkspaceOverwritesExistingFiles() {
+        var dir = AgentService.workspacePath("svc-reset-overwrite");
+        AgentService.createWorkspace("svc-reset-overwrite");
+
+        var agentMd = dir.resolve("AGENT.md");
+        try {
+            Files.writeString(agentMd, "# user-edited content\n");
+        } catch (Exception e) {
+            fail("setup write failed: " + e.getMessage());
+        }
+
+        AgentService.resetWorkspace("svc-reset-overwrite");
+        try {
+            var after = Files.readString(agentMd);
+            assertNotEquals("# user-edited content\n", after,
+                    "resetWorkspace must clobber existing files");
+            assertTrue(after.contains("Agent Instructions") || after.contains("helpful AI assistant"),
+                    "resetWorkspace must restore the template: " + after);
+        } catch (Exception e) {
+            fail("verification read failed: " + e.getMessage());
+        }
+    }
+
+    // =====================
+    // Test-only cleanup so workspace dirs don't leak across runs.
+    // =====================
+
+    @AfterAll
+    static void cleanupWorkspaceDirs() {
+        // Test agents are namespaced "svc-*". Sweep them so a flaky run
+        // doesn't accumulate state on disk between sessions.
+        var root = AgentService.workspaceRoot();
+        if (!Files.exists(root)) return;
+        try (var stream = Files.list(root)) {
+            stream.filter(p -> {
+                var name = p.getFileName().toString();
+                return name.startsWith("svc-");
+            }).forEach(AgentServiceTest::deleteRecursively);
+        } catch (Exception _) {
+            // best-effort cleanup; never fail the suite on this
+        }
+    }
+
+    private static void deleteRecursively(Path p) {
+        if (!Files.exists(p)) return;
+        try (var walk = Files.walk(p)) {
+            walk.sorted(java.util.Comparator.reverseOrder()).forEach(child -> {
+                try { Files.delete(child); } catch (Exception _) { /* best-effort */ }
+            });
+        } catch (Exception _) {
+            // best-effort cleanup
+        }
+    }
+
+    // --- writeWorkspaceFile branch coverage ---
+
+    @Test
+    void writeWorkspaceFileWritesContentToTargetPath() throws Exception {
+        AgentService.create("svc-write-ok", "openrouter", "gpt-4.1");
+        AgentService.writeWorkspaceFile("svc-write-ok", "notes.txt", "hello");
+        var written = AgentService.workspacePath("svc-write-ok").resolve("notes.txt");
+        assertTrue(Files.exists(written));
+        assertEquals("hello", Files.readString(written));
+    }
+
+    @Test
+    void writeWorkspaceFileBlocksTraversalSilently() {
+        AgentService.create("svc-write-trav", "openrouter", "gpt-4.1");
+        // The SecurityException catch logs a warn and returns without
+        // writing. We verify no file lands outside the workspace.
+        AgentService.writeWorkspaceFile("svc-write-trav", "../escaped.txt", "content");
+        var ws = AgentService.workspacePath("svc-write-trav");
+        // The legitimate workspace dir gets created lazily, but no escaped.txt
+        // should exist at its parent.
+        var escapeTarget = ws.getParent().resolve("escaped.txt");
+        assertFalse(Files.exists(escapeTarget),
+                "escape attempt must not produce a file at: " + escapeTarget);
+    }
+
+    // --- syncEnabledStates branch coverage ---
+
+    @Test
+    void syncEnabledStatesIsNoopWhenAgentsAlreadyMatch() {
+        // No agents that need flipping → the early-return short-circuit path.
+        // No assertions on side effects; we just want the no-change branch
+        // hit cleanly.
+        assertDoesNotThrow(AgentService::syncEnabledStates);
+    }
+
+    @Test
+    void syncEnabledStatesReEnablesMainAgent() {
+        // Main agent must stay enabled. Construct one in a disabled state
+        // and verify sync flips it back.
+        var main = services.Tx.run(() -> {
+            Agent a = new Agent();
+            a.name = models.Agent.MAIN_AGENT_NAME;
+            a.modelProvider = "openrouter";
+            a.modelId = "gpt-4.1";
+            a.enabled = false;
+            a.save();
+            return a;
+        });
+        AgentService.syncEnabledStates();
+        Agent reread = services.Tx.run(() -> (Agent) Agent.findById(main.id));
+        assertTrue(reread.enabled, "main agent must be auto-enabled by sync");
+    }
+
+    @Test
+    void syncEnabledStatesDisablesNonMainWithoutConfiguredProvider() {
+        // A non-main agent whose modelProvider isn't registered in
+        // ProviderRegistry (the test JVM has none seeded) must be flipped to
+        // disabled by the sync.
+        var agent = AgentService.create("svc-sync-disable",
+                "definitely-no-provider", "any-model");
+        // Force enabled true to set up the divergence.
+        services.Tx.run(() -> {
+            Agent a = (Agent) Agent.findById(agent.id);
+            a.enabled = true;
+            a.save();
+            return null;
+        });
+        AgentService.syncEnabledStates();
+        Agent reread = services.Tx.run(() -> (Agent) Agent.findById(agent.id));
+        assertFalse(reread.enabled,
+                "agent with unregistered provider must be flipped to disabled");
+    }
+
+    @Test
+    void syncEnabledStatesEnablesNonMainWithConfiguredProvider() {
+        // Pins the "provider:modelId" key format the enable path's bulk lookup relies on.
+        services.ConfigService.set("provider.openrouter.baseUrl", "https://openrouter.ai/api/v1");
+        services.ConfigService.set("provider.openrouter.apiKey", "sk-test");
+        services.ConfigService.set("provider.openrouter.models",
+                "[{\"id\":\"sync-enable-model\",\"name\":\"X\",\"contextWindow\":1000,\"maxTokens\":100}]");
+        llm.ProviderRegistry.refresh();
+
+        var agent = AgentService.create("svc-sync-enable", "openrouter", "sync-enable-model");
+        // create() already enabled it — force disabled to set up the divergence.
+        services.Tx.run(() -> {
+            Agent a = (Agent) Agent.findById(agent.id);
+            a.enabled = false;
+            a.save();
+            return null;
+        });
+
+        AgentService.syncEnabledStates();
+        Agent reread = services.Tx.run(() -> (Agent) Agent.findById(agent.id));
+        assertTrue(reread.enabled,
+                "agent whose provider+model is configured must be flipped to enabled");
+    }
+
+    // --- supportsVision branch coverage ---
+
+    @Test
+    void supportsVisionReturnsFalseForNullAgent() {
+        // hasModelCapability's first guard — null agent → false.
+        assertFalse(AgentService.supportsVision(null));
+    }
+
+    @Test
+    void supportsVisionReturnsFalseWhenProviderNotConfigured() {
+        // Test JVM has no providers configured by default; supportsVision
+        // must return false rather than throw NPE on the registry lookup.
+        var agent = AgentService.create("svc-no-provider",
+                "definitely-not-a-registered-provider", "any-model");
+        assertFalse(AgentService.supportsVision(agent));
+    }
+
+    @Test
+    void supportsVisionReturnsFalseWhenModelNotInProviderList() {
+        // Seed openrouter with a model that does NOT include the agent's
+        // model id → findFirst().isEmpty → orElse(false).
+        services.ConfigService.set("provider.openrouter.baseUrl", "https://openrouter.ai/api/v1");
+        services.ConfigService.set("provider.openrouter.apiKey", "sk-test");
+        services.ConfigService.set("provider.openrouter.models",
+                "[{\"id\":\"some-other-model\",\"name\":\"X\",\"contextWindow\":1000,\"maxTokens\":100}]");
+        llm.ProviderRegistry.refresh();
+
+        var agent = AgentService.create("svc-no-match", "openrouter", "missing-model-id");
+        assertFalse(AgentService.supportsVision(agent));
+    }
+}

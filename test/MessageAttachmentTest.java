@@ -1,0 +1,232 @@
+import models.Agent;
+import models.Conversation;
+import models.Message;
+import models.MessageAttachment;
+import models.MessageRole;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import play.test.Fixtures;
+import play.test.UnitTest;
+
+import java.util.UUID;
+
+class MessageAttachmentTest extends UnitTest {
+
+    private Agent agent;
+    private Conversation conversation;
+    private Message message;
+
+    @BeforeEach
+    void setUp() {
+        Fixtures.deleteDatabase();
+        agent = new Agent();
+        agent.name = "vision-agent";
+        agent.modelProvider = "openrouter";
+        agent.modelId = "openai/gpt-4o";
+        agent.save();
+
+        conversation = new Conversation();
+        conversation.agent = agent;
+        conversation.channelType = "web";
+        conversation.peerId = "tester";
+        conversation.save();
+
+        message = new Message();
+        message.conversation = conversation;
+        message.role = MessageRole.USER.value;
+        message.content = "what is in this image?";
+        message.save();
+    }
+
+    @Test
+    void persistsImageAttachment() {
+        var uuid = UUID.randomUUID().toString();
+        var att = new MessageAttachment();
+        att.message = message;
+        att.uuid = uuid;
+        att.originalFilename = "screenshot.png";
+        att.storagePath = "vision-agent/attachments/" + conversation.id + "/" + uuid + ".png";
+        att.mimeType = "image/png";
+        att.sizeBytes = 12345L;
+        att.kind = MessageAttachment.KIND_IMAGE;
+        att.save();
+
+        assertNotNull(att.id);
+        assertNotNull(att.createdAt);
+
+        var found = MessageAttachment.findByUuid(uuid);
+        assertNotNull(found);
+        assertEquals("screenshot.png", found.originalFilename);
+        assertEquals("image/png", found.mimeType);
+        assertEquals(MessageAttachment.KIND_IMAGE, found.kind);
+        assertEquals(message.id, found.message.id);
+    }
+
+    @Test
+    void findByMessageReturnsInsertionOrder() {
+        var first = persist("a.png", MessageAttachment.KIND_IMAGE);
+        var second = persist("b.pdf", MessageAttachment.KIND_FILE);
+        var third = persist("c.jpg", MessageAttachment.KIND_IMAGE);
+
+        var all = MessageAttachment.findByMessage(message);
+        assertEquals(3, all.size());
+        assertEquals(first.id, all.get(0).id);
+        assertEquals(second.id, all.get(1).id);
+        assertEquals(third.id, all.get(2).id);
+    }
+
+    @Test
+    void uuidIsUnique() {
+        var uuid = UUID.randomUUID().toString();
+        var first = new MessageAttachment();
+        first.message = message;
+        first.uuid = uuid;
+        first.originalFilename = "a.png";
+        first.storagePath = "path/a";
+        first.mimeType = "image/png";
+        first.sizeBytes = 1L;
+        first.kind = MessageAttachment.KIND_IMAGE;
+        first.save();
+
+        var clash = new MessageAttachment();
+        clash.message = message;
+        clash.uuid = uuid;
+        clash.originalFilename = "b.png";
+        clash.storagePath = "path/b";
+        clash.mimeType = "image/png";
+        clash.sizeBytes = 2L;
+        clash.kind = MessageAttachment.KIND_IMAGE;
+        assertThrows(Exception.class, () -> {
+            clash.save();
+            clash.em().flush();
+        });
+    }
+
+    @Test
+    void transcriptIsNullByDefault() {
+        var att = persistAudio(null);
+        att.em().flush();
+        att.em().clear();
+
+        var found = MessageAttachment.findByUuid(att.uuid);
+        assertNotNull(found);
+        assertNull(found.transcript);
+    }
+
+    @Test
+    void persistsAudioAttachmentWithTranscript() {
+        var transcript = "Hello, this is a voice note recorded on Telegram. "
+                + "Whisper produced this transcript at 16 kHz mono PCM. "
+                + "End of message.";
+        var att = persistAudio(transcript);
+        att.em().flush();
+        att.em().clear();
+
+        var found = MessageAttachment.findByUuid(att.uuid);
+        assertNotNull(found);
+        assertEquals(MessageAttachment.KIND_AUDIO, found.kind);
+        assertEquals(transcript, found.transcript);
+    }
+
+    @Test
+    void captionIsNullByDefault() {
+        var att = persist("photo.png", MessageAttachment.KIND_IMAGE);
+        att.em().flush();
+        att.em().clear();
+
+        var found = MessageAttachment.findByUuid(att.uuid);
+        assertNotNull(found);
+        assertNull(found.caption, "JCLAW-211: caption is null until the captioner writes it");
+    }
+
+    @Test
+    void persistsAndReadsImageCaption() {
+        var att = persist("photo.png", MessageAttachment.KIND_IMAGE);
+        att.caption = "a dog standing next to a red bicycle";
+        att.save();
+        att.em().flush();
+        att.em().clear();
+
+        var found = MessageAttachment.findByUuid(att.uuid);
+        assertNotNull(found);
+        assertEquals("a dog standing next to a red bicycle", found.caption);
+        // caption and transcript are independent columns (a video could carry both).
+        assertNull(found.transcript);
+    }
+
+    @Test
+    void videoSummaryIsNullByDefault() {
+        var att = persist("clip.mp4", MessageAttachment.KIND_VIDEO);
+        att.em().flush();
+        att.em().clear();
+
+        var found = MessageAttachment.findByUuid(att.uuid);
+        assertNotNull(found);
+        assertNull(found.videoSummary, "JCLAW-218: videoSummary is null until the Tier-3 fallback writes it");
+    }
+
+    @Test
+    void persistsAndReadsVideoSummary() {
+        var att = persist("clip.mp4", MessageAttachment.KIND_VIDEO);
+        att.videoSummary = "[00:00:00] a person opens a door\n[00:00:05] they walk into a kitchen";
+        att.save();
+        att.em().flush();
+        att.em().clear();
+
+        var found = MessageAttachment.findByUuid(att.uuid);
+        assertNotNull(found);
+        assertEquals("[00:00:00] a person opens a door\n[00:00:05] they walk into a kitchen", found.videoSummary);
+        // videoSummary is independent of caption and transcript (a video could carry all three).
+        assertNull(found.caption);
+        assertNull(found.transcript);
+    }
+
+    @Test
+    void findLatestUploadedImagePicksNewestNonGeneratedImage() {
+        // JCLAW-694: resolves the reference image for generate_image's image-to-image path.
+        var oldImg = persist("old.png", MessageAttachment.KIND_IMAGE);
+        persist("doc.pdf", MessageAttachment.KIND_FILE);       // non-image excluded
+        var generated = persist("gen.png", MessageAttachment.KIND_IMAGE);
+        generated.generated = true;                            // a prior generation must not feed back
+        generated.save();
+        var newest = persist("new.png", MessageAttachment.KIND_IMAGE);
+
+        var found = MessageAttachment.findLatestUploadedImage(conversation.id);
+        assertNotNull(found);
+        assertEquals(newest.id, found.id, "newest uploaded image wins");
+        assertNotEquals(generated.id, found.id, "generated images are excluded");
+        assertNotEquals(oldImg.id, found.id, "older upload loses to the newest");
+
+        assertNull(MessageAttachment.findLatestUploadedImage(null), "null conversation → null");
+        assertNull(MessageAttachment.findLatestUploadedImage(999_999L), "conversation with no attachments → null");
+    }
+
+    private MessageAttachment persistAudio(String transcript) {
+        var uuid = UUID.randomUUID().toString();
+        var att = new MessageAttachment();
+        att.message = message;
+        att.uuid = uuid;
+        att.originalFilename = "voice-note.ogg";
+        att.storagePath = "vision-agent/attachments/" + conversation.id + "/" + uuid + ".ogg";
+        att.mimeType = "audio/ogg";
+        att.sizeBytes = 9876L;
+        att.kind = MessageAttachment.KIND_AUDIO;
+        att.transcript = transcript;
+        att.save();
+        return att;
+    }
+
+    private MessageAttachment persist(String filename, String kind) {
+        var uuid = UUID.randomUUID().toString();
+        var att = new MessageAttachment();
+        att.message = message;
+        att.uuid = uuid;
+        att.originalFilename = filename;
+        att.storagePath = "vision-agent/attachments/" + conversation.id + "/" + uuid;
+        att.mimeType = kind.equals(MessageAttachment.KIND_IMAGE) ? "image/png" : "application/pdf";
+        att.sizeBytes = 100L;
+        att.kind = kind;
+        att.save();
+        return att;
+    }
+}

@@ -1,0 +1,143 @@
+package agents;
+
+import com.google.gson.JsonObject;
+import llm.LlmProvider;
+import llm.LlmTypes.ModelInfo;
+import llm.ProviderRegistry;
+import llm.routing.RoutedTurn;
+import models.Agent;
+import models.Conversation;
+import org.jspecify.annotations.Nullable;
+import services.ModelOverrideResolver;
+
+import java.util.Optional;
+
+/**
+ * Conversation-override-aware lookups for the model identity and
+ * configuration that should drive a turn. Extracted from
+ * {@link AgentRunner} as part of JCLAW-299; all four helpers center on
+ * a single question — "for this {agent, conversation, provider}
+ * triple, what model are we actually running?" — and the JCLAW-108 /
+ * JCLAW-269 override resolution that answers it.
+ *
+ * <h2>Resolution chain</h2>
+ * <ul>
+ *   <li>{@link #effectiveModelId} and {@link #effectiveModelProvider}
+ *   are thin wrappers over {@link ModelOverrideResolver}. They surface
+ *   the per-conversation override (set by {@code /model} or JCLAW-269
+ *   per-spawn) when present, otherwise return the agent's default. The
+ *   wrappers exist so call sites in {@link AgentRunner} and its sibling
+ *   classes read naturally next to the rest of the runner's helpers
+ *   rather than reaching into {@code services} directly.</li>
+ *   <li>{@link #resolveModelInfo} layers on top: it composes
+ *   {@code effectiveModelId} with the provider's configured model list
+ *   to return the full {@link ModelInfo} record (context window,
+ *   pricing, capabilities), or {@link Optional#empty()} when the
+ *   resolved id isn't on the provider.</li>
+ *   <li>{@link #resolveThinkingMode} composes again: agent's persisted
+ *   {@code thinkingMode} ∩ resolved model's advertised levels. Returns
+ *   {@code null} when reasoning should be disabled — either because
+ *   the agent isn't configured for it or because the active model no
+ *   longer advertises the level the agent stored.</li>
+ * </ul>
+ *
+ * <p>The {@code null} path on {@link #resolveThinkingMode} is not
+ * redundant with {@link services.AgentService#normalizeThinkingMode}:
+ * agents can persist a valid level today and see their model's levels
+ * change tomorrow (operator edits the provider config), so we prefer
+ * to silently disable reasoning rather than send a level the model no
+ * longer understands.
+ */
+public final class ModelResolver {
+
+    private ModelResolver() {}
+
+    /**
+     * Effective model id for this turn — honors the conversation-scoped
+     * override (JCLAW-108 per-conversation, JCLAW-269 per-spawn) when
+     * present, otherwise returns the agent's default. Thin wrapper over
+     * {@link ModelOverrideResolver#modelId}.
+     */
+    public static @Nullable String effectiveModelId(@Nullable Agent agent, Conversation conv) {
+        return ModelOverrideResolver.modelId(conv, agent);
+    }
+
+    /** Companion to {@link #effectiveModelId} — returns the effective provider name. */
+    public static @Nullable String effectiveModelProvider(@Nullable Agent agent, Conversation conv) {
+        return ModelOverrideResolver.provider(conv, agent);
+    }
+
+    /**
+     * Where a turn goes when its primary fails it. In a routed turn (JCLAW-1222) that is the router's
+     * next-best model on another provider; otherwise, or when the router found none, the operator's
+     * fallback for {@code agent} (JCLAW-1190). Null when neither exists, or when the chosen provider
+     * has since lost its configuration — logged by {@link LlmProvider.Fallback#forAgent}, so a
+     * fallback that silently stopped existing is visible. Not subject to the conversation override:
+     * the fallback is the agent's, and a per-turn provider override that lands on it is handled by
+     * the failover entry points.
+     */
+    public static LlmProvider.@Nullable Fallback fallbackFor(@Nullable Agent agent, @Nullable Conversation conv) {
+        var routed = RoutedTurn.current(conv);
+        var target = routed != null ? routed.fallback() : null;
+        var provider = target != null ? ProviderRegistry.get(target.provider()) : null;
+        if (target != null && provider != null) return new LlmProvider.Fallback(provider, target.modelId());
+        return LlmProvider.Fallback.forAgent(agent);
+    }
+
+    /**
+     * Resolve the model's {@link ModelInfo} from the provider's
+     * configured model list. Honors the conversation-scoped override
+     * (JCLAW-108): when {@code conv.modelIdOverride} is set, looks up
+     * that id instead of the agent's default.
+     */
+    public static Optional<ModelInfo> resolveModelInfo(Agent agent, Conversation conv,
+                                                       LlmProvider provider) {
+        var modelId = effectiveModelId(agent, conv);
+        if (modelId == null) return Optional.empty();
+        return provider.config().models().stream()
+                .filter(m -> modelId.equals(m.id()))
+                .findFirst();
+    }
+
+    /**
+     * Resolve the reasoning-effort level this call should use. Combines
+     * the agent's persisted {@code thinkingMode} with the model's
+     * capability: the setting only takes effect when the model supports
+     * thinking and the stored level is still advertised by the model.
+     * Otherwise returns {@code null} (reasoning disabled).
+     */
+    public static @Nullable String resolveThinkingMode(Agent agent, Conversation conv,
+                                                       LlmProvider provider) {
+        // The router agent's own thinkingMode belongs to no real model, so a routed turn reasons at the
+        // effort the router chose for the prompt unless the conversation chose a level (or off) itself.
+        var routed = RoutedTurn.current(conv);
+        if (routed != null && !ModelOverrideResolver.hasThinkingOverride(conv)) {
+            var effort = routed.decision().effort();
+            return resolveModelInfo(agent, conv, provider)
+                    .filter(ModelInfo::supportsThinking)
+                    .map(m -> effort.fit(m.effectiveThinkingLevels()))
+                    .orElse(null);
+        }
+        var mode = ModelOverrideResolver.thinkingMode(conv, agent);
+        if (mode == null || mode.isBlank()) return null;
+        return resolveModelInfo(agent, conv, provider)
+                .filter(ModelInfo::supportsThinking)
+                .filter(m -> m.effectiveThinkingLevels().contains(mode))
+                .map(_ -> mode)
+                .orElse(null);
+    }
+
+    /**
+     * The routed turn's route record: why this model answered, and the effort it reasons at.
+     * Null outside a {@link RoutedTurn}.
+     */
+    public static @Nullable JsonObject routeJson(Agent agent, Conversation conv) {
+        var routed = RoutedTurn.current(conv);
+        if (routed == null) return null;
+        var json = routed.decision().toJson(routed.active(), routed.failedOver());
+        var provider = ProviderRegistry.get(routed.active().provider());
+        var thinking = provider != null ? resolveThinkingMode(agent, conv, provider) : null;
+        if (thinking != null) json.addProperty("thinkingMode", thinking);
+        return json;
+    }
+}

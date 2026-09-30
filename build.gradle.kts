@@ -1,0 +1,764 @@
+import net.ltgt.gradle.errorprone.CheckSeverity
+import net.ltgt.gradle.errorprone.errorprone
+import org.gradle.process.CommandLineArgumentProvider
+
+plugins {
+    id("org.playframework.play1")
+    id("org.sonarqube") version "7.5.0.8588"
+    id("com.diffplug.spotless") version "8.10.2"
+    id("net.ltgt.errorprone") version "5.1.1"
+}
+
+// JCLAW-1149: nullness enforcement. Play's own ECJ compile inside the fork cannot host a
+// javac plugin, so the checker rides the Gradle compileJava — which Sonar, pre-push and, via
+// the play CLI's task graph, `play run`/`play autotest` all pass through first.
+tasks.withType<JavaCompile>().configureEach {
+    options.errorprone {
+        // compileTestJava stays out of this block: test/ is 500+ default-package classes with
+        // no nullness annotations, and the contracts being enforced are production ones. It is
+        // re-enabled below for MustBeClosed alone.
+        enabled.set(name == "compileJava")
+        // Two named checks only. Adopting the rest of Error Prone's catalogue is its own decision.
+        disableAllChecks.set(true)
+        check("NullAway", CheckSeverity.ERROR)
+        // JCLAW-1156: an @MustBeClosed AutoCloseable whose result escapes without a
+        // try-with-resources (or a @MustBeClosed caller that returns it on) fails the build.
+        check("MustBeClosed", CheckSeverity.ERROR)
+        // Packages whose unannotated types default to non-null. `models` is deliberately
+        // absent: JPA populates entity fields reflectively after construction, so every
+        // non-null column would report as uninitialised. `com` (the vendored Aspose shim) is
+        // absent too, as it is not JClaw code. Widening to another package is a
+        // name here plus a @NullMarked package-info per (sub)package it contains.
+        option("NullAway:AnnotatedPackages", "utils,llm,agents,tools,services,controllers,channels,jobs,slash,mcp,memory")
+    }
+}
+
+// JCLAW-1156: MustBeClosed also runs on test/, which the block above deliberately excludes.
+// LuceneTestSync's lock is the leak that actually hurts here — a missing release starves
+// every later Lucene test — and it is held only by test code, so an enforcement that stops
+// at app/ cannot reach it. NullAway stays off: test/ is the default package, outside its
+// AnnotatedPackages scope, so switching it on would check nothing and only add risk.
+tasks.named<JavaCompile>("compileTestJava") {
+    options.errorprone {
+        enabled.set(true)
+        disableAllChecks.set(true)
+        check("NullAway", CheckSeverity.OFF)
+        check("MustBeClosed", CheckSeverity.ERROR)
+    }
+}
+
+// Import hygiene enforcement for production Java (JCLAW code-audit follow-up). Two
+// steps: removeUnusedImports() strips imports whose name is never referenced (it
+// parses source via google-java-format — verified Java-25-safe: handles unnamed
+// vars `_`, records, and pattern matching, see the injection test in the sonar-fixes
+// branch history), and importOrder() canonicalises ordering (a pure text transform).
+// Note removeUnusedImports does NOT catch same-package-but-used imports (the S1128
+// subset where the simple name IS referenced) — Sonar S1128 still owns those.
+// Wildcard bans are the pre-push grep gate. `spotlessApply` canonicalises;
+// `spotlessCheck` (wired into .githooks/pre-push) fails the push on drift. Scoped to
+// app/ to match the production-only cleanup; test/ is intentionally out of scope.
+spotless {
+    java {
+        // JCLAW-895: tests are in scope too. They were excluded for no recorded
+        // reason, which left 436 files with no unused-import removal and no
+        // import-order enforcement — javac does not warn on either, and /quality
+        // sweeps only app/, so nothing looked. JCLAW-894 orphaned seven imports
+        // that had to be found by hand.
+        target("app/**/*.java", "test/**/*.java")
+        removeUnusedImports()
+        importOrder("", "javax", "java", "\\#")
+    }
+}
+
+play1 {
+    val playRoot = file("/opt/play1")
+    frameworkPath.set(playRoot)
+
+    // Pinned framework version range. Bump when migrating to a new minor
+    // (e.g. "1.14.x"). The mini-DSL: dots are literal, "x" is one or more
+    // digits — so the form is always X.Y.x. Acts as a guard rail: the
+    // declared exact version below must fall inside this range, and the
+    // installed fork's version must equal the declared one.
+    val frameworkVersionRange = "1.13.x"
+    val versionPattern = Regex(
+        "^" + frameworkVersionRange.replace(".", "\\.").replace("x", "\\d+") + "$"
+    )
+
+    // Single source of truth for the play1 release jclaw expects. Lives at
+    // the repo root so both Dockerfiles can read it (avoids a stale parse
+    // of this Gradle file from inside Docker, which silently broke when
+    // build.gradle.kts switched to the dynamic `installed` variable). To
+    // bump play1: edit .play-version AND ensure /opt/play1 is on the
+    // matching release.
+    val declaredFile = rootProject.file(".play-version")
+    require(declaredFile.isFile) {
+        "Missing $declaredFile — expected a single line with the pinned play1 version (e.g. 1.13.7)."
+    }
+    val declared = declaredFile.readText().trim()
+    require(versionPattern.matches(declared)) {
+        "Declared play1 version $declared (in .play-version) is outside the pinned $frameworkVersionRange " +
+        "range. Either update the range here, or correct .play-version."
+    }
+
+    val versionFile = playRoot.resolve("framework/src/play/version")
+    require(versionFile.isFile) {
+        "play1 framework not found at $versionFile — is ${playRoot.absolutePath} the right frameworkPath?"
+    }
+    val installed = versionFile.readText().trim()
+    require(installed == declared) {
+        "play1 fork at $playRoot is at $installed but jclaw declares $declared (.play-version). " +
+        "Bump .play-version to match the fork, or check out v$declared in the fork."
+    }
+    frameworkVersion.set(declared)
+}
+
+// The Jenkins pipeline runs `play precompile`, then `play autotest`, then
+// `./gradlew sonar`. None of those emits Gradle's test classes, so sonar.java.test
+// .binaries would point at a directory that never exists on CI. Compiling them here
+// is the cheapest way to keep the analysis property honest; javac output is enough
+// for symbol resolution, which is all the analyzer needs from it.
+tasks.named("sonar") { dependsOn(tasks.named("compileTestJava")) }
+
+sonar {
+    properties {
+        property("sonar.projectKey", "abundent:jclaw")
+        property("sonar.projectName", "JClaw")
+        // Overridden by the Jenkinsfile via -Dsonar.projectVersion=v${appVersion}
+        // so each analysis run is tagged with the release it was run against.
+        property("sonar.projectVersion", "v1")
+
+        // Both the Play backend (app/) and the Nuxt frontend (frontend/) are
+        // analyzed; SonarQube routes each file to the appropriate language
+        // analyzer (Java, TypeScript, Vue, CSS) automatically.
+        property("sonar.sources", "app,frontend")
+        property("sonar.tests", "test,frontend/test")
+
+        // Exclude generated artifacts, dependency caches, runtime data, and
+        // vendored/third-party content. Groovy templates (app/views/**/*.html)
+        // stay out because Play renders them at request time rather than
+        // compiling into the precompiled/ tree Sonar analyzes, and Sonar's
+        // HTML analyzer misreads Play directives as invalid markup.
+        // frontend/test/** lives under sonar.sources=frontend AND
+        // sonar.tests=frontend/test, which would double-index each test file
+        // — the explicit exclusion carves the test subtree out of the main-
+        // source scan so the two walkers produce disjoint sets.
+        property(
+            "sonar.exclusions",
+            "**/node_modules/**, **/dist/**, **/.nuxt/**, **/.output/**, " +
+                "**/public/spa/**, **/precompiled/**, **/workspace/**, " +
+                "**/skills/**, app/views/**, frontend/test/**, " +
+                "**/*.md, **/*.txt, **/*.sh, **/*.xml, **/*.yaml, **/*.yml, " +
+                "**/*.properties, **/*.sql",
+        )
+
+        // Coverage-only exclusions: these files are still analyzed for
+        // code smells, bugs, and security issues, but are not counted
+        // toward the coverage metric (numerator OR denominator). The
+        // sonar.exclusions list above removes files from analysis entirely;
+        // this list narrows just the coverage denominator so JClaw's headline
+        // coverage % reflects business code that meaningfully benefits from
+        // tests, rather than being deflated by vendored or harness code.
+        // See JCLAW-306 for the rationale per category.
+        property(
+            "sonar.coverage.exclusions",
+            // shadcn-vue primitives: upstream-vendored UI wrappers, not
+            // JClaw business logic. ~50 files at 0% inflate the gap without
+            // representing genuine untested code.
+            "frontend/components/ui/**, " +
+                // Playwright end-to-end specs: test code, not production source.
+                "frontend/tests/e2e/**, " +
+                // Dev-mode load harnesses: run manually under controlled
+                // conditions, not part of production code paths.
+                "app/services/LoadTestRunner.java, app/tools/LoadTestSleepTool.java, " +
+                // Generated TypeScript types: emitted by codegen, no
+                // hand-written behavior to cover.
+                "frontend/types/schemas.ts",
+        )
+
+        // Override the Gradle plugin's default (build/classes/java/main) to
+        // also include Play's template-derived classes from `play precompile`.
+        property("sonar.java.binaries", "build/classes/java/main,precompiled/java")
+
+        // Test-side counterpart of sonar.java.binaries. Without resolvable test
+        // binaries the Java analyzer falls back to syntactic checks on test files,
+        // which is the shape of the java:S1128 reports that marked demonstrably-used
+        // static imports as unused.
+        //
+        // Unlike the main path this points at Gradle output rather than precompiled/,
+        // because `play precompile` emits app classes only — no test class is written
+        // anywhere by the CI pipeline's own steps. `play autotest` compiles tests
+        // in-process and leaves nothing behind, so the directory below exists only
+        // because the sonar task is wired to compileTestJava further down. Removing
+        // that wiring makes this property silently point at nothing.
+        property("sonar.java.test.binaries", "build/classes/java/test")
+
+        property("sonar.coverage.jacoco.xmlReportPaths", "jacoco.xml")
+        property("sonar.javascript.lcov.reportPaths", "frontend/coverage/lcov.info")
+        property("sonar.junit.reportPaths", "test-result")
+        // sonar.junit.reportPaths is Java-only, so the Vitest suite needs the
+        // language-neutral Generic Execution report instead — without it the
+        // frontend shows coverage but zero tests, which reads as untested.
+        property("sonar.testExecutionReportPaths", "frontend/test-report/sonar.xml")
+        property("sonar.dependencyCheck.htmlReportPath", "dependency-check-report.html")
+
+        // TypeScript strict-mode + Vue parser picks up the frontend tsconfig
+        // so type-aware analysis matches what vue-tsc does during pnpm typecheck.
+        property("sonar.typescript.tsconfigPath", "frontend/tsconfig.json")
+
+        property("sonar.sourceEncoding", "UTF-8")
+        // sonar.java.jdkHome is deliberately omitted so the scanner picks up
+        // the JDK resolved by the Jenkins `tools { jdk 'JDK25' }` block rather
+        // than a hardcoded path that can drift from the Jenkins tool install.
+        property("sonar.java.source", "25")
+
+        // S1220 (default package): every test/*.java file in this codebase
+        // lives in the default package per Play 1.x's test-runner convention.
+        // Adding a package declaration to a single test creates inconsistency
+        // without benefit; doing it across all 90 tests would touch every file
+        // with no functional change. Suppressed project-wide for the test/
+        // tree only — main-source files (app/) still get flagged correctly.
+        //
+        // S3252 ("Use static access with GenericModel"): play1's bytecode
+        // enhancer injects the calling class at compile time, so every model
+        // query is written as `Agent.findById(123)` / `Conversation.count(...)`
+        // on the derived class. Calling `GenericModel.findById(...)` directly
+        // wouldn't have the class context and wouldn't compile. The rule
+        // can't be satisfied without abandoning the framework's idiom; ignore
+        // everywhere it could fire (app/ and test/ both invoke model statics).
+        //
+        // S2925 (Thread.sleep in tests): the rule wants Awaitility-style
+        // polling. Most of our sleeps are in tests that deliberately exercise
+        // timing-bound behavior (streaming SSE pacing, virtual-thread
+        // scheduling, MCP reconnect backoff, conversation queue eviction,
+        // per-listener notification timeouts). Swapping to Awaitility would
+        // be a 50-site rewrite with no behavioral improvement; the sleeps
+        // are the right primitive for "verify A happens before B happens
+        // before C". Test-tree scope only.
+        //
+        // S3457 (\n vs %n): JClaw's String.format calls produce text bound
+        // for LLM context windows, HTTP response bodies, and tool output —
+        // never OS-native text files. On macOS/Linux %n == \n, but on
+        // Windows %n == \r\n, which would inject \r into LLM context (the
+        // model is trained on \n), break golden-string assertions in tests,
+        // and corrupt JSON payloads downstream. Keeping \n is the right
+        // call; scope to app/ so the one real S3457 hit in test/ (an actual
+        // argument-count mismatch) still gets caught.
+        //
+        // S125 (commented-out code): JClaw's coding style uses dense `//`
+        // blocks to document non-obvious logic, design tradeoffs, and JCLAW
+        // ticket references inline. Sonar's heuristic treats multi-line `//`
+        // comments containing code-like tokens (identifiers, parens, dots)
+        // as commented-out code; a sample of 18/27 hits confirmed 100%
+        // false-positive — every flagged block is documentation. Suppressed
+        // project-wide.
+        //
+        // S108 (empty code blocks): JClaw uses Java 21's unnamed-variable
+        // syntax (`catch (IOException _) {}`, `catch (RuntimeException ignored)
+        // {}`) to express intentional exception discard at the type-system
+        // level. Sample of 14 hits across both app/ and test/ confirmed
+        // 100% intentional empty catches for best-effort cleanup (file
+        // deletes, stream closes, parse-error fallbacks). Sonar's rule
+        // pre-dates the `_` syntax convention; the unnamed variable IS the
+        // intent documentation. Suppressed project-wide.
+        property("sonar.issue.ignore.multicriteria", "e1,e2,e3,e4,e5,e6")
+        property("sonar.issue.ignore.multicriteria.e1.ruleKey", "java:S1220")
+        property("sonar.issue.ignore.multicriteria.e1.resourceKey", "test/*.java")
+        property("sonar.issue.ignore.multicriteria.e2.ruleKey", "java:S3252")
+        property("sonar.issue.ignore.multicriteria.e2.resourceKey", "**/*.java")
+        property("sonar.issue.ignore.multicriteria.e3.ruleKey", "java:S2925")
+        property("sonar.issue.ignore.multicriteria.e3.resourceKey", "test/*.java")
+        property("sonar.issue.ignore.multicriteria.e4.ruleKey", "java:S3457")
+        property("sonar.issue.ignore.multicriteria.e4.resourceKey", "app/**/*.java")
+        property("sonar.issue.ignore.multicriteria.e5.ruleKey", "java:S125")
+        property("sonar.issue.ignore.multicriteria.e5.resourceKey", "**/*.java")
+        property("sonar.issue.ignore.multicriteria.e6.ruleKey", "java:S108")
+        property("sonar.issue.ignore.multicriteria.e6.resourceKey", "**/*.java")
+
+        // sonar.host.url is deliberately omitted; Jenkins injects it via
+        // withSonarQubeEnv('SonarQube'), which reads from Manage Jenkins →
+        // System → SonarQube servers. Keeping the URL in one place prevents
+        // drift if the Sonar server ever moves to a new domain.
+    }
+}
+
+repositories {
+    mavenCentral()
+
+    // JCLAW-793: sherpa-onnx (the JVM-native TTS engine) isn't published to
+    // Maven Central — resolve its classes jar + per-platform native-lib jar
+    // straight from the project's GitHub releases via an Ivy pattern (the same
+    // shape the pre-JCLAW-630 sherpa integration used). Scoped to the sherpa
+    // group with content{} so no other dependency is ever looked up here, and
+    // metadataSources{artifact()} because the releases carry no POM/ivy.xml.
+    ivy {
+        url = uri("https://github.com/k2-fsa/sherpa-onnx/releases/download")
+        patternLayout { artifact("v[revision]/[artifact]-v[revision].[ext]") }
+        metadataSources { artifact() }
+        content { includeGroup("com.k2fsa.sherpa.onnx") }
+    }
+}
+
+dependencies {
+    // JCLAW-1149: the javac plugin host, and the nullness checker that runs inside it.
+    // Both are compile-only tool dependencies — nothing here reaches the dist.
+    errorprone("com.google.errorprone:error_prone_core:2.50.0")
+    errorprone("com.uber.nullaway:nullaway:0.14.1")
+
+    // JCLAW-1156: @MustBeClosed itself. Unlike the two above this one is referenced by
+    // app/ and test/ sources, so it has to be a real compile dependency rather than a
+    // tool-only one — CLASS retention, nothing loads it at runtime.
+    implementation("com.google.errorprone:error_prone_annotations:2.50.0")
+
+    // Agent Client Protocol (ACP) SDK — the official Java client for driving a
+    // coding harness over ACP (JSON-RPC/stdio). Used by the runtime=acp subagent
+    // path (Stage 2) to speak real ACP instead of the stdin/stdout wrapper.
+    // Pulls Jackson + Reactor transitively. Verified full round-trip against
+    // claude-agent-acp.
+    implementation("com.agentclientprotocol:acp-core:0.17.0")
+
+    // JCLAW-735: JSpecify nullness annotations (@Nullable / @NonNull, TYPE_USE).
+    // The tree-wide standard for expressing null contracts; introduced first on
+    // the security-utility public surface (PasswordHasher / SsrfGuard /
+    // WorkspacePathGuard). Broadening to the rest of app/ is the next increment.
+    implementation("org.jspecify:jspecify:1.0.1")
+
+    // JCLAW-34: OpenTelemetry. The SDK runs in-process (traces + metrics over OTLP) so
+    // the collector endpoint can change without a restart; the Java agent is optional
+    // and attaches through PF-92's javaagent.path instead. Both BOMs so every artifact
+    // moves together. The OTLP sender's OkHttp is okhttp-jvm 5.x, the same artifact
+    // family pinned below — no exclusion needed, unlike the telegrambots graph.
+    implementation(platform("io.opentelemetry:opentelemetry-bom:1.66.0"))
+    implementation(platform("io.opentelemetry.instrumentation:opentelemetry-instrumentation-bom-alpha:2.31.1-alpha"))
+    implementation("io.opentelemetry:opentelemetry-api")
+    implementation("io.opentelemetry:opentelemetry-sdk")
+    implementation("io.opentelemetry:opentelemetry-exporter-otlp")
+    implementation("io.opentelemetry:opentelemetry-sdk-testing")
+    implementation("io.opentelemetry.instrumentation:opentelemetry-okhttp-3.0")
+    implementation("io.opentelemetry.instrumentation:opentelemetry-jdbc")
+    implementation("io.opentelemetry.instrumentation:opentelemetry-runtime-telemetry")
+    implementation("io.opentelemetry.semconv:opentelemetry-semconv")
+
+    // ArchUnit — architecture rules as unit tests (test/ArchitectureTest). Guards
+    // the canonical seams the audit waves keep having to re-consolidate: outbound
+    // HTTP goes through HttpFactories, no JDK java.net.http creeps back in, and a
+    // bare `new Gson()` can't bypass GsonHolder's wire-format contract. Declared as
+    // `implementation` (not testImplementation) because the play1 test runner builds
+    // its classpath from the main dependency set + framework/lib; only transitive
+    // dep is slf4j-api, already on the classpath. Never loaded at runtime (only the
+    // test class references it), so its presence in the dist is inert.
+    implementation("com.tngtech.archunit:archunit:1.5.0")
+
+    // JCLAW-1154: jqwik — property-based testing for the pure parsers and planners
+    // (test/PropertyBasedTest). `implementation` for the same reason as ArchUnit above:
+    // playAutotest builds its classpath from sourceSets.main.runtimeClasspath, so a
+    // testImplementation dep is invisible to the fork's runner; never loaded at runtime,
+    // so its presence in the dist is inert. The junit-platform exclusions are
+    // load-bearing: jqwik 1.10 asks for platform 1.14.4, the fork ships 6.1.3, and
+    // Gradle's deps precede framework/lib on the classpath — without these the 1.x
+    // commons would shadow 6.1.3 and break every existing test.
+    implementation("net.jqwik:jqwik-api:1.10.1") {
+        exclude(group = "org.junit.platform")
+    }
+    runtimeOnly("net.jqwik:jqwik-engine:1.10.1") {
+        exclude(group = "org.junit.platform")
+    }
+
+    // JCLAW-911: printer discovery over mDNS/Bonjour. Pure Java, Apache-2.0, no
+    // native deps — which is the whole point of the printer tool: it works on a
+    // box with no CUPS and no OS print subsystem. 3.6.3 rather than the 3.5.9 the
+    // ticket named; 3.5.9 is two minors stale and Renovate would bump it on sight.
+    implementation("org.jmdns:jmdns:3.6.3")
+
+    // JCLAW-911: HP JIPP — pure-Java IPP codec for the primary print backend
+    // (RFC 8010/8011 over HTTP to port 631). MIT. JIPP is written in Kotlin and
+    // asks for kotlin-stdlib 1.9.10, but readability4j already puts Kotlin on the
+    // classpath, so this resolves UP to the existing 2.2.21 rather than adding a
+    // runtime — verified via `gradlew dependencies --configuration runtimeClasspath`.
+    implementation("com.hp.jipp:jipp-core:0.7.18")
+
+    // jsoup 1.22.2 is one patch ahead of the 1.22.1 that Tika 3.3.0's
+    // parent POM pins for its parser modules; keeps resolved/declared in sync.
+    implementation("org.jsoup:jsoup:1.23.2")
+
+    // crawler-commons — Googlebot-compatible robots.txt parsing and sitemap handling
+    // for web_scrape (JCLAW-1084). The same SimpleRobotRulesParser Nutch and
+    // StormCrawler use, so the matching rules come from a parser exercised far more
+    // widely than a hand-rolled one. Its only compile deps are slf4j-api and
+    // commons-io, both already resolved here.
+    implementation("com.github.crawler-commons:crawler-commons:1.6")
+
+
+    // Readability4J — Kotlin port of Mozilla Readability, drives WebFetchTool's
+    // main-content extraction (JCLAW-775). Pins an old jsoup transitively; the
+    // 1.22.2 above wins on the resolved classpath. WebFetchTool falls back to a
+    // Jsoup boilerplate strip if this yields no article, so a readability miss
+    // (or throw) never surfaces as an empty result.
+    implementation("net.dankito.readability4j:readability4j:1.0.8") {
+        exclude(group = "org.slf4j", module = "slf4j-simple")
+    }
+
+    // JavaParser — AST-aware Java compression for CodeCompressor (JCLAW-463).
+    // Self-contained (no transitive deps); its classes load lazily, only when
+    // Java source is actually compressed, so non-Java paths never touch it.
+    implementation("com.github.javaparser:javaparser-core:3.28.2")
+
+    // Playwright's POM declares slf4j-simple as a runtime dep, which races
+    // log4j-slf4j2-impl for the SLF4JServiceProvider ServiceLoader slot
+    // (see JCLAW-88).
+    implementation("com.microsoft.playwright:playwright:1.63.0") {
+        exclude(group = "org.slf4j", module = "slf4j-simple")
+    }
+
+    // OOXML schema classes (STTblWidth, CTTbl, CTRow, CTTc) that DocumentWriter compiles
+    // against. Tika 3.3.2 pulled poi-ooxml-full transitively and Tika 4.0.0 does not; POI
+    // publishes -lite and -full under one capability, so nothing substitutes for it and the
+    // classes just vanish. Declared here because DocumentWriter needs them whatever Tika
+    // ships. Must stay on the same version as the poi/poi-ooxml that Tika resolves —
+    // xmlbeans-generated schemas and poi-ooxml are a matched pair (JCLAW-1142).
+    implementation("org.apache.poi:poi-ooxml-full:5.5.1")
+
+    // Tika core — drop OSGi/bndlib (Ivy promoted provided→runtime) and the
+    // test/lombok pulls.
+    implementation("org.apache.tika:tika-core:4.0.0") {
+        exclude(group = "org.apache.logging.log4j")
+        exclude(group = "org.projectlombok")
+        exclude(group = "org.assertj")
+        exclude(group = "org.mockito")
+        exclude(group = "biz.aQute.bnd")
+        exclude(group = "org.osgi")
+    }
+
+    // Tika parsers — keep pdfbox-tools (PDF OCR depends on ImageIOUtil),
+    // exclude picocli (CLI front-end only), exclude mail/lucene/cxf/etc.
+    implementation("org.apache.tika:tika-parsers-standard-package:4.0.0") {
+        exclude(group = "org.apache.lucene")
+        exclude(group = "org.ow2.asm")
+        exclude(group = "org.apache.logging.log4j")
+        exclude(group = "org.bouncycastle")
+        exclude(group = "org.slf4j")
+        exclude(group = "com.healthmarketscience.jackcess")
+        exclude(group = "org.apache.tika", module = "tika-parser-mail-commons")
+        exclude(group = "org.apache.tika", module = "tika-parser-mail-module")
+        exclude(group = "org.projectlombok")
+        exclude(group = "org.assertj")
+        exclude(group = "org.mockito")
+        exclude(group = "com.codeborne", module = "pdf-test")
+        exclude(group = "com.vladsch.flexmark", module = "flexmark-test-util")
+        exclude(group = "com.vladsch.flexmark", module = "flexmark-test-specs")
+        exclude(group = "com.vladsch.flexmark", module = "flexmark-core-test")
+        exclude(group = "info.picocli")
+        exclude(group = "org.osgi")
+        // JCLAW-452: drop transitive parser backends with non-standard licenses that
+        // JClaw never invokes directly — junrar (UnRar License, a use-restriction; the
+        // RAR backend of tika-parser-pkg-module) and jhighlight (CDDL; the code-
+        // highlight backend of tika-parser-code-module). Tika discovers parsers via
+        // ServiceLoader, so the two matching parsers simply de-register and every other
+        // format (PDF/Office/HTML/EPUB/zip/7z/tar) is unaffected. The only loss is
+        // extracting text from .rar archives + syntax-highlighting embedded source.
+        exclude(group = "com.github.junrar", module = "junrar")
+        exclude(group = "org.codelibs", module = "jhighlight")
+    }
+
+    // flexmark — drop test utilities, jmh, pdf-test, assertj.
+    implementation("com.vladsch.flexmark:flexmark:0.64.8") {
+        exclude(group = "com.vladsch.flexmark", module = "flexmark-test-util")
+        exclude(group = "com.vladsch.flexmark", module = "flexmark-test-specs")
+        exclude(group = "com.vladsch.flexmark", module = "flexmark-core-test")
+        exclude(group = "com.codeborne", module = "pdf-test")
+        exclude(group = "org.assertj")
+        exclude(group = "org.mockito")
+        exclude(group = "org.projectlombok")
+        exclude(group = "org.openjdk.jmh")
+    }
+
+    // Each flexmark-ext-* re-pulls flexmark-core-test → replicate the excludes.
+    // flexmark-html2md-converter (JCLAW-775) is the reverse of the HtmlRenderer
+    // DocumentWriter uses: it turns extracted HTML into LLM-friendly Markdown in
+    // WebFetchTool. Same 0.64.8 family, same test-util excludes.
+    listOf(
+        "flexmark-ext-tables",
+        "flexmark-ext-gfm-strikethrough",
+        "flexmark-ext-gfm-tasklist",
+        "flexmark-ext-autolink",
+        "flexmark-ext-typographic",
+        "flexmark-html2md-converter",
+    ).forEach { module ->
+        implementation("com.vladsch.flexmark:$module:0.64.8") {
+            exclude(group = "com.vladsch.flexmark", module = "flexmark-test-util")
+            exclude(group = "com.vladsch.flexmark", module = "flexmark-test-specs")
+            exclude(group = "com.vladsch.flexmark", module = "flexmark-core-test")
+            exclude(group = "org.openjdk.jmh")
+            exclude(group = "org.hamcrest")
+            exclude(group = "com.codeborne", module = "pdf-test")
+        }
+    }
+
+    // flying-saucer-pdf-openpdf — narrow plausible transitive sources.
+    implementation("org.xhtmlrenderer:flying-saucer-pdf-openpdf:9.4.0") {
+        exclude(group = "com.codeborne", module = "pdf-test")
+        exclude(group = "org.assertj")
+        exclude(group = "org.hamcrest", module = "hamcrest-core")
+        exclude(group = "org.mockito")
+        exclude(group = "org.projectlombok")
+        exclude(group = "org.slf4j", module = "slf4j-simple")
+    }
+
+    implementation("org.hdrhistogram:HdrHistogram:2.2.2")
+
+    // JCLAW-307: OpenAI/tiktoken-compatible tokenizer used for provider-facing
+    // prompt measurement and fallback usage accounting when a provider omits
+    // usage blocks. The registry is created lazily in TokenUsageEstimator.
+    implementation("com.knuddels:jtokkit:1.1.0")
+
+    // JCLAW-205: Caffeine JSR-107 (JCache) provider for Hibernate L2 cache.
+    // Co-versioned with the caffeine-3.3.0 the fork ships.
+    implementation("com.github.ben-manes.caffeine:jcache:3.3.0") {
+        exclude(group = "org.osgi")
+        exclude(group = "biz.aQute.bnd")
+    }
+
+    // Telegram Bot API SDK — exclude OkHttp 4.x graph (we use okhttp-jvm 5.x
+    // directly), logback (log4j path), and test artifacts.
+    listOf(
+        "telegrambots-client",
+        "telegrambots-longpolling",
+    ).forEach { module ->
+        implementation("org.telegram:$module:9.5.0") {
+            exclude(group = "ch.qos.logback")
+            exclude(group = "org.awaitility")
+            exclude(group = "com.squareup.okhttp3", module = "okhttp")
+            exclude(group = "com.squareup.okhttp3", module = "mockwebserver")
+            exclude(group = "com.squareup.okio")
+            exclude(group = "org.projectlombok")
+            exclude(group = "org.assertj")
+            exclude(group = "org.mockito")
+        }
+    }
+
+    // OkHttp 5.x JVM artifact (the bare `okhttp` artifact is Gradle-Metadata
+    // only and Play 1.x's Ivy didn't understand it; under Gradle Metadata is
+    // native, but we keep the jvm-suffixed coord to mirror the python config).
+    implementation("com.squareup.okhttp3:okhttp-jvm:5.5.0")
+
+    // JCLAW-185: SSE + MockWebServer 5.x (plain POMs, no -jvm suffix).
+    implementation("com.squareup.okhttp3:okhttp-sse:5.5.0")
+    implementation("com.squareup.okhttp3:mockwebserver3:5.5.0")
+
+    // JCLAW-83: Slack SDK (official com.slack.api), a la carte — slack-api-client
+    // (Web API + Block Kit) + slack-app-backend (SlackSignature.Verifier + event
+    // parsers). NO Bolt. Exclude its bare OkHttp 4.x + Okio so it runs on
+    // okhttp-jvm 5.x instead of clashing in the shared okhttp3 package
+    // (same treatment as the Telegram SDK above).
+    listOf(
+        "slack-api-client",
+        "slack-app-backend",
+    ).forEach { module ->
+        implementation("com.slack.api:$module:1.49.0") {
+            exclude(group = "com.squareup.okhttp3", module = "okhttp")
+            exclude(group = "com.squareup.okhttp3", module = "mockwebserver")
+            exclude(group = "com.squareup.okio")
+        }
+    }
+    // JCLAW-351: Slack Socket Mode backend. The socket-mode client classes ship inside
+    // slack-api-client, but its WebSocket runtime is optional — pull the lightweight
+    // Java-WebSocket impl so SocketModeClient.Backend.JavaWebSocket has a transport.
+    implementation("org.java-websocket:Java-WebSocket:1.6.0")
+
+    // JCLAW-650: whisper.cpp JNI retired — ASR runs in the diarize sidecar
+    // on the host-relevant GPU engine (mlx-whisper / faster-whisper), and
+    // the Settings page provisions THAT engine's weights.
+
+    // JCLAW-630: WeSpeaker embeddings moved into the diarize sidecar
+    // (batched /embed, sherpa-onnx Python — same ONNX + feature pipeline).
+    // The JVM-side sherpa-onnx JNI stack and its ivy repo are gone.
+
+    // JCLAW-793: sherpa-onnx returns to the JVM — deliberately — as the
+    // operator-selectable "JVM-native" TTS engine (Settings > Speech), an
+    // alternative to the Python sidecar. Apache-2.0. The classes jar is
+    // platform-neutral; the native-lib jar carries libsherpa-onnx-jni with ONNX
+    // Runtime STATICALLY LINKED inside it, so this adds ONE native lib and does
+    // NOT pull com.microsoft.onnxruntime. Selected for the target host below; CPU
+    // inference (RTF ~0.03 for Piper, validated in the JCLAW-793 spike) — the
+    // GPU path stays on the sidecar (Qwen3-TTS/vLLM). Resolved via the Ivy repo.
+    //
+    // This is the only architecture-specific artifact in the whole resolved
+    // graph, so it alone decides whether a bundle is portable. -PtargetArch
+    // (Docker's TARGETARCH: amd64/arm64) exists because the image's bundle
+    // stage builds natively on $BUILDPLATFORM and cross-targets — keying off
+    // os.arch there would ship the builder's x64 lib inside the arm64 image.
+    // Blank (an unset ARG expands -PtargetArch= to the empty string) means
+    // unspecified, not x64 — otherwise the guard silently fails the arm64 way.
+    val sherpaVersion = "1.13.4"
+    val sherpaNativeClassifier = run {
+        val os = System.getProperty("os.name").lowercase()
+        val arch = ((findProperty("targetArch") as String?)?.takeIf { it.isNotBlank() }
+            ?: System.getProperty("os.arch")).lowercase()
+        val a = if (arch.contains("aarch64") || arch.contains("arm64")) "aarch64" else "x64"
+        when {
+            os.contains("mac") || os.contains("darwin") -> "osx-$a"
+            os.contains("win") -> "win-x64"
+            else -> "linux-$a"
+        }
+    }
+    implementation("com.k2fsa.sherpa.onnx:sherpa-onnx:$sherpaVersion")
+    runtimeOnly("com.k2fsa.sherpa.onnx:sherpa-onnx-native-lib-$sherpaNativeClassifier:$sherpaVersion")
+
+    // JCLAW-563/654: in-process wav2vec2 speech-emotion recognition (ONNX
+    // Runtime Java API) retired — per-turn emotion is now judged by the LLM
+    // from vocal prosody in DiarizeAudioTool, so the onnxruntime dep and its
+    // bundled multi-platform native libs are gone.
+
+    // WebP decode for image captioning: caption models vary in format support — local Ollama vision
+    // models reject WebP ("Failed to load image"). This TwelveMonkeys ImageIO plugin auto-registers a
+    // WebP ImageReader so CaptionImageNormalizer can transcode WebP → PNG before sending. Pure-Java,
+    // no natives; read-only (we only decode WebP, then write PNG via core ImageIO).
+    implementation("com.twelvemonkeys.imageio:imageio-webp:3.15.2")
+
+    // JCLAW-21: db-scheduler — persistent task scheduling backed by a single
+    // DB table (scheduled_tasks). Replaces what would otherwise be a custom
+    // TaskPollerJob + CronParser + StuckTaskRecoveryJob trio. db-scheduler
+    // handles polling, atomic claim via a row-version column, retry via
+    // pluggable FailureHandler, and heartbeat-based dead-execution detection;
+    // JClaw contributes the TaskExecutionHandler that knows how to fire each
+    // Task. Core artifact has no Spring dependency (the spring-boot starter
+    // is a separate optional module we don't pull in).
+    implementation("com.github.kagkarlsson:db-scheduler:16.12.0")
+
+    // Lucene 10: full-text index for task_run_message.content (transcript
+    // search) via DirectLuceneMessageSearchRepository. We dropped H2's
+    // bundled FullTextLucene because it's incompatible with Lucene 10 —
+    // TotalHits.value went from public field to private with a getter, and
+    // H2 2.3.232's FullTextLucene reads it via direct field access, so the
+    // first search query IllegalAccessError's against a Lucene 10 classpath.
+    // The direct repo owns its own FSDirectory under data/jclaw-lucene/,
+    // kept in sync via JPA lifecycle hooks on TaskRunMessage rather than
+    // H2 triggers. tika-parsers-standard-package above already excludes
+    // the transitive lucene pull (line 205), so these declarations own
+    // the resolved graph.
+    // lucene-queryparser is deliberately absent: collectScored builds its query
+    // programmatically from PrefixQuery/TermQuery/BooleanQuery (all in core) so a
+    // stray operator character can't ParseException the query out from under the UI.
+    implementation("org.apache.lucene:lucene-core:10.5.1")
+    implementation("org.apache.lucene:lucene-analysis-common:10.5.1")
+
+    // JCLAW-448: Cobalt — the unofficial WhatsApp-Web (Baileys-equivalent) stack
+    // for the WHATSAPP_WEB transport (QR-paired, group-capable, ban-warned).
+    // Namespace it.auties.whatsapp.
+    //
+    // RISK: single-maintainer, mid-rewrite library. The published 0.0.x line is
+    // the stable API surface (the master branch is a 0.1.0 rewrite not yet on
+    // Maven Central); we PIN an exact version so a surprise republish can't shift
+    // the API under us. Treat every Cobalt call as load-bearing-but-fragile —
+    // it's isolated behind WhatsAppCobalt* so a breaking bump is contained to
+    // the channels/ package. Pulls a large transitive graph (its own protobuf,
+    // bouncycastle, etc.); excluded slf4j-simple to keep the log4j path clean
+    // (same treatment as the other SDKs above).
+    implementation("com.github.auties00:cobalt:0.0.10") {
+        // aspose-words 22.11 is a commercial, closed-source artifact NOT on Maven
+        // Central (it lives in Aspose's private repo). Cobalt links it (in its
+        // Medias helper) only to count document pages + render a first-page
+        // thumbnail for outbound document messages. We drop the commercial artifact
+        // and instead provide a tiny com.aspose.words shim backed by the PDFBox we
+        // already ship — see app/com/aspose/words (JCLAW-451). The shim satisfies
+        // Cobalt's static link, so ALL WhatsApp-Web media outbound works with no
+        // commercial dependency.
+        exclude(group = "com.aspose", module = "aspose-words")
+        // slf4j-nop / slf4j-simple both grab the SLF4JServiceProvider
+        // ServiceLoader slot that log4j-slf4j2-impl needs (same clash as the
+        // Telegram/Slack/Playwright SDKs above) — exclude so our log4j binding wins.
+        exclude(group = "org.slf4j", module = "slf4j-nop")
+        exclude(group = "org.slf4j", module = "slf4j-simple")
+    }
+}
+
+// ── Release hardening: strip debug info from the precompiled classes ──────────
+// Drops the local-variable / parameter name tables a decompiler reads to reprint
+// readable source, while keeping names, logic, line numbers and every
+// runtime-read attribute intact (conf/proguard-debug-strip.pro). Full renaming
+// was spiked and deferred — it breaks Play's string-based class resolution, and
+// only a commercial tool makes logic unreadable. This step is behaviour-neutral,
+// so it is gated on a property and OFF by default: the Jenkins Package stage
+// turns it on with -Pjclaw.stripDebugInfo=true, while `play run`, `play autotest`
+// and a plain `./jclaw.sh dist` are untouched.
+//
+// Three typed tasks rather than doLast{} closures, so the chain stays
+// configuration-cache compatible (delete()/sync() on the project script are not):
+// clean the output dir, run ProGuard dir->dir, then Sync the result back over
+// precompiled/java so playDist / playBundle zip the stripped classes.
+val proguard = configurations.create("proguard")
+dependencies {
+    // Debug-strip engine only. The `proguard` configuration is on no compile or
+    // runtime classpath, so nothing here reaches the dist.
+    proguard("com.guardsquare:proguard-base:7.10.0")
+}
+
+val strippedPrecompiledDir = layout.buildDirectory.dir("proguard/precompiled-java")
+
+val cleanStrippedPrecompiled = tasks.register<Delete>("cleanStrippedPrecompiled") {
+    delete(strippedPrecompiledDir)
+}
+
+val proguardStripPrecompiled = tasks.register<JavaExec>("proguardStripPrecompiled") {
+    description = "Run ProGuard to strip local-variable name tables from precompiled/java"
+    dependsOn("playPrecompile", cleanStrippedPrecompiled)
+    mustRunAfter("playPrecompile")
+    classpath = proguard
+    mainClass.set("proguard.ProGuard")
+    val config = layout.projectDirectory.file("conf/proguard-debug-strip.pro").asFile.absolutePath
+    val inDir = layout.projectDirectory.dir("precompiled/java").asFile.absolutePath
+    val outDir = strippedPrecompiledDir.get().asFile.absolutePath
+    val jmods = "${System.getProperty("java.home")}/jmods(!**.jar;!module-info.class)"
+    args("@$config", "-injars", inDir, "-outjars", outDir, "-libraryjars", jmods)
+    // ProGuard needs the full type hierarchy even to strip (its partial evaluator
+    // computes common supertypes), so the app compile classpath — the Play framework
+    // jar plus every resolved dependency — goes in as -libraryjars. Passed through an
+    // argument provider capturing the FileCollection, so the task stays
+    // configuration-cache compatible (resolving the configuration eagerly here would not).
+    // compileClasspath carries the resolved app dependencies but NOT the Play
+    // framework itself (the fork provides play.* at runtime), so add the framework
+    // jar and the framework's own libs — the same /opt/play1 the version check above
+    // reads — to complete the hierarchy (play.db.jpa.Model, jakarta.*, Hibernate).
+    val libClasspath = files(
+        configurations.named("compileClasspath"),
+        fileTree("/opt/play1/framework") { include("play-*.jar", "lib/*.jar") },
+    )
+    inputs.files(libClasspath).withPropertyName("libraryClasspath")
+    argumentProviders.add(CommandLineArgumentProvider {
+        val cp = libClasspath.files.joinToString(System.getProperty("path.separator")) { it.absolutePath }
+        if (cp.isEmpty()) emptyList() else listOf("-libraryjars", cp)
+    })
+}
+
+// Swap the stripped classes back over the originals. Sync mirrors, so a stale
+// class from a prior run cannot survive into the dist.
+val stripPrecompiledDebugInfo = tasks.register<Sync>("stripPrecompiledDebugInfo") {
+    description = "Replace precompiled/java with its debug-stripped copy (release hardening)"
+    dependsOn(proguardStripPrecompiled)
+    from(strippedPrecompiledDir)
+    into(layout.projectDirectory.dir("precompiled/java"))
+}
+
+// Wire the strip between precompile and packaging only when explicitly requested.
+if (providers.gradleProperty("jclaw.stripDebugInfo").orNull == "true") {
+    listOf("playDist", "playBundle").forEach { t ->
+        tasks.named(t) { dependsOn(stripPrecompiledDebugInfo) }
+    }
+}
+
+// ── Release bundle: no Playwright driver-bundle ────────────────────────────────
+// driver-bundle is Node.js for all five Playwright platforms (~194 MB, near half the bundle).
+// A bundle install, and the Docker image built from the bundle, downloads its one platform's
+// official Node on first browser use (services.browser.PlaywrightNode), so the zip needs none.
+// Dev, tests and `play run` keep the jar on the classpath. playBundle fills both lib/ and the
+// launcher's .classpath from playClasspath, so filtering it keeps the jar out of both.
+tasks.named<play.gradle.PlayBundleTask>("playBundle") {
+    // Snapshot the sources first: filtering playClasspath into itself would be circular.
+    val resolved = files(playClasspath.from.toList())
+    playClasspath.setFrom(resolved.filter { !it.name.startsWith("driver-bundle-") })
+    doFirst {
+        // Loud rather than silent: a renamed or removed jar means this filter is stale.
+        check(resolved.any { it.name.startsWith("driver-bundle-") }) {
+            "no driver-bundle jar on playBundle's classpath; the Playwright filter in build.gradle.kts is stale"
+        }
+    }
+}

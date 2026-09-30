@@ -1,0 +1,190 @@
+import channels.ChannelTransport;
+import channels.TelegramChannel;
+import channels.TelegramWebhookRegistrar;
+import channels.TelegramWebhookRegistrar.WebhookApi;
+import models.TelegramBinding;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import play.test.UnitTest;
+
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * JCLAW-339: the {@link TelegramWebhookRegistrar} decision logic, exercised with
+ * an injected {@link WebhookApi} so nothing hits the real Telegram API. The
+ * public base URL is supplied directly (it's a stored binding field, not derived
+ * here).
+ */
+class TelegramWebhookRegistrarTest extends UnitTest {
+
+    static final class FakeApi implements WebhookApi {
+        final List<String> set = new ArrayList<>();
+        final List<String> deleted = new ArrayList<>();
+        boolean setResult = true;
+
+        @Override public boolean setWebhook(String token, String url, String secret) {
+            set.add(token + "|" + url + "|" + secret);
+            return setResult;
+        }
+
+        @Override public boolean deleteWebhook(String token) {
+            deleted.add(token);
+            return true;
+        }
+    }
+
+    private static final String BASE = "https://host.taildcc9a6.ts.net";
+
+    @Test
+    void webhookUrlEmbedsBindingIdOnly() {
+        // JCLAW-784: the secret moved to the X-Telegram-Bot-Api-Secret-Token header,
+        // so the URL keys on the binding id alone (no /{secret} tail to leak into logs).
+        assertEquals("https://h.ts.net/api/webhooks/telegram/7",
+                TelegramWebhookRegistrar.webhookUrl("https://h.ts.net", 7L));
+    }
+
+    @Test
+    void webhookUrlStripsTrailingSlashFromBase() {
+        assertEquals("https://h.ts.net/api/webhooks/telegram/7",
+                TelegramWebhookRegistrar.webhookUrl("https://h.ts.net/", 7L));
+    }
+
+    @Test
+    void enabledWebhookWithSecretAndBaseRegisters() {
+        var api = new FakeApi();
+        TelegramWebhookRegistrar.apply(7L, "tok", "sek", BASE, ChannelTransport.WEBHOOK, true, api);
+        assertEquals(List.of("tok|" + BASE + "/api/webhooks/telegram/7|sek"), api.set);
+        assertTrue(api.deleted.isEmpty(), "should not deregister an active webhook binding");
+    }
+
+    @Test
+    void pollingEnabledBindingSkipsDeleteWebhook() {
+        // JCLAW-432: an enabled POLLING binding gets a session, and the SDK's
+        // BotSession deletes any webhook itself before its first getUpdates — so
+        // apply() must NOT issue its own (redundant, sometimes-failing) delete.
+        var api = new FakeApi();
+        TelegramWebhookRegistrar.apply(7L, "tok", "sek", BASE, ChannelTransport.POLLING, true, api);
+        assertTrue(api.deleted.isEmpty(),
+                "enabled POLLING must not call deleteWebhook — the session clears it");
+        assertTrue(api.set.isEmpty(), "POLLING must not register a webhook");
+    }
+
+    @Test
+    void pollingDisabledBindingDeregisters() {
+        // A disabled POLLING binding has no session, so apply() must clear any
+        // leftover webhook itself.
+        var api = new FakeApi();
+        TelegramWebhookRegistrar.apply(7L, "tok", "sek", BASE, ChannelTransport.POLLING, false, api);
+        assertEquals(List.of("tok"), api.deleted);
+        assertTrue(api.set.isEmpty());
+    }
+
+    @Test
+    void disabledWebhookBindingDeregisters() {
+        // A disabled WEBHOOK binding must clear its webhook so it stops receiving.
+        var api = new FakeApi();
+        TelegramWebhookRegistrar.apply(7L, "tok", "sek", BASE, ChannelTransport.WEBHOOK, false, api);
+        assertEquals(List.of("tok"), api.deleted);
+        assertTrue(api.set.isEmpty());
+    }
+
+    @Test
+    void onBindingDeletedClearsWebhookForWebhookBinding() {
+        // Deleting a WEBHOOK binding must clear its registered webhook.
+        var api = new FakeApi();
+        TelegramWebhookRegistrar.onBindingDeleted("tok", ChannelTransport.WEBHOOK, api);
+        assertEquals(List.of("tok"), api.deleted);
+    }
+
+    @Test
+    void onBindingDeletedSkipsDeleteForPollingBinding() {
+        // JCLAW-433: a POLLING binding never registered a webhook, so deleting it
+        // must not issue a (redundant, sometimes-401ing) deleteWebhook.
+        var api = new FakeApi();
+        TelegramWebhookRegistrar.onBindingDeleted("tok", ChannelTransport.POLLING, api);
+        assertTrue(api.deleted.isEmpty(),
+                "deleting a POLLING binding must not call deleteWebhook");
+    }
+
+    @Test
+    void blankBaseSkipsRegistrationWithoutDeleting() {
+        // No public base → can't form a URL → skip + warn, but DON'T deregister
+        // (the binding is still intended as a webhook).
+        var api = new FakeApi();
+        TelegramWebhookRegistrar.apply(7L, "tok", "sek", null, ChannelTransport.WEBHOOK, true, api);
+        assertTrue(api.set.isEmpty());
+        assertTrue(api.deleted.isEmpty());
+    }
+
+    @Test
+    void missingSecretSkipsRegistration() {
+        var api = new FakeApi();
+        TelegramWebhookRegistrar.apply(7L, "tok", "   ", BASE, ChannelTransport.WEBHOOK, true, api);
+        assertTrue(api.set.isEmpty());
+        assertTrue(api.deleted.isEmpty());
+    }
+
+    @Test
+    void registerOneReflectsApiResult() {
+        var api = new FakeApi();
+        api.setResult = false;
+        assertFalse(TelegramWebhookRegistrar.registerOne(7L, "tok", "sek", BASE, api));
+        api.setResult = true;
+        assertTrue(TelegramWebhookRegistrar.registerOne(7L, "tok", "sek", BASE, api));
+    }
+
+    // ── JCLAW-376: webhook allowed_updates must include message_reaction ──
+    //
+    // The injected FakeApi above only sees (token, url, secret); allowed_updates
+    // lives in the real default WebhookApi's SetWebhook builder call. So this
+    // test drives the production path (onBindingSaved → the default impl) against
+    // MockTelegramServer and asserts on the recorded setWebhook request body.
+
+    private MockTelegramServer mock;
+
+    @BeforeEach
+    void startMock() throws Exception {
+        mock = new MockTelegramServer();
+        mock.start();
+    }
+
+    @AfterEach
+    void stopMock() {
+        if (mock != null) mock.close();
+    }
+
+    @Test
+    void webhookRegistrationRequestsMessageReaction() {
+        String token = "wh-react-" + System.nanoTime();
+        try {
+            TelegramChannel.installForTest(token, mock.telegramUrl());
+
+            var b = new TelegramBinding();
+            b.botToken = token;
+            b.webhookSecret = "sek";
+            b.webhookBaseUrl = BASE;
+            b.transport = ChannelTransport.WEBHOOK;
+            b.enabled = true;
+
+            TelegramWebhookRegistrar.onBindingSaved(b);
+
+            // The SDK posts setWebhook as a JSON body; allowed_updates is the
+            // snake_case key carrying the requested update types.
+            String body = mock.requests().stream()
+                    .filter(r -> r.method().equalsIgnoreCase("setWebhook"))
+                    .map(MockTelegramServer.RecordedRequest::body)
+                    .findFirst()
+                    .orElseThrow(() -> new AssertionError("no setWebhook request recorded"));
+
+            assertTrue(body.contains("message_reaction"),
+                    "webhook allowed_updates must opt into message_reaction; body=" + body);
+            // Parity with the polling path's set (JCLAW-375).
+            assertTrue(body.contains("callback_query") && body.contains("edited_message"),
+                    "allowed_updates should mirror the polling set; body=" + body);
+        } finally {
+            TelegramChannel.clearForTest(token);
+        }
+    }
+}

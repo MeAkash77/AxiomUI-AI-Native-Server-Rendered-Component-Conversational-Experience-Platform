@@ -1,0 +1,894 @@
+package controllers;
+
+import com.google.gson.JsonObject;
+import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.media.Content;
+import io.swagger.v3.oas.annotations.media.Schema;
+import io.swagger.v3.oas.annotations.responses.ApiResponse;
+import memory.MemoryStoreFactory;
+import memory.MemoryVectorSettings;
+import models.CompressionMetric;
+import models.LatencyMetric;
+import org.jspecify.annotations.Nullable;
+import play.db.jpa.JPA;
+import play.libs.F;
+import play.mvc.Before;
+import play.mvc.Controller;
+import play.mvc.Util;
+import play.mvc.results.Result;
+import services.CompressionMetrics;
+import services.ConfigService;
+import services.EventLogger;
+import services.LoadTestHarness;
+import services.LoadTestRunner;
+import tools.LoadTestSleepTool;
+import utils.ApiResponses;
+import utils.AppClock;
+import utils.DbPoolStats;
+import utils.HttpFactories;
+import utils.JvmStats;
+import utils.LatencyStats;
+import utils.LogFootprint;
+
+import java.time.Instant;
+import java.time.format.DateTimeParseException;
+import java.time.temporal.ChronoUnit;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.TreeSet;
+
+import static controllers.AgentAccess.Level.OPEN;
+import static controllers.AgentAccess.Level.OPERATOR_ONLY;
+import static utils.GsonHolder.GSON;
+
+/**
+ * Runtime observability endpoints. In-memory only — histograms reset
+ * on JVM restart or via {@link #resetLatency()}. Includes an auth-gated
+ * load-test harness that uses an in-process mock LLM provider.
+ *
+ * <p>Two distinct auth guards apply, scoped via {@link Before}{@code (only=...)}
+ * filters because Play 1.x's {@code @With} annotation is class-level only
+ * (cannot be applied per-action):
+ * <ul>
+ *   <li>{@link AuthCheck#checkAuthentication} on the latency endpoints —
+ *       standard admin session check, same as the rest of the API.</li>
+ *   <li>{@link LoadtestAuthCheck#checkLoadtestAuth} on the loadtest
+ *       endpoints — loopback origin plus X-Loadtest-Auth header
+ *       containing application.secret. Required because the loadtest
+ *       pipeline has no plaintext admin password to authenticate with
+ *       after commit caf9422 (JCLAW-181).</li>
+ * </ul>
+ *
+ * <p>The interceptor methods below delegate to the canonical static
+ * checks so the gating logic stays single-sourced; this controller is
+ * just selecting which gate runs for which action.
+ */
+public class ApiMetricsController extends Controller {
+
+    private static final String KEY_PROMPTS = "prompts";
+    private static final String KEY_SINCE = "since";
+    private static final String KEY_VALUE = "value";
+    private static final String STATUS_RESET = "reset";
+
+    /** Latency-store channel for the SPA's own INP reports; never part of a chat turn. */
+    static final String BROWSER_CHANNEL = "browser";
+    static final String INP_SEGMENT = "inp";
+    // web.dev's "good" INP bound; slower reports are logged with their attribution.
+    private static final double INP_GOOD_MS = 200;
+    private static final double INP_MAX_MS = 60_000;
+
+    // NB: `only` is an allowlist, so an action omitted here is served UNAUTHENTICATED.
+    @Before(only = {"latency", "resetLatency", "latencyRows", "clearLatencyRows", "webVitals",
+            "cost", "compression", "resetCompression", "dbPool", "jvm", "logs", "purgeLogs"})
+    static void requireAdminSession() {
+        AuthCheck.checkAuthentication();
+    }
+
+    @Before(only = {"loadtest", "stopLoadtest", "cleanLoadtest"})
+    static void requireLoadtestAuth() {
+        LoadtestAuthCheck.checkLoadtestAuth();
+    }
+
+    public record StatusResponse(String status) {}
+
+    public record CostRow(String timestamp, Long agentId, String channelType, String usageJson,
+                          String modelProvider) {}
+
+    public record CostResponse(String since, List<CostRow> rows) {}
+
+    public record CompressionRow(String timestamp, String agentId, String channel, String contentType,
+                                 String algorithm, int tokensBefore, int tokensAfter, String kind, Boolean ccrHit) {}
+
+    public record CompressionResponse(String since, List<CompressionRow> rows) {}
+
+    /**
+     * Loadtest response schema descriptor (JCLAW-278). Used solely for OpenAPI
+     * spec generation — the actual response is built as a JsonObject below so
+     * the conditional fields (turnBuckets, serverSegments, provider, model)
+     * are emitted only when populated, matching the historical wire format.
+     *
+     * @param totalRequests      total requests issued in the run
+     * @param successCount       requests that returned a successful response
+     * @param errorCount         requests that errored
+     * @param wallClockMs        end-to-end wall-clock duration in ms
+     * @param avgPerRequestMs    average per-request duration in ms
+     * @param minPerRequestMs    fastest per-request duration in ms
+     * @param maxPerRequestMs    slowest per-request duration in ms
+     * @param avgTtftMs          average time-to-first-token in ms
+     * @param avgResponseTokens  mean completion-token count per request
+     * @param avgReasoningTokens mean reasoning-token count per request
+     * @param avgTokensPerSec    mean throughput (tokens/sec)
+     * @param provider           provider name when the run pinned a single
+     *                           provider; absent otherwise
+     * @param model              model id when the run pinned a single model;
+     *                           absent otherwise
+     * @param turnBuckets        per-turn breakdown buckets used by the chart UI
+     * @param serverSegments     server-side segment breakdown (queue wait,
+     *                           prompt build, etc.) when available
+     */
+    public record LoadtestResponse(int totalRequests, int successCount, int errorCount,
+                                   long wallClockMs, long avgPerRequestMs, long minPerRequestMs,
+                                   long maxPerRequestMs, long avgTtftMs, int avgResponseTokens,
+                                   int avgReasoningTokens, double avgTokensPerSec,
+                                   String provider, String model,
+                                   List<LoadTestRunner.TurnBucket> turnBuckets,
+                                   List<LoadTestRunner.SegmentBreakdown> serverSegments) {}
+
+    /** GET /api/metrics/latency — JSON snapshot of segment histograms.
+     *  Returns the raw {@code LatencyStats.snapshot()} JSON tree which has a
+     *  dynamic shape (one entry per segment); not annotated with a fixed
+     *  schema since the shape is dictated at runtime by the segments that
+     *  have observed traffic. */
+    @Operation(summary = "Snapshot latency segment histograms as JSON")
+    @AgentAccess(OPEN)
+    public static void latency() {
+        renderJSON(LatencyStats.snapshot().toString());
+    }
+
+    /** DELETE /api/metrics/latency — reset histograms. */
+    @ApiResponse(responseCode = "200", content = @Content(schema = @Schema(implementation = StatusResponse.class)))
+    @Operation(summary = "Reset latency segment histograms")
+    @AgentAccess(value = OPERATOR_ONLY, reason = "discards the operator's latency histograms")
+    public static void resetLatency() {
+        LatencyStats.reset();
+        renderJSON(GSON.toJson(new StatusResponse(STATUS_RESET)));
+    }
+
+    /**
+     * GET /api/metrics/latency/rows — windowed, persisted latency samples (JCLAW-515),
+     * aggregated server-side into the same {@code {segment: histogram}} shape the live
+     * snapshot ({@link #latency()}) emits per channel, so the Chat Performance dashboard
+     * can window (7d/30d/All via {@code since}) and filter by agent and channel — the
+     * dimensions the in-memory histogram can't provide.
+     *
+     * <p>Query params: {@code since} (ISO-8601 lower bound; default 30d), {@code agentId}
+     * and {@code channel} (optional filters). Response: {@code {"since": ISO, "channels":
+     * [...], "segments": {segment: histogramJson}}}. {@code channels} lists every channel
+     * present in the window (ignoring the channel filter) so the dropdown can populate;
+     * {@code segments} aggregates only the rows matching the channel filter — all channels
+     * when omitted, with percentiles recomputed from raw samples (not merged).
+     */
+    @Operation(summary = "Windowed latency percentiles by segment, filterable by agent and channel")
+    @AgentAccess(OPEN)
+    public static void latencyRows() {
+        Instant since = parseSinceParam(params.get(KEY_SINCE));
+        var agentIdParam = params.get("agentId");
+        var agentId = (agentIdParam != null && !agentIdParam.isBlank()) ? agentIdParam : null;
+        var channelParam = params.get("channel");
+        var channel = (channelParam != null && !channelParam.isBlank()) ? channelParam : null;
+
+        // One query: window + agent filter (NOT channel). Derive the channel list from
+        // all fetched rows so the dropdown populates; aggregate only the channel-matching
+        // subset so percentiles are recomputed from raw samples rather than merged.
+        //
+        // Scalar projection (mirrors cost() below): this is the highest-volume table
+        // over a 30-day default window, and only three columns are read per row, so
+        // select (channel, segment, latencyMs) directly instead of hydrating full
+        // LatencyMetric entities.
+        var jpql = new StringBuilder(
+                "SELECT m.channel, m.segment, m.latencyMs FROM LatencyMetric m WHERE m.createdAt >= ?1");
+        if (agentId != null) jpql.append(" AND m.agentId = ?2");
+        var query = JPA.em().createQuery(jpql.toString(), Object[].class);
+        query.setParameter(1, since);
+        if (agentId != null) query.setParameter(2, agentId);
+        var rows = query.getResultList();
+
+        var channels = new TreeSet<String>();
+        var bySegment = new LinkedHashMap<String, List<Long>>();
+        for (var r : rows) {
+            var rowChannel = (String) r[0];
+            var segment = (String) r[1];
+            var latencyMs = (Long) r[2];
+            if (rowChannel != null) channels.add(rowChannel);
+            // INP is not a stage of the chat chain, so it shows only when its channel is picked.
+            boolean included = channel == null ? !BROWSER_CHANNEL.equals(rowChannel) : channel.equals(rowChannel);
+            if (included) {
+                bySegment.computeIfAbsent(segment, _ -> new ArrayList<>()).add(latencyMs);
+            }
+        }
+
+        var resp = new JsonObject();
+        resp.addProperty(KEY_SINCE, since.toString());
+        resp.add("channels", GSON.toJsonTree(channels));
+        resp.add("segments", LatencyStats.aggregate(bySegment));
+        renderJSON(resp.toString());
+    }
+
+    /**
+     * POST /api/metrics/web-vitals — one Interaction to Next Paint report from the SPA's
+     * web-vitals reporter. The value is persisted under {@link #BROWSER_CHANNEL} so the Chat
+     * Performance dashboard windows it like any other segment. It bypasses
+     * {@link LatencyStats#record}, which would also export it as a chat-turn segment.
+     */
+    @ApiResponse(responseCode = "200", content = @Content(schema = @Schema(implementation = StatusResponse.class)))
+    @Operation(summary = "Record an Interaction to Next Paint report from the browser")
+    @AgentAccess(value = OPERATOR_ONLY, reason = "records the operator's own browser timings")
+    public static void webVitals() {
+        var body = JsonBodyReader.readJsonBody();
+        if (body == null || !"INP".equals(JsonBodyReader.optString(body, "name", true))
+                || !body.has(KEY_VALUE) || body.get(KEY_VALUE).isJsonNull()) {
+            ApiResponses.error(400, ApiResponses.INVALID_REQUEST, "Expected an INP report with a value");
+            return;
+        }
+        // Every field is validated before the save: a 400 Result does not roll the save back.
+        double value = readMs(body, KEY_VALUE);
+        double inputDelay = readMs(body, "inputDelay");
+        double processing = readMs(body, "processingDuration");
+        double presentation = readMs(body, "presentationDelay");
+        if (value > INP_MAX_MS) {
+            ApiResponses.error(400, ApiResponses.INVALID_REQUEST, "'value' is out of range");
+            return;
+        }
+        long ms = Math.round(value);
+        // Saved in this request's transaction rather than via LatencyMetricRecorder: a session
+        // sends a handful, and that queue exists to keep saves off the chat-turn path.
+        var row = new LatencyMetric();
+        row.channel = BROWSER_CHANNEL;
+        row.segment = INP_SEGMENT;
+        row.latencyMs = ms;
+        row.save();
+        if (value > INP_GOOD_MS) {
+            EventLogger.warn(BROWSER_CHANNEL, slowInpMessage(ms,
+                    JsonBodyReader.optString(body, "route", true),
+                    JsonBodyReader.optString(body, "interactionType", true),
+                    JsonBodyReader.optString(body, "interactionTarget", true),
+                    inputDelay, processing, presentation));
+        }
+        renderJSON(GSON.toJson(new StatusResponse("recorded")));
+    }
+
+    /** The event-log line for an INP report slower than the "good" bound; client strings are clipped. */
+    @Util
+    public static String slowInpMessage(long ms, @Nullable String route, @Nullable String interactionType,
+                                        @Nullable String target, double inputDelay, double processing,
+                                        double presentation) {
+        return "INP %d ms on %s: %s on %s (input %d, processing %d, presentation %d ms)".formatted(ms,
+                clip(route, 120), clip(interactionType, 16), clip(target, 200),
+                Math.round(inputDelay), Math.round(processing), Math.round(presentation));
+    }
+
+    /** A non-negative millisecond field; absent reads as 0, anything else non-numeric is a 400. */
+    private static double readMs(JsonObject body, String key) {
+        if (!body.has(key) || body.get(key).isJsonNull()) return 0;
+        double v;
+        try {
+            v = body.get(key).getAsDouble();
+        } catch (Exception _) {
+            v = Double.NaN;
+        }
+        if (!Double.isFinite(v) || v < 0) {
+            ApiResponses.error(400, ApiResponses.INVALID_REQUEST, "Invalid duration for '" + key + "'");
+        }
+        return v;
+    }
+
+    private static String clip(@Nullable String s, int max) {
+        if (s == null) return "?";
+        return s.length() > max ? s.substring(0, max) + "…" : s;
+    }
+
+    /** DELETE /api/metrics/latency/rows — clear the persisted latency time-series (JCLAW-515). */
+    @ApiResponse(responseCode = "200", content = @Content(schema = @Schema(implementation = StatusResponse.class)))
+    @Operation(summary = "Clear persisted latency metric rows")
+    @AgentAccess(value = OPERATOR_ONLY, reason = "discards the operator's persisted latency rows")
+    public static void clearLatencyRows() {
+        LatencyMetric.deleteAll();
+        renderJSON(GSON.toJson(new StatusResponse(STATUS_RESET)));
+    }
+
+    /**
+     * GET /api/metrics/compression — raw compression-metric rows since a
+     * timestamp, for client-side aggregation in the Chat Compression dashboard
+     * (mirrors {@link #cost()}). The frontend filters by agent/channel and rolls
+     * up savings, ratios, algorithm usage, CCR hit rate, and alerts over the rows.
+     */
+    @ApiResponse(responseCode = "200", content = @Content(schema = @Schema(implementation = CompressionResponse.class)))
+    @Operation(summary = "List raw compression-metric rows since a timestamp for client-side aggregation")
+    @AgentAccess(OPEN)
+    public static void compression() {
+        Instant since = parseSinceParam(params.get(KEY_SINCE));
+        List<CompressionMetric> events = CompressionMetric.<CompressionMetric>find(
+                "createdAt >= ?1 order by createdAt desc", since).fetch();
+        var rows = new ArrayList<CompressionRow>(events.size());
+        for (var m : events) {
+            rows.add(new CompressionRow(
+                    m.createdAt.toString(), m.agentId, m.channel, m.contentType, m.algorithm,
+                    m.tokensBefore, m.tokensAfter, m.kind.name(), m.ccrHit));
+        }
+        renderJSON(GSON.toJson(new CompressionResponse(since.toString(), rows)));
+    }
+
+    /**
+     * JCLAW-772: current HikariCP pool occupancy. Added because nothing exposed the pool,
+     * so "is a connection pinned for the duration of a stream?" could not be answered from
+     * a running install at all. {@code awaiting} is the field that signals exhaustion —
+     * a sustained non-zero value means callers are blocking on {@code db.pool.timeout}.
+     */
+    @ApiResponse(responseCode = "200", content = @Content(schema = @Schema(implementation = DbPoolStats.class)))
+    @Operation(summary = "Current HikariCP connection-pool occupancy (active, idle, total, awaiting, max)")
+    @AgentAccess(OPEN)
+    public static void dbPool() {
+        var stats = DbPoolStats.snapshot();
+        if (stats.isEmpty()) {
+            ApiResponses.error(503, ApiResponses.POOL_UNAVAILABLE,
+                    "The configured DataSource is not a HikariCP pool, so occupancy cannot be read.");
+            throw ApiResponses.unreachable();
+        }
+        renderJSON(GSON.toJson(stats.get()));
+    }
+
+    /**
+     * JCLAW-1057: JVM runtime state for the Maintenance panel. Nothing exposed heap,
+     * non-heap or process RSS before this, so "how much memory is this instance actually
+     * using?" could not be answered from a running install without a shell.
+     *
+     * <p>Always renders: unlike the pool, every figure here degrades to null or -1
+     * individually rather than the snapshot as a whole becoming unavailable.
+     */
+    @ApiResponse(responseCode = "200", content = @Content(schema = @Schema(implementation = JvmStats.class)))
+    @Operation(summary = "JVM runtime state (heap, non-heap, RSS, GC, threads, uptime, CPU)")
+    @AgentAccess(OPEN)
+    public static void jvm() {
+        renderJSON(GSON.toJson(JvmStats.snapshot()));
+    }
+
+    /**
+     * JCLAW-1057: disk taken by {@code logs/}. The live file is capped by the rollover
+     * and was never the problem; the archives are, and nothing surfaced them — 97 MB
+     * across 70 unpruned files had accumulated before the retention fix, invisible from
+     * the UI.
+     */
+    @ApiResponse(responseCode = "200", content = @Content(schema = @Schema(implementation = LogFootprint.class)))
+    @Operation(summary = "Disk used by the log directory (live file, archives, total)")
+    @AgentAccess(OPEN)
+    public static void logs() {
+        renderJSON(GSON.toJson(LogFootprint.snapshot()));
+    }
+
+    /**
+     * DELETE /api/metrics/logs — remove the rolled-over archives.
+     *
+     * <p>Retention already deletes them after 30 days; this is for reclaiming the disk
+     * now, which matters on an instance that accumulated a backlog before the retention
+     * fix. Only archives go — see {@link LogFootprint#purgeArchives()} for why the live
+     * file is excluded rather than merely skipped by name.
+     */
+    @ApiResponse(responseCode = "200", content = @Content(schema = @Schema(implementation = LogFootprint.Purged.class)))
+    @Operation(summary = "Delete rolled-over log archives, keeping the current log file")
+    @AgentAccess(value = OPERATOR_ONLY,
+            reason = "deletes rolled-over log archives -- the record of what an agent did")
+    public static void purgeLogs() {
+        renderJSON(GSON.toJson(LogFootprint.purgeArchives()));
+    }
+
+    /** DELETE /api/metrics/compression — clear all recorded compression metrics. */
+    @ApiResponse(responseCode = "200", content = @Content(schema = @Schema(implementation = StatusResponse.class)))
+    @Operation(summary = "Reset (delete) all compression metrics")
+    @AgentAccess(value = OPERATOR_ONLY, reason = "discards the operator's compression metrics")
+    public static void resetCompression() {
+        CompressionMetrics.reset();
+        renderJSON(GSON.toJson(new StatusResponse(STATUS_RESET)));
+    }
+
+    /**
+     * GET /api/metrics/cost — raw per-turn cost rows for client-side aggregation.
+     *
+     * <p>Returns one row per assistant message with embedded {@code usageJson}
+     * + agent and channel context. The frontend aggregates across rows via the
+     * existing {@code computeUsageCostBreakdown} helpers in
+     * {@code utils/usage-cost.ts} — keeps cost math single-sourced (already
+     * battle-tested by the conversation-detail per-turn display).
+     *
+     * <p>Query params:
+     * <ul>
+     *   <li>{@code since} — ISO-8601 instant lower bound (inclusive). Default:
+     *       30 days before now. The frontend's window selector (7d/30d/all-time)
+     *       drives this.</li>
+     *   <li>{@code agentId}, {@code channelType} — optional server-side filters.
+     *       The dashboard does interactive filter changes client-side from a
+     *       single window load, so these are only used by callers that want a
+     *       narrower payload (e.g. CSV export tooling). Both omitted is the
+     *       common case.</li>
+     * </ul>
+     *
+     * <p>Response shape: {@code {"since": "ISO", "rows": [{"timestamp": "ISO",
+     * "agentId": N, "channelType": "...", "usageJson": "{...}"}, ...]}}.
+     * {@code usageJson} is the original Message column verbatim so the
+     * frontend's TS types ({@code MessageUsage}) deserialize without
+     * conversion; carries every pricing/token field the cost helpers need.
+     *
+     * <p>Only rows with non-null {@code usageJson} are returned — user and
+     * tool messages have no usage and would just be filtered out client-side
+     * anyway.
+     */
+    @ApiResponse(responseCode = "200", content = @Content(schema = @Schema(implementation = CostResponse.class)))
+    @Operation(summary = "List per-turn cost rows since a timestamp for client-side aggregation")
+    @AgentAccess(OPEN)
+    public static void cost() {
+        Instant since = parseSinceParam(params.get(KEY_SINCE));
+        Long agentId = parseAgentIdParam(params.get("agentId"));
+        var channelTypeParam = params.get("channelType");
+        String channelType = (channelTypeParam != null && !channelTypeParam.isBlank())
+                ? channelTypeParam : null;
+
+        // Build JPQL with positional params. Hibernate's optimizer collapses
+        // the JOIN to the existing idx_message_conversation index plus the
+        // conversation row lookup; for operator-scale traffic the planner is
+        // fast enough that an explicit Message.created_at index isn't needed.
+        //
+        // JCLAW-280: project the conversation's effective model provider via
+        // COALESCE(conversation.modelProviderOverride, agent.modelProvider).
+        // The cost dashboard partitions rows into per-token vs subscription
+        // subsections by reading each provider's modality from ProviderRegistry.
+        var jpql = new StringBuilder(
+                "SELECT m.createdAt, c.agent.id, c.channelType, m.usageJson, "
+                        + "COALESCE(c.modelProviderOverride, c.agent.modelProvider) "
+                        + "FROM Message m JOIN m.conversation c "
+                        + "WHERE m.createdAt >= ?1 "
+                        + "AND m.usageJson IS NOT NULL");
+        int paramIdx = 2;
+        Integer agentParamIdx = null;
+        Integer channelParamIdx = null;
+        if (agentId != null) {
+            jpql.append(" AND c.agent.id = ?").append(paramIdx);
+            agentParamIdx = paramIdx;
+            paramIdx++;
+        }
+        if (channelType != null) {
+            jpql.append(" AND c.channelType = ?").append(paramIdx);
+            channelParamIdx = paramIdx;
+            // paramIdx not incremented — no further branches consume it.
+        }
+        jpql.append(" ORDER BY m.createdAt ASC");
+
+        var query = JPA.em().createQuery(jpql.toString(), Object[].class);
+        query.setParameter(1, since);
+        if (agentParamIdx != null) query.setParameter(agentParamIdx, agentId);
+        if (channelParamIdx != null) query.setParameter(channelParamIdx, channelType);
+
+        var results = query.getResultList();
+
+        var rows = new ArrayList<CostRow>(results.size());
+        for (var r : results) {
+            rows.add(new CostRow(
+                    ((Instant) r[0]).toString(),
+                    (Long) r[1],
+                    (String) r[2],
+                    (String) r[3],
+                    (String) r[4]));
+        }
+
+        renderJSON(GSON.toJson(new CostResponse(since.toString(), rows)));
+    }
+
+    /** Parsed loadtest request — collapses the body-parsing branch tower into one record carrier. */
+    private record LoadtestInput(int concurrency, int turns, int ttftMs, int tokensPerSecond,
+                                 int responseTokens, int simulatedToolCalls, int toolSleepMs,
+                                 boolean compress, @Nullable String provider, @Nullable String model,
+                                 boolean real, boolean toolAgent, @Nullable String userMessage,
+                                 List<String> prompts, @Nullable String agentName) {}
+
+    /**
+     * POST /api/metrics/loadtest — run a synchronous load test against
+     * /api/chat/stream using the in-process mock provider.
+     *
+     * <p>Request body (all fields optional, shown with defaults):
+     * <pre>{
+     *   "concurrency": 10,
+     *   "turns": 5,
+     *   "ttftMs": 100,
+     *   "tokensPerSecond": 50,
+     *   "responseTokens": 40,
+     *   "compress": false
+     * }</pre>
+     *
+     * <p>{@code turns} is the number of sequential chat requests each worker
+     * sends *within the same conversation* — turn 1 starts a fresh conversation,
+     * turn 2..N reuse the {@code conversationId} the server returned for turn
+     * 1. This shape exercises growing-history behavior (system-prompt
+     * assembly cost, provider prompt-cache hits, model recall on repeated
+     * questions) under load. To simulate N independent fresh-conversation
+     * starts instead, set {@code turns=1} and crank {@code concurrency}.
+     *
+     * <p>{@code prompts} (optional) is an array of per-turn user messages.
+     * When provided, turn t sends {@code prompts[t]} instead of replaying
+     * {@code userMessage}; the array must contain at least {@code turns}
+     * entries. Mutually exclusive with a non-blank {@code userMessage}. Use
+     * to drive a varied question sequence inside a growing conversation —
+     * separates "model recall on repeated questions" (single-message mode)
+     * from "model behavior across a topic flow" (varied mode).
+     *
+     * <p>{@code compress=true} adds {@code Accept-Encoding: br, gzip} to each
+     * harness request so the pipeline's {@link io.netty.handler.codec.http.HttpContentCompressor}
+     * (when wired) actually engages on the response. Without it, Java's
+     * {@code HttpClient} sends no Accept-Encoding and the compressor passes
+     * traffic through as identity — so loadtest results reflect the controller
+     * hot path, not the encoding path.
+     *
+     * <p>Returns the aggregate counts + wall-clock. Use GET
+     * /api/metrics/latency afterwards for per-segment histograms.
+     */
+    @SuppressWarnings("java:S2259")
+    @ApiResponse(responseCode = "200", content = @Content(schema = @Schema(implementation = LoadtestResponse.class)))
+    @AgentAccess(value = OPERATOR_ONLY, reason = "drives a synthetic load sweep -- resource and cost abuse")
+    public static void loadtest() {
+        var input = parseLoadtestInput();
+        validateLoadtestInput(input);
+        enableMockProviderIfNeeded(input.real());
+
+        // Auto-bump the LLM dispatcher cap if --concurrency would saturate it.
+        // The default 64-per-host (or auto-tuned 8*cores) is sized for steady
+        // production traffic; loadtest at higher concurrency against one host
+        // (mock or single real provider) would otherwise queue at the
+        // dispatcher and inflate the ttft segment by the queue time. Snapshot
+        // here, restore in finally so the cap returns to its operator-tuned
+        // value after the test.
+        int origPerHost = HttpFactories.llmDispatcherMaxRequestsPerHost();
+        int origMax = HttpFactories.llmDispatcherMaxRequests();
+        boolean dispatcherBumped = input.concurrency() > origPerHost;
+        if (dispatcherBumped) {
+            int newPerHost = input.concurrency() + 16;
+            int newMax = Math.max(origMax, newPerHost * 2);
+            HttpFactories.setLlmDispatcherCapTransient(newPerHost, newMax);
+        }
+
+        // A loadtest measures the chat turn. Recall embeds the user's message on every turn,
+        // synchronously, before the chat call starts — and that embedding goes to a provider
+        // with its own concurrency limit, so at scale the measurement describes that provider
+        // rather than this one. Measured over 50-turn runs with cold caches: 107 ms/turn at
+        // c=10 against 1115 ms at c=100, linear in offered load, while the JVM sat idle (four
+        // lock-contention events, no CPU saturation). Disabled for the run and restored after;
+        // recall still runs on its keyword leg, so the retrieval path stays exercised.
+        //
+        // An in-memory override, not a config write: ConfigService.set joins this request's
+        // transaction, so persisting the flag held a write lock on CONFIG for the whole run and
+        // the next config write in the process timed out against it. The store reads the value
+        // once into a final field at construction, so the singleton is dropped on both edges.
+        boolean vectorWasEnabled = MemoryVectorSettings.enabled();
+        if (vectorWasEnabled) {
+            MemoryVectorSettings.setTransientOverride(false);
+            MemoryStoreFactory.reset();
+        }
+
+        long toolInvocationsBefore = LoadTestSleepTool.invocations();
+        try {
+            var result = LoadTestRunner.run(new LoadTestRunner.Request(
+                    input.concurrency(), input.turns(), input.compress(),
+                    new LoadTestHarness.Scenario(input.ttftMs(), input.tokensPerSecond(), input.responseTokens(),
+                            input.simulatedToolCalls(), input.toolSleepMs()),
+                    input.real(), input.toolAgent(), input.provider(), input.model(), input.userMessage(), input.prompts(),
+                    input.agentName()));
+
+            long toolInvocations = LoadTestSleepTool.invocations() - toolInvocationsBefore;
+            teardownLoadtest(input);
+            renderJSON(GSON.toJson(buildLoadtestResponse(result, input, toolInvocations)));
+        } catch (Result r) {
+            throw r;
+        } catch (Exception e) {
+            teardownLoadtest(input);
+            ApiResponses.error(500, ApiResponses.INTERNAL_ERROR, "Load test failed: " + e.getMessage());
+        } finally {
+            if (dispatcherBumped) {
+                HttpFactories.setLlmDispatcherCapTransient(origPerHost, origMax);
+            }
+            if (vectorWasEnabled) {
+                MemoryVectorSettings.setTransientOverride(null);
+                MemoryStoreFactory.reset();
+            }
+        }
+    }
+
+    /**
+     * Undo per-run registration after a loadtest: stop the mock harness (mock
+     * runs) or unregister {@code loadtest_sleep} (tools runs). A real non-tool
+     * run leaves nothing to undo.
+     */
+    private static void teardownLoadtest(LoadtestInput input) {
+        if (!input.real()) {
+            LoadTestHarness.stop();
+            LoadTestRunner.disable();
+        } else if (input.toolAgent()) {
+            LoadTestRunner.disable();  // flips loadtest-mock.enabled=false → unregisters the tool
+        }
+        // A run leaves conversations, messages, event rows and latency samples behind, and
+        // until JCLAW-942 that sweep only happened when someone passed --clean. The samples
+        // are the reason it now runs every time: they feed the Chat Performance dashboard,
+        // which is meant to describe the operator's own agents, and one c=100 run wrote
+        // 60,436 of them against 146 from real chat. Safe here — the run's token and cost
+        // aggregation reads those messages before this point.
+        LoadTestRunner.cleanupConversations();
+    }
+
+    @SuppressWarnings("java:S2259")
+    private static LoadtestInput parseLoadtestInput() {
+        var body = JsonBodyReader.readJsonBody();
+        int concurrency = readInt(body, "concurrency", 10);
+        int turns = readInt(body, "turns", 5);
+        int ttftMs = readInt(body, "ttftMs", 100);
+        int tokensPerSecond = readInt(body, "tokensPerSecond", 50);
+        int responseTokens = readInt(body, "responseTokens", 40);
+        int simulatedToolCalls = readInt(body, "simulatedToolCalls", 0);
+        int toolSleepMs = readInt(body, "toolSleepMs", 200);
+        boolean compress = readBool(body, "compress", false);
+
+        // Real-provider mode is implied by both `provider` and `model` being
+        // set (non-blank). Operators don't pass a separate `real` flag — its
+        // joint presence is the signal. Mismatched half-set state is rejected
+        // below so callers can't accidentally fall through to mock mode by
+        // forgetting one of the two fields.
+        String provider = readString(body, "provider", null);
+        String model = readString(body, "model", null);
+        boolean providerSet = provider != null && !provider.isBlank();
+        boolean modelSet = model != null && !model.isBlank();
+        if (providerSet != modelSet) {
+            ApiResponses.error(400, ApiResponses.INVALID_REQUEST, "provider and model must be set together (or both omitted for mock mode)");
+        }
+        boolean real = providerSet;  // both set ⇔ real-provider run
+        // The single-tool benchmark twin (__loadtest_tools__): exposes
+        // loadtest_sleep to a real model. Requires real mode — a real model
+        // must decide to call the tool (there is no forced tool_choice).
+        boolean toolAgent = readBool(body, "toolAgent", false);
+        if (toolAgent && !real) {
+            ApiResponses.error(400, ApiResponses.INVALID_REQUEST,
+                    "toolAgent requires a real provider (set provider and model)");
+        }
+        // Optional per-run user message override. Default lives in
+        // LoadTestRunner so the constant has one home.
+        String userMessage = readString(body, "userMessage", null);
+        var prompts = parsePromptsField(body, userMessage);
+
+        // Drive an existing agent instead of a benchmark twin, so the run ships
+        // a real tool array. Both twins pin their tool surface by name, which is
+        // right for model-speed benchmarks and useless for measuring anything
+        // about the tools array itself (JCLAW-840).
+        String agentName = readString(body, "agentName", null);
+        if (agentName != null && !agentName.isBlank() && !real) {
+            ApiResponses.error(400, ApiResponses.INVALID_REQUEST,
+                    "agentName requires a real provider (set provider and model)");
+        }
+        if (agentName != null && !agentName.isBlank() && toolAgent) {
+            ApiResponses.error(400, ApiResponses.INVALID_REQUEST,
+                    "agentName and toolAgent are mutually exclusive");
+        }
+
+        return new LoadtestInput(concurrency, turns, ttftMs, tokensPerSecond, responseTokens,
+                simulatedToolCalls, toolSleepMs, compress, provider, model, real, toolAgent, userMessage, prompts,
+                agentName);
+    }
+
+    /**
+     * Optional varied-prompts mode: an array of per-turn user messages.
+     * When present, turn t sends prompts[t] instead of replaying
+     * userMessage. Mutually exclusive with a non-blank userMessage so the
+     * wire format never carries two conflicting per-turn message
+     * strategies.
+     */
+    @SuppressWarnings("java:S2259")
+    private static List<String> parsePromptsField(@Nullable JsonObject body, @Nullable String userMessage) {
+        // LoadTestRunner treats null and empty identically (`!= null && !isEmpty()` guard
+        // at the consumer); returning an empty list rather than null keeps the contract
+        // predictable for any caller that doesn't replicate that guard.
+        if (body == null || !body.has(KEY_PROMPTS) || body.get(KEY_PROMPTS).isJsonNull()) return List.of();
+        List<String> prompts;
+        try {
+            var arr = body.getAsJsonArray(KEY_PROMPTS);
+            prompts = new ArrayList<>(arr.size());
+            for (var el : arr) prompts.add(el.getAsString());
+        } catch (Exception _) {
+            ApiResponses.error(400, ApiResponses.INVALID_REQUEST, "Invalid 'prompts' — must be an array of strings");
+            return List.of(); // unreachable — error() throws
+        }
+        if (userMessage != null && !userMessage.isBlank()) {
+            ApiResponses.error(400, ApiResponses.INVALID_REQUEST, "userMessage and prompts are mutually exclusive");
+        }
+        return prompts;
+    }
+
+    @SuppressWarnings("java:S2259")
+    private static void validateLoadtestInput(LoadtestInput input) {
+        int maxConcurrency = ConfigService.getInt("provider.loadtest-mock.maxConcurrency", 100);
+        int maxTurns = ConfigService.getInt("provider.loadtest-mock.maxTurns", 50);
+        if (input.concurrency() < 1 || input.concurrency() > maxConcurrency) {
+            ApiResponses.error(400, ApiResponses.INVALID_REQUEST, "concurrency must be between 1 and " + maxConcurrency);
+        }
+        if (input.turns() < 1 || input.turns() > maxTurns) {
+            ApiResponses.error(400, ApiResponses.INVALID_REQUEST, "turns must be between 1 and " + maxTurns);
+        }
+        // Empty means "no varied-prompts mode" (parsePromptsField normalizes an
+        // absent field to List.of(), not null) — only a non-empty array must
+        // cover every turn. Checking size on the empty default rejected every
+        // promptless run with a bogus 400 (regression from the S2259 cleanup).
+        if (input.prompts() != null && !input.prompts().isEmpty()
+                && input.prompts().size() < input.turns()) {
+            ApiResponses.error(400, ApiResponses.INVALID_REQUEST, "prompts array has " + input.prompts().size() + " entries but turns=" + input.turns()
+                    + "; provide at least one prompt per turn");
+        }
+    }
+
+    /**
+     * Enable the mock provider in its own transaction so it's committed
+     * before the loadtest requests fire (they use separate connections).
+     * Skip in real-provider mode — that path uses an existing registered
+     * provider seeded by DefaultConfigJob or the operator at boot.
+     */
+    @SuppressWarnings("java:S2259")
+    private static void enableMockProviderIfNeeded(boolean real) {
+        if (real) return;
+        try {
+            JPA.withTransaction("default", false,
+                    (F.Function0<Void>) () -> {
+                        ConfigService.setWithSideEffects("provider.loadtest-mock.enabled", "true");
+                        return null;
+                    });
+        } catch (Throwable t) {
+            // JCLAW-674: Throwable is REQUIRED here, not over-broad — Play's
+            // JPA.withTransaction(...) declares `throws Throwable`, so narrowing
+            // to Exception does not compile. The 500 is the right response for
+            // any failure enabling the mock provider.
+            ApiResponses.error(500, ApiResponses.INTERNAL_ERROR, "Failed to enable mock provider: " + t.getMessage());
+        }
+    }
+
+    private static JsonObject buildLoadtestResponse(LoadTestRunner.Result result, LoadtestInput input,
+                                                    long toolInvocations) {
+        var out = new JsonObject();
+        out.addProperty("totalRequests", result.totalRequests());
+        out.addProperty("successCount", result.successCount());
+        out.addProperty("errorCount", result.errorCount());
+        out.addProperty("wallClockMs", result.wallClockMs());
+        out.addProperty("avgPerRequestMs", result.avgPerRequestMs());
+        out.addProperty("minPerRequestMs", result.minPerRequestMs());
+        out.addProperty("maxPerRequestMs", result.maxPerRequestMs());
+        // Per-run averages — useful in both modes. For mock runs they
+        // confirm the harness honored the requested scenario; for real-
+        // provider runs they're the only reliable view of provider
+        // performance (the mock-shape ttftMs / tokensPerSecond inputs are
+        // ignored by the runner once it routes to a real provider).
+        out.addProperty("avgTtftMs", result.avgTtftMs());
+        out.addProperty("avgResponseTokens", result.avgResponseTokens());
+        // Reasoning tokens are surfaced separately so cross-model
+        // comparisons see the full picture: a "70 visible / 3000 reasoning"
+        // model is doing very different work from a "70 visible / 0
+        // reasoning" model even when their visible-token rates match.
+        out.addProperty("avgReasoningTokens", result.avgReasoningTokens());
+        // What the run cost, while the rows it is computed from still exist — teardown
+        // deletes them, which is why this never reached the Chat Cost dashboard (JCLAW-942).
+        // costUsd is the provider's own figure summed across turns; 0 when the provider
+        // reported none (every mock run, and providers that do not price per call).
+        out.addProperty("promptTokens", result.promptTokens());
+        out.addProperty("completionTokens", result.completionTokens());
+        out.addProperty("costUsd", result.costUsd());
+        out.addProperty("avgTokensPerSec", round1(result.avgTokensPerSec()));
+        // Provider/model are echoed only in real-provider mode. Their
+        // presence (vs absence) IS the run-mode signal — no separate
+        // `realProvider` field needed.
+        if (input.real()) {
+            out.addProperty("provider", input.provider());
+            out.addProperty("model", input.model());
+        }
+        // Tools benchmark: how often the real model actually invoked
+        // loadtest_sleep. No forced tool_choice, so the call is prompt-driven —
+        // toolCallsPerTurn near 1.0 means the model complied on (nearly) every
+        // turn; a low value means the metric is diluted by no-tool turns.
+        if (input.toolAgent()) {
+            out.addProperty("toolInvocations", toolInvocations);
+            long expectedTurns = (long) input.turns() * input.concurrency();
+            out.addProperty("toolCallsPerTurn",
+                    expectedTurns == 0 ? 0.0 : round1((double) toolInvocations / expectedTurns));
+        }
+        // Per-turn breakdown only when turns > 1 (LoadTestRunner returns
+        // null otherwise). Renders as an array of {turn, count, ttftMeanMs,
+        // ttftP50Ms, ...} objects, ordered by turn position.
+        if (result.turnBuckets() != null) {
+            out.add("turnBuckets", GSON.toJsonTree(result.turnBuckets()));
+        }
+        // Server-side segment breakdown for this run only — see
+        // LoadTestRunner.SegmentBreakdown. Always present (single-turn
+        // runs still benefit from the segment view).
+        if (result.serverSegments() != null && !result.serverSegments().isEmpty()) {
+            out.add("serverSegments", GSON.toJsonTree(result.serverSegments()));
+        }
+        return out;
+    }
+
+    /** DELETE /api/metrics/loadtest — stop the embedded mock provider. */
+    @ApiResponse(responseCode = "200", content = @Content(schema = @Schema(implementation = StatusResponse.class)))
+    @AgentAccess(value = OPERATOR_ONLY, reason = "stops the operator's load-test harness mid-run")
+    public static void stopLoadtest() {
+        LoadTestHarness.stop();
+        renderJSON(GSON.toJson(new StatusResponse("stopped")));
+    }
+
+    /** DELETE /api/metrics/loadtest/data — delete loadtest conversations, messages, and events. */
+    @SuppressWarnings("java:S2259")
+    @ApiResponse(responseCode = "200", content = @Content(schema = @Schema(implementation = StatusResponse.class)))
+    @AgentAccess(value = OPERATOR_ONLY, reason = "bulk-deletes the conversations a load test left behind")
+    public static void cleanLoadtest() {
+        LoadTestRunner.cleanupConversations();
+        LoadTestRunner.forgetMockBreaker();
+        renderJSON(GSON.toJson(new StatusResponse("cleaned")));
+    }
+
+    @SuppressWarnings("java:S2259")
+    private static int readInt(@Nullable JsonObject body, String key, int defaultValue) {
+        if (body == null || !body.has(key) || body.get(key).isJsonNull()) return defaultValue;
+        try {
+            return body.get(key).getAsInt();
+        } catch (Exception _) {
+            ApiResponses.error(400, ApiResponses.INVALID_REQUEST, "Invalid integer for '" + key + "'");
+            return defaultValue; // unreachable
+        }
+    }
+
+    @SuppressWarnings("java:S2259")
+    private static boolean readBool(@Nullable JsonObject body, String key, boolean defaultValue) {
+        if (body == null || !body.has(key) || body.get(key).isJsonNull()) return defaultValue;
+        try {
+            return body.get(key).getAsBoolean();
+        } catch (Exception _) {
+            ApiResponses.error(400, ApiResponses.INVALID_REQUEST, "Invalid boolean for '" + key + "'");
+            return defaultValue; // unreachable
+        }
+    }
+
+    @SuppressWarnings("java:S2259")
+    private static @Nullable String readString(@Nullable JsonObject body, String key, @Nullable String defaultValue) {
+        if (body == null || !body.has(key) || body.get(key).isJsonNull()) return defaultValue;
+        try {
+            return body.get(key).getAsString();
+        } catch (Exception _) {
+            ApiResponses.error(400, ApiResponses.INVALID_REQUEST, "Invalid string for '" + key + "'");
+            return defaultValue; // unreachable
+        }
+    }
+
+    /** Round to one decimal so tokens-per-second prints as 47.3 instead of 47.27272727. */
+    private static double round1(double v) {
+        return Math.round(v * 10.0) / 10.0;
+    }
+
+    @SuppressWarnings("java:S2259")
+    private static Instant parseSinceParam(@Nullable String sinceParam) {
+        if (sinceParam == null || sinceParam.isBlank()) {
+            return AppClock.now().minus(30, ChronoUnit.DAYS);
+        }
+        try {
+            return Instant.parse(sinceParam);
+        } catch (DateTimeParseException _) {
+            ApiResponses.error(400, ApiResponses.INVALID_REQUEST, "Invalid 'since' — must be ISO-8601 instant (e.g. 2026-04-10T00:00:00Z)");
+            throw ApiResponses.unreachable();
+        }
+    }
+
+    @SuppressWarnings("java:S2259")
+    private static @Nullable Long parseAgentIdParam(@Nullable String agentIdParam) {
+        if (agentIdParam == null || agentIdParam.isBlank()) return null;
+        try {
+            return Long.parseLong(agentIdParam);
+        } catch (NumberFormatException _) {
+            ApiResponses.error(400, ApiResponses.INVALID_REQUEST, "Invalid 'agentId' — must be numeric");
+            throw ApiResponses.unreachable();
+        }
+    }
+}

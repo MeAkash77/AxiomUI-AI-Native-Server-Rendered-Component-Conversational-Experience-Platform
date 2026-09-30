@@ -1,0 +1,529 @@
+import com.github.kagkarlsson.scheduler.ScheduledExecution;
+import com.github.kagkarlsson.scheduler.SchedulerClient;
+import com.github.kagkarlsson.scheduler.task.Execution;
+import com.github.kagkarlsson.scheduler.task.TaskInstance;
+import jobs.BootConsistencyCheck;
+import models.Agent;
+import models.EventLog;
+import models.Task;
+import models.TaskRun;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import play.db.DB;
+import play.db.jpa.JPA;
+import play.test.Fixtures;
+import play.test.UnitTest;
+import services.EventLogger;
+import services.TaskExecutionHandler;
+import services.TaskRunRegistry;
+
+import java.lang.reflect.Method;
+import java.lang.reflect.Proxy;
+import java.sql.Timestamp;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Set;
+
+/**
+ * Functional test for {@link BootConsistencyCheck#sweep}. Drives
+ * the sweep directly with a recording {@link SchedulerClient} stub
+ * to verify:
+ *
+ * <ul>
+ *   <li>Orphan PENDING Tasks (no scheduled_tasks row) get
+ *       registered.</li>
+ *   <li>PENDING Tasks that are already in scheduled_tasks do
+ *       NOT get re-registered (no duplicate fires).</li>
+ *   <li>Terminal-status Tasks (RUNNING / COMPLETED / FAILED /
+ *       CANCELLED) are skipped — the sweep only acts on PENDING.</li>
+ * </ul>
+ *
+ * <p>Stub pattern: dynamic Proxy with response shape configurable
+ * per test (which "already-scheduled" rows to surface in
+ * {@code fetchScheduledExecutionsForTask}). Same approach the
+ * other Task-related tests use, generalised to also serve as the
+ * "already-scheduled" data source.
+ */
+class BootConsistencyCheckTest extends UnitTest {
+
+    private Agent agent;
+    private RecordingSchedulerStub stub;
+
+    @BeforeEach
+    void setup() {
+        Fixtures.deleteDatabase();
+        agent = persistAgent();
+        stub = new RecordingSchedulerStub();
+        services.TaskSchedulingServiceTestHooks.setSchedulerClient(stub.proxy());
+    }
+
+    @AfterEach
+    void tearDown() {
+        services.TaskSchedulingServiceTestHooks.reset();
+    }
+
+    @Test
+    void orphanPendingTasksGetRegistered() {
+        // Two PENDING Tasks with no scheduled_tasks rows — both
+        // should get registered by the sweep.
+        var orphanA = persistTask("orphan-a", Task.Status.PENDING);
+        var orphanB = persistTask("orphan-b", Task.Status.PENDING);
+
+        int registered = BootConsistencyCheck.sweep(stub.proxy());
+
+        assertEquals(2, registered, "both orphans should register");
+        assertEquals(2, stub.schedules.size(),
+                "TaskSchedulingService.register should have called schedule() twice");
+
+        var scheduledIds = stub.schedules.stream()
+                .map(s -> s.instance.getId()).toList();
+        assertTrue(scheduledIds.contains(orphanA.id.toString()),
+                "orphan-a registered, got: " + scheduledIds);
+        assertTrue(scheduledIds.contains(orphanB.id.toString()),
+                "orphan-b registered, got: " + scheduledIds);
+    }
+
+    @Test
+    void alreadyScheduledTasksAreNotReRegistered() {
+        var alreadyScheduled = persistTask("already-scheduled", Task.Status.PENDING);
+        var orphan = persistTask("orphan", Task.Status.PENDING);
+
+        // Tell the stub: the already-scheduled Task has a row.
+        stub.scheduledIds.add(alreadyScheduled.id.toString());
+
+        int registered = BootConsistencyCheck.sweep(stub.proxy());
+
+        assertEquals(1, registered,
+                "only the orphan should register; the already-scheduled is skipped");
+        assertEquals(1, stub.schedules.size());
+        assertEquals(orphan.id.toString(), stub.schedules.getFirst().instance.getId(),
+                "schedule() should have run for the orphan, not the already-scheduled");
+    }
+
+    @Test
+    void terminalStatusTasksAreNotRegistered() {
+        // PENDING gets registered; everything else is skipped.
+        var pending = persistTask("pending", Task.Status.PENDING);
+        persistTask("running", Task.Status.RUNNING);
+        persistTask("completed", Task.Status.COMPLETED);
+        persistTask("failed", Task.Status.FAILED);
+        persistTask("cancelled", Task.Status.CANCELLED);
+
+        int registered = BootConsistencyCheck.sweep(stub.proxy());
+
+        assertEquals(1, registered,
+                "exactly the one PENDING Task should register; the four "
+                + "non-PENDING ones are out of scope for the sweep");
+        assertEquals(pending.id.toString(),
+                stub.schedules.getFirst().instance.getId());
+    }
+
+    @Test
+    void emptyPendingListIsANoop() {
+        // No PENDING Tasks; sweep does nothing.
+        persistTask("running", Task.Status.RUNNING);
+        persistTask("completed", Task.Status.COMPLETED);
+
+        int registered = BootConsistencyCheck.sweep(stub.proxy());
+
+        assertEquals(0, registered);
+        assertTrue(stub.schedules.isEmpty(),
+                "sweep must not call schedule() when there are no PENDING tasks");
+    }
+
+    @Test
+    void lostSweepRunsAtBoot() throws Exception {
+        // JCLAW-258: a RUNNING Task whose scheduled_tasks row has a stale
+        // heartbeat (the crash-then-restart case) must be reconciled to
+        // LOST inside sweep() — operators shouldn't have to wait up to
+        // 30 s for the periodic LostTaskScanJob's first tick.
+        var stale = persistTask("crash-orphan", Task.Status.RUNNING);
+        insertScheduledTaskRow(stale.id, Instant.now().minusSeconds(90));
+
+        BootConsistencyCheck.sweep(stub.proxy());
+
+        assertEquals(Task.Status.LOST,
+                ((Task) Task.findById(stale.id)).status,
+                "boot sweep must transition stale-heartbeat RUNNING to LOST");
+    }
+
+    @Test
+    void everyPendingAlreadyScheduledIsANoop() {
+        // The "boot after a normal shutdown" case — every PENDING
+        // Task still has its scheduled_tasks row because the prior
+        // process didn't crash. Sweep should observe this and do
+        // nothing.
+        var t1 = persistTask("t1", Task.Status.PENDING);
+        var t2 = persistTask("t2", Task.Status.PENDING);
+        stub.scheduledIds.add(t1.id.toString());
+        stub.scheduledIds.add(t2.id.toString());
+
+        int registered = BootConsistencyCheck.sweep(stub.proxy());
+
+        assertEquals(0, registered);
+        assertTrue(stub.schedules.isEmpty());
+    }
+
+    // === JCLAW-22: reArmOrphans (periodic-sweep half, no LOST detection) ===
+
+    @Test
+    void reArmOrphansRegistersOrphans() {
+        var orphan = persistTask("orphan", Task.Status.PENDING);
+
+        int registered = BootConsistencyCheck.reArmOrphans(stub.proxy());
+
+        assertEquals(1, registered, "reArmOrphans should register the orphan");
+        assertEquals(orphan.id.toString(), stub.schedules.getFirst().instance.getId());
+    }
+
+    @Test
+    void reArmOrphansDoesNotRunLostDetection() throws Exception {
+        // sweep() flips a stale-heartbeat RUNNING task to LOST; reArmOrphans
+        // must NOT — LostTaskScanJob owns LOST detection, and the periodic
+        // OrphanReArmJob calls only this half to avoid double-scanning.
+        var stale = persistTask("crash-orphan", Task.Status.RUNNING);
+        insertScheduledTaskRow(stale.id, Instant.now().minusSeconds(90));
+
+        BootConsistencyCheck.reArmOrphans(stub.proxy());
+
+        assertEquals(Task.Status.RUNNING,
+                ((Task) Task.findById(stale.id)).status,
+                "reArmOrphans must not reconcile RUNNING -> LOST");
+    }
+
+    // === JCLAW-410: orphaned task_run reconciliation ===
+
+    @Test
+    void reconcileOrphanedRunsFailsStaleRunningRun() {
+        // A run left RUNNING by a prior JVM generation (started an hour ago).
+        var task = persistTask("orphaned-run", Task.Status.ACTIVE);
+        var runId = persistRun(task, Instant.now().minusSeconds(3600),
+                TaskRun.Status.RUNNING, null);
+
+        int reconciled = BootConsistencyCheck.reconcileOrphanedRuns(Instant.now());
+
+        assertEquals(1, reconciled, "stale RUNNING run should be reconciled");
+        var closed = (TaskRun) TaskRun.findById(runId);
+        assertEquals(TaskRun.Status.FAILED, closed.status, "orphaned run must be FAILED");
+        assertNotNull(closed.completedAt, "completedAt must be stamped");
+        assertNotNull(closed.durationMs, "durationMs must be stamped");
+        assertNotNull(closed.error, "an error reason must be recorded");
+    }
+
+    @Test
+    void reconcileOrphanedRunsLeavesInFlightRunsRunning() {
+        // A run started AFTER the cutoff belongs to the current JVM generation
+        // and is genuinely in-flight — it must not be failed out from under it.
+        var task = persistTask("live-run", Task.Status.ACTIVE);
+        var runId = persistRun(task, Instant.now(), TaskRun.Status.RUNNING, null);
+        var cutoff = Instant.now().minusSeconds(60);
+
+        int reconciled = BootConsistencyCheck.reconcileOrphanedRuns(cutoff);
+
+        assertEquals(0, reconciled, "a run started after the cutoff is in-flight, not orphaned");
+        assertEquals(TaskRun.Status.RUNNING,
+                ((TaskRun) TaskRun.findById(runId)).status,
+                "in-flight run must stay RUNNING");
+    }
+
+    @Test
+    void reconcileOrphanedRunsIgnoresTerminalRuns() {
+        var task = persistTask("done-run", Task.Status.ACTIVE);
+        var runId = persistRun(task, Instant.now().minusSeconds(3600),
+                TaskRun.Status.COMPLETED, Instant.now().minusSeconds(3500));
+
+        int reconciled = BootConsistencyCheck.reconcileOrphanedRuns(Instant.now());
+
+        assertEquals(0, reconciled, "terminal runs are out of scope");
+        assertEquals(TaskRun.Status.COMPLETED,
+                ((TaskRun) TaskRun.findById(runId)).status);
+    }
+
+    @Test
+    void sweepReconcilesOrphanedRunFromPriorJvm() {
+        // A run whose startedAt predates this JVM's start is unambiguously
+        // orphaned; the full boot sweep must close it out (wiring check).
+        var task = persistTask("ancient-run", Task.Status.ACTIVE);
+        var runId = persistRun(task, Instant.parse("2020-01-01T00:00:00Z"),
+                TaskRun.Status.RUNNING, null);
+
+        BootConsistencyCheck.sweep(stub.proxy());
+
+        assertEquals(TaskRun.Status.FAILED,
+                ((TaskRun) TaskRun.findById(runId)).status,
+                "boot sweep must reconcile a run orphaned by a prior JVM generation");
+    }
+
+    @Test
+    void sweepReconcilesPriorGenerationRunWithinSameJvm() {
+        // The dev-mode hot-reload bug: a fire from a PRIOR scheduler generation
+        // has a RECENT startedAt (after the JVM start), so the old JVM-start
+        // cutoff never reconciled it and stale RUNNING rows piled up on each
+        // @OnApplicationStart re-run within the same JVM. The per-bootstrap
+        // cutoff variant of sweep() must reconcile it.
+        var task = persistTask("reload-orphan", Task.Status.ACTIVE);
+        var priorGenStart = Instant.now();
+        var runId = persistRun(task, priorGenStart, TaskRun.Status.RUNNING, null);
+
+        // A later bootstrap within the same JVM captures a fresh cutoff just
+        // after the prior generation's run opened — exactly what
+        // DbSchedulerBootstrapJob now passes from its pre-start bootInstant.
+        BootConsistencyCheck.sweep(stub.proxy(), priorGenStart.plusMillis(5));
+
+        assertEquals(TaskRun.Status.FAILED,
+                ((TaskRun) TaskRun.findById(runId)).status,
+                "a run left RUNNING by a prior scheduler generation (same JVM) must be reconciled");
+    }
+
+    // === Helpers ===
+
+    private Long persistRun(Task task, Instant startedAt, TaskRun.Status status, Instant completedAt) {
+        var r = new TaskRun();
+        r.task = task;
+        r.startedAt = startedAt;
+        r.status = status;
+        r.completedAt = completedAt;
+        r.save();
+        return r.id;
+    }
+
+    private Agent persistAgent() {
+        var a = new Agent();
+        a.name = "boot-consistency-test-agent";
+        a.modelProvider = "test-provider";
+        a.modelId = "test-model";
+        a.enabled = true;
+        a.save();
+        return a;
+    }
+
+    private void insertScheduledTaskRow(Long taskId, Instant lastHeartbeat) throws Exception {
+        // DB.getDataSource() returns Hikari-pooled connections with autoCommit=false
+        // (Hibernate-managed). Force autocommit on so the row lands before the
+        // detector's separate-connection SELECT.
+        try (var conn = DB.getDataSource().getConnection()) {
+            conn.setAutoCommit(true);
+            try (var ps = conn.prepareStatement(
+                    "INSERT INTO scheduled_tasks "
+                    + "(task_name, task_instance, execution_time, picked, "
+                    + " picked_by, last_heartbeat, version) "
+                    + "VALUES (?, ?, ?, ?, ?, ?, ?)")) {
+                ps.setString(1, TaskExecutionHandler.TASK_NAME);
+                ps.setString(2, taskId.toString());
+                ps.setTimestamp(3, Timestamp.from(Instant.now()));
+                ps.setBoolean(4, true);
+                ps.setString(5, "test-scheduler");
+                ps.setTimestamp(6, Timestamp.from(lastHeartbeat));
+                ps.setLong(7, 1L);
+                ps.executeUpdate();
+            }
+        }
+    }
+
+    // === JCLAW-1103: RUNNING with no scheduled_tasks row ===
+
+    @Test
+    void strandedRunningTaskIsReturnedToAliveStateAndLogged() {
+        var task = persistRecurringTask("jclaw1103-stranded", Task.Status.RUNNING);
+
+        int reconciled = BootConsistencyCheck.reconcileStrandedRunning(
+                Set.of(), Instant.now().plusSeconds(60));
+
+        assertEquals(1, reconciled);
+        var reloaded = (Task) Task.findById(task.id);
+        assertEquals(Task.Status.ACTIVE, reloaded.status,
+                "a recurring Task stranded in RUNNING must return to ACTIVE so the re-arm registers it");
+
+        EventLogger.flush();
+        assertEquals(1L, EventLog.count("message LIKE ?1", "%jclaw1103-stranded%"),
+                "reconciliation must name the Task in an operator-visible event");
+    }
+
+    @Test
+    void strandedRunningOneShotReturnsToPending() {
+        var task = persistTask("jclaw1103-oneshot", Task.Status.RUNNING);
+
+        BootConsistencyCheck.reconcileStrandedRunning(Set.of(), Instant.now().plusSeconds(60));
+
+        assertEquals(Task.Status.PENDING, ((Task) Task.findById(task.id)).status,
+                "a one-shot returns to PENDING, not ACTIVE");
+    }
+
+    @Test
+    void runningTaskHoldingAScheduledRowIsLeftAlone() {
+        var task = persistRecurringTask("jclaw1103-has-row", Task.Status.RUNNING);
+
+        int reconciled = BootConsistencyCheck.reconcileStrandedRunning(
+                Set.of(task.id.toString()), Instant.now().plusSeconds(60));
+
+        assertEquals(0, reconciled);
+        assertEquals(Task.Status.RUNNING, ((Task) Task.findById(task.id)).status,
+                "a RUNNING Task that still holds its row is db-scheduler's to recover, not ours");
+    }
+
+    @Test
+    void runningTaskWithALiveFireClaimedOnThisNodeIsLeftAlone() {
+        var task = persistRecurringTask("jclaw1103-live-fire", Task.Status.RUNNING);
+
+        assertTrue(TaskRunRegistry.tryClaimTask(task.id));
+        int reconciled;
+        try {
+            reconciled = BootConsistencyCheck.reconcileStrandedRunning(
+                    Set.of(), Instant.now().plusSeconds(60));
+        } finally {
+            TaskRunRegistry.releaseTask(task.id);
+        }
+
+        assertEquals(0, reconciled);
+        assertEquals(Task.Status.RUNNING, ((Task) Task.findById(task.id)).status,
+                "an in-flight fire must never be reconciled out from under itself");
+    }
+
+    @Test
+    void freshlyStartedRunningTaskIsLeftAlone() {
+        var task = persistRecurringTask("jclaw1103-fresh", Task.Status.RUNNING);
+
+        // Cutoff in the past: the Task was written after it, so it is not yet stale.
+        int reconciled = BootConsistencyCheck.reconcileStrandedRunning(
+                Set.of(), Instant.now().minusSeconds(60));
+
+        assertEquals(0, reconciled);
+        assertEquals(Task.Status.RUNNING, ((Task) Task.findById(task.id)).status,
+                "the stop-then-schedule window of a healthy fire must survive the sweep");
+    }
+
+    @Test
+    void sweepReArmsAStrandedRunningTaskEndToEnd() {
+        var task = persistRecurringTask("jclaw1103-end-to-end", Task.Status.RUNNING);
+        ageUpdatedAt(task.id, Instant.now().minusSeconds(600));
+
+        BootConsistencyCheck.reArmOrphans(stub.proxy());
+
+        assertEquals(Task.Status.ACTIVE, ((Task) Task.findById(task.id)).status);
+        assertTrue(stub.schedules.stream()
+                        .anyMatch(c -> task.id.toString().equals(c.instance.getId())),
+                "the same sweep that reconciles the Task must also register its new row");
+    }
+
+    /**
+     * Backdate {@code updatedAt} so the Task reads as stale. A JPQL bulk update
+     * rather than a field write + save(): bulk updates skip {@code @PreUpdate},
+     * which would otherwise stamp the value straight back to now.
+     */
+    private void ageUpdatedAt(Long taskId, Instant when) {
+        JPA.em().createQuery("UPDATE Task SET updatedAt = :when WHERE id = :id")
+                .setParameter("when", when)
+                .setParameter("id", taskId)
+                .executeUpdate();
+        JPA.em().clear();
+    }
+
+    private Task persistRecurringTask(String name, Task.Status status) {
+        var t = new Task();
+        t.agent = agent;
+        t.name = name;
+        t.description = "Test task";
+        t.type = Task.Type.INTERVAL;
+        t.intervalSeconds = 1800L;
+        t.status = status;
+        t.nextRunAt = Instant.now();
+        t.save();
+        return t;
+    }
+
+    private Task persistTask(String name, Task.Status status) {
+        var t = new Task();
+        t.agent = agent;
+        t.name = name;
+        t.description = "Test task";
+        t.type = Task.Type.IMMEDIATE;
+        t.status = status;
+        t.nextRunAt = Instant.now();
+        t.createdAt = Instant.now();
+        t.updatedAt = Instant.now();
+        t.save();
+        return t;
+    }
+
+    /**
+     * Proxy-based SchedulerClient stub that:
+     * <ul>
+     *   <li>Records {@code schedule()} calls so tests can assert which
+     *       Tasks got registered.</li>
+     *   <li>Surfaces a configurable set of "already-scheduled"
+     *       task_instance ids via
+     *       {@code fetchScheduledExecutionsForTask} — the
+     *       call site the sweep uses to discover what's already in
+     *       scheduled_tasks.</li>
+     * </ul>
+     */
+    static class RecordingSchedulerStub {
+        static class ScheduleCall {
+            final TaskInstance<?> instance;
+            final Instant when;
+            ScheduleCall(TaskInstance<?> i, Instant w) { instance = i; when = w; }
+        }
+        final List<ScheduleCall> schedules = new ArrayList<>();
+        /** What scheduleIfNotExists reports: true models an absent row, false a surviving one. */
+        boolean scheduleIfNotExistsReturns = true;
+        final List<String> scheduledIds = new ArrayList<>();
+
+        SchedulerClient proxy() {
+            return (SchedulerClient) Proxy.newProxyInstance(
+                    SchedulerClient.class.getClassLoader(),
+                    new Class<?>[] { SchedulerClient.class },
+                    this::dispatch);
+        }
+
+        @SuppressWarnings({"unchecked", "rawtypes"})
+        private Object dispatch(Object proxy, Method method, Object[] args) {
+            String name = method.getName();
+            if ("schedule".equals(name) && args != null && args.length == 2
+                    && args[0] instanceof TaskInstance<?> inst
+                    && args[1] instanceof Instant when) {
+                schedules.add(new ScheduleCall(inst, when));
+                return null;
+            }
+            // Production schedules through scheduleIfNotExists, which leaves an existing row alone
+            // and reports whether it created one; schedules records only the ones it created.
+            if ("scheduleIfNotExists".equals(name) && args != null && args.length == 2
+                    && args[0] instanceof TaskInstance<?> inst
+                    && args[1] instanceof Instant when) {
+                if (scheduleIfNotExistsReturns) schedules.add(new ScheduleCall(inst, when));
+                return scheduleIfNotExistsReturns;
+            }
+            // BootConsistencyCheck calls
+            // getScheduledExecutionsForTask(name), the no-data-class
+            // overload. Java's Proxy invokes interface default
+            // methods through the InvocationHandler too — they don't
+            // auto-delegate to fetchScheduledExecutionsForTask
+            // unless we call InvocationHandler.invokeDefault. So
+            // handle the getScheduledExecutionsForTask call directly,
+            // returning ScheduledExecution rows for the configured
+            // "already-scheduled" ids.
+            if ("getScheduledExecutionsForTask".equals(name)
+                    && args != null && args.length >= 1
+                    && args[0] instanceof String taskName) {
+                var out = new ArrayList<ScheduledExecution<Object>>();
+                for (var id : scheduledIds) {
+                    var ti = new TaskInstance(taskName, id);
+                    var exec = new Execution(Instant.now(), ti);
+                    out.add(new ScheduledExecution<>(Object.class, exec));
+                }
+                return out;
+            }
+            // Sensible defaults for any other method the test code
+            // happens to hit through the facade. Same pattern the
+            // other Proxy-based stubs in the test suite use.
+            Class<?> r = method.getReturnType();
+            if (r == boolean.class || r == Boolean.class) return false;
+            if (r == int.class || r == Integer.class) return 0;
+            if (r == long.class || r == Long.class) return 0L;
+            if (r == List.class) return List.of();
+            if (r == java.util.Optional.class) return java.util.Optional.empty();
+            return null;
+        }
+    }
+}

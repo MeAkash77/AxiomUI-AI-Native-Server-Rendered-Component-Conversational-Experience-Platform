@@ -1,0 +1,78 @@
+package agents;
+
+import llm.LlmProvider;
+import llm.LlmTypes.ChatMessage;
+import llm.LlmTypes.ToolDef;
+import models.Agent;
+import models.Conversation;
+import org.jspecify.annotations.Nullable;
+import services.EventLogger;
+
+import java.util.List;
+
+/**
+ * Provider {@code finish_reason} interpretation and the JCLAW-291
+ * structured-warn diagnostic when a turn truncates. Extracted from
+ * {@link AgentRunner} as part of JCLAW-299.
+ *
+ * <h2>Why "max_tokens" must alias to "length"</h2>
+ * OpenAI-compatible routes emit {@code "length"} when the model
+ * exhausted its output token budget; Anthropic-native (and
+ * OpenRouter's Bedrock route for Anthropic models) emit
+ * {@code "max_tokens"}. Both must be treated as truncation — if only
+ * {@code "length"} is matched, Bedrock-routed Claude tool-call deltas
+ * get dispatched with incomplete JSON args and the downstream tool
+ * fails with a cryptic Gson EOFException.
+ *
+ * <h2>Why we log on truncation, not just retry</h2>
+ * The empty-tool-calls truncation diagnostic (JCLAW-291) dumps the
+ * headroom math — configured cap, context window, prompt tokens
+ * estimate, clamped {@code max_tokens} — so operators can correlate
+ * the truncation with the model's effective output budget. Without
+ * this, the only signal that {@code max_tokens} was tight was
+ * "responses look cut off" — slow to diagnose, easy to misattribute.
+ */
+public final class TruncationDiagnostics {
+
+    private TruncationDiagnostics() {}
+
+    /**
+     * Return {@code true} when a streaming {@code finish_reason}
+     * signals the model exhausted its output token budget
+     * mid-response.
+     */
+    public static boolean isTruncationFinish(@Nullable String finishReason) {
+        return "length".equals(finishReason) || "max_tokens".equals(finishReason);
+    }
+
+    /**
+     * JCLAW-291: emit a structured warn line whenever the model
+     * truncates a plain (non-tool-call) reply via
+     * {@code finish_reason = length / max_tokens}. Mirrors the
+     * existing tool-call truncation guards but dumps the headroom
+     * math so operators can correlate the truncation with the
+     * model's effective output budget. Single call site shape so the
+     * format stays canonical across streaming and non-streaming.
+     */
+    static void logEmptyToolCallsTruncation(String site, Agent agent, Conversation conversation,
+                                             LlmProvider provider, @Nullable String channelType,
+                                             @Nullable String finishReason, List<ChatMessage> messages,
+                                             @Nullable List<ToolDef> tools) {
+        var modelInfo = ModelResolver.resolveModelInfo(agent, conversation, provider).orElse(null);
+        var providerName = provider != null && provider.config() != null ? provider.config().name() : null;
+        var modelId = ModelResolver.effectiveModelId(agent, conversation);
+        int promptTokens = ContextWindowManager.adjustedPromptTokens(providerName, modelId,
+                ContextWindowManager.estimateProviderPromptTokens(
+                        agent, conversation, provider, messages, tools));
+        int configured = modelInfo != null ? modelInfo.maxTokens() : -1;
+        int contextWindow = modelInfo != null ? modelInfo.contextWindow() : -1;
+        int headroom = contextWindow > 0
+                ? contextWindow - promptTokens - ContextWindowManager.OUTPUT_SAFETY_MARGIN_TOKENS
+                : -1;
+        var clamped = ContextWindowManager.effectiveMaxTokens(agent, conversation, provider, messages, tools);
+        EventLogger.warn("llm", agent.name, channelType,
+                "Truncated reply (site=%s, finish=%s, configured=%d, contextWindow=%d, prompt~%d, headroom=%d, clamped=%s)"
+                        .formatted(site, finishReason, configured, contextWindow, promptTokens, headroom,
+                                clamped == null ? "null" : clamped.toString()));
+    }
+}

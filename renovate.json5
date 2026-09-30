@@ -1,0 +1,217 @@
+{
+  // Self-hosted Renovate config. Run by Jenkinsfile.renovate against Bitbucket
+  // Server (origin). PRs land on Bitbucket; the existing /deploy flow propagates
+  // merges to the github mirror. Schema reference:
+  // https://docs.renovatebot.com/configuration-options/
+  $schema: "https://docs.renovatebot.com/renovate-schema.json",
+
+  extends: [
+    "config:recommended",
+  ],
+
+  // No `schedule` directive — Jenkinsfile.renovate's cron (`H 6 * * 1`) is the
+  // sole gate on when Renovate runs. A second Renovate-side schedule would
+  // need its `timezone` kept in sync with the Jenkins server's clock, with no
+  // error if they drift; cheaper to let the orchestrator decide. Each weekly
+  // run opens PRs for whatever drift exists at that moment.
+
+  // Disabled — Bitbucket Server doesn't have a native issues UI for the
+  // Dependency Dashboard pattern Renovate's GitHub support uses. Renovate's own
+  // bitbucket-server docs put it as "creating issues not implemented yet", and
+  // the dashboard needs issues with dynamic Markdown checkboxes. Status
+  // visibility comes from the open PR list instead.
+  //
+  // The github mirror DOES have Issues enabled, which looks like a way out and
+  // is not: Renovate runs with RENOVATE_PLATFORM=bitbucket-server and builds the
+  // dashboard on the platform it operates against, so it never reaches github at
+  // all. Pointing it there instead would open dependency PRs on a mirror where
+  // no development happens and nothing merges back — Bitbucket is the source of
+  // truth and /deploy pushes onward to github, not the reverse. Note
+  // Jenkinsfile.renovate's GITHUB_COM_TOKEN is for fetching changelogs, not
+  // platform auth, and does not make github the platform.
+  //
+  // Setting this true is inert at best and has been reported to fail outright on
+  // self-hosted Bitbucket (renovatebot/renovate#10517). Routing the dashboard to
+  // Jira has been open upstream since 2022 (renovatebot/renovate#16625); if that
+  // ever lands, this is the line to revisit.
+  dependencyDashboard: false,
+
+  // Wait 3 days after a package version is published before opening a PR for
+  // it. Catches the 'shipped → breaking bug found → republished' cycle that
+  // hits weekly with active OSS packages. (Renamed from `stabilityDays` in
+  // Renovate v37; the old key still works but emits a deprecation warning.)
+  minimumReleaseAge: "3 days",
+
+  // Backpressure caps. prConcurrentLimit caps total open PRs Renovate has
+  // authored; prHourlyLimit caps how fast new ones land in a single run.
+  // Both are kept at 10 so a weekly run can drain a normal week's drift in
+  // one trigger — prConcurrentLimit still prevents the PR list from
+  // ballooning if merges fall behind.
+  prConcurrentLimit: 10,
+  prHourlyLimit: 10,
+
+  // Match JClaw's '<scope>: <message>' commit convention so bot commits read
+  // consistently with manual ones in git log.
+  commitMessagePrefix: "deps:",
+  commitMessageAction: "bump",
+
+  // enabledManagers is an allowlist — managers not listed don't run, even
+  // ones config:recommended would otherwise enable by default. 'gradle' +
+  // 'gradle-wrapper' cover build.gradle.kts and gradle-wrapper.properties
+  // (the entire Java dependency tree, plus Gradle itself); 'npm' covers
+  // frontend/package.json including the pnpm pin in `packageManager`
+  // (the gap that triggered switching from Dependabot); 'dockerfile' +
+  // 'docker-compose' cover the prod + devcontainer images.
+  enabledManagers: [
+    "gradle",
+    "gradle-wrapper",
+    "npm",
+    "dockerfile",
+    "docker-compose",
+    // custom.regex is the manager type for the customManagers block
+    // below — needed in this list so Renovate's manager-enable gate
+    // doesn't filter our regex manager out before it runs.
+    "custom.regex",
+  ],
+
+  // Same family-grouping intent as the previous .github/dependabot.yml:
+  // collapse the dozen-plus eslint plugins and similar lockstep-versioned
+  // packages into one PR per family per cycle. update-types limits grouping to
+  // minor+patch — major bumps land as individual PRs because they almost always
+  // need code changes.
+  packageRules: [
+    {
+      groupName: "vue",
+      matchManagers: ["npm"],
+      matchUpdateTypes: ["minor", "patch"],
+      matchPackageNames: ["vue", "@vue/**", "vue-*"],
+    },
+    {
+      groupName: "nuxt",
+      matchManagers: ["npm"],
+      matchUpdateTypes: ["minor", "patch"],
+      matchPackageNames: ["nuxt", "@nuxt/**", "nuxi", "h3"],
+    },
+    // Block TypeScript 7.x. TS7 is the native (tsgo) compiler rewrite; it
+    // dropped the `typescript/lib/tsc` package export that vue-tsc / Volar
+    // shim into, so `pnpm typecheck` (nuxi typecheck -> vue-tsc) hard-fails
+    // with ERR_PACKAGE_PATH_NOT_EXPORTED on every .vue file. vue-tsc's peer
+    // range is a misleading `>=5.0.0` that claims a TS7 support it lacks, so
+    // only the typecheck gate catches it — invisible to Renovate and pnpm,
+    // which is why the lone `renovate/typescript-7.x` branch recurred weekly
+    // and never merged. Tracking: vuejs/language-tools#5381 (waiting on a
+    // Volar port, likely gated on TS 7.1). TS 6.x minors/patches still flow.
+    // Lift to <8 (or drop) once vue-tsc/index.js no longer resolves
+    // `typescript/lib/tsc`, and bump typescript + vue-tsc + @vue/language-core
+    // together. Its `@typescript/typescript6` alias branch runs TS 6 under the
+    // `typescript` name; it is not native-compiler support.
+    {
+      matchPackageNames: ["typescript"],
+      allowedVersions: "<7",
+    },
+    {
+      groupName: "eslint",
+      matchManagers: ["npm"],
+      matchUpdateTypes: ["minor", "patch"],
+      matchPackageNames: ["eslint", "@eslint/**", "eslint-*"],
+    },
+    {
+      groupName: "stylelint",
+      matchManagers: ["npm"],
+      matchUpdateTypes: ["minor", "patch"],
+      matchPackageNames: ["stylelint", "stylelint-*", "postcss-*"],
+    },
+    {
+      groupName: "tailwind",
+      matchManagers: ["npm"],
+      matchUpdateTypes: ["minor", "patch"],
+      matchPackageNames: ["tailwindcss", "@tailwindcss/**"],
+    },
+    {
+      groupName: "vitest",
+      matchManagers: ["npm"],
+      matchUpdateTypes: ["minor", "patch"],
+      matchPackageNames: ["vitest", "@vitest/**", "@vue/test-utils", "happy-dom"],
+    },
+
+    // Auto-merge patch and minor bumps directly to main via signed git push,
+    // skipping Bitbucket's merge UI (which can't sign commits on Bitbucket
+    // Server 7.21.10 — see JCLAW-180). Renovate runs as a catch-all here:
+    // grouped bumps inherit automerge from this rule, ungrouped ones still
+    // match by updateType. Major bumps fall through (matchUpdateTypes excludes
+    // them) and continue to open PRs for human review, merged locally with a
+    // signed git merge. Requires gitPrivateKey configured on the runner so the
+    // resulting commits land verified on the github mirror.
+    {
+      matchUpdateTypes: ["minor", "patch"],
+      automerge: true,
+      automergeType: "branch",
+    },
+
+    // Carve Java/Gradle minors back out of the catch-all above. Tika,
+    // Playwright, and OkHttp minors have historically required exclude-graph
+    // adjustments in build.gradle.kts (the long `exclude(group = ...)` lists
+    // for tika-core / tika-parsers-standard-package / flexmark / telegrambots
+    // exist precisely because each minor reshuffles the transitive set).
+    // Patches still auto-merge — they almost never reshape transitives.
+    // Must sit after the catch-all because Renovate evaluates packageRules
+    // in order, last match wins.
+    {
+      matchManagers: ["gradle", "gradle-wrapper"],
+      matchUpdateTypes: ["minor"],
+      automerge: false,
+    },
+
+    // The AFK factory's Sandcastle. Before 1.0 it ships breaking changes as patch releases, and
+    // .sandcastle/factory.ts wraps its Docker provider's internals to lock the sandbox's .git down, so a
+    // bump is reviewed and `npx tsx sandbox-check.ts` run before merging.
+    {
+      matchPackageNames: ["@ai-hero/sandcastle"],
+      automerge: false,
+      prBodyNotes: [
+        ":warning: Run `cd .sandcastle && npm ci && npx tsx sandbox-check.ts` before merging: the factory's `.git` lockdown wraps Sandcastle's Docker provider.",
+      ],
+    },
+
+    // The play1 fork pin. See the custom manager below for why this can never
+    // automerge: the matching checkout in /opt/play1 is a step no PR can take.
+    {
+      matchDepNames: ["tsukhani/play1"],
+      automerge: false,
+      prBodyNotes: [
+        ":warning: Bumping `.play-version` alone breaks the build. `build.gradle.kts` requires the fork installed at `/opt/play1` to be checked out at the same version, so check out the matching tag there before merging.",
+      ],
+    },
+  ],
+
+  customManagers: [
+    // Bump the Play fork pin from tsukhani/play1's GitHub releases.
+    // The pin lives in .play-version, a single bare version line;
+    // build.gradle.kts reads that file and requires the fork installed at
+    // /opt/play1 to be checked out at the same version. extractVersion strips
+    // the release tag's leading 'v' so semver compares bare versions.
+    //
+    // Never automerge this one. The catch-all packageRule automerges every
+    // minor and patch, but a bumped .play-version fails the build on every
+    // clone whose /opt/play1 has not been checked out to match — the bump is
+    // only half the change, and the other half happens outside this repo.
+    {
+      customType: "regex",
+      // Renamed from `fileMatch` in Renovate v40; old key still works
+      // but emits a deprecation warning each run.
+      managerFilePatterns: ["^\\.play-version$"],
+      matchStrings: ["^(?<currentValue>\\d+\\.\\d+\\.\\d+)"],
+      datasourceTemplate: "github-releases",
+      depNameTemplate: "tsukhani/play1",
+      extractVersionTemplate: "^v(?<version>.+)$",
+      versioningTemplate: "semver",
+    },
+    // The AFK factory's gateway image, pinned by tag and digest in a TypeScript string.
+    {
+      customType: "regex",
+      managerFilePatterns: ["^\\.sandcastle/factory\\.ts$"],
+      matchStrings: ["\"(?<depName>gcr\\.io/distroless/[\\w-]+):(?<currentValue>[\\w.-]+)@(?<currentDigest>sha256:[a-f0-9]{64})\""],
+      datasourceTemplate: "docker",
+    },
+  ],
+}

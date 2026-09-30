@@ -1,0 +1,288 @@
+# -----------------------------------------------------------------------------
+# JClaw - Play Framework 1.x .gitignore
+# -----------------------------------------------------------------------------
+
+.mcp.json
+
+# JCLAW-213 throwaway PoC (standalone DJL+ONNX image-caption spike + ~245MB downloaded
+# model weights). Never committed; the production captioner lives in app/services/caption.
+/spike/
+
+# VulnHunter security-audit output (the /vulnhunt skill writes to
+# <basename>_VULNHUNT_RESULTS_<timestamp>/). NEVER commit — these trees hold
+# working exploit PoCs + step-by-step reproduction for findings that are not yet
+# fixed; publishing them is an attacker roadmap. Actionable content is tracked in
+# JIRA (e.g. epic JCLAW-776); keep the raw artifacts local only.
+*_VULNHUNT_RESULTS_*/
+
+# Per-clone runtime security material — application secret (PLAY_SECRET)
+# and TLS cert+key. Lives under certs/ (write paths: `./jclaw.sh secret`,
+# `./jclaw.sh cert`, `play secret`, `play enable-https`, the Docker
+# entrypoint). NEVER commit — the secret is an admin-session-forgery
+# primitive and the TLS private key binds to a per-machine CA root.
+# certs/.env.example is the tracked template that keeps the directory
+# in the repo and dist tarball; everything else under certs/ is
+# generated and per-machine.
+certs/*
+!certs/.env.example
+
+# Environment files (don't commit secrets!)
+# All environment overrides live in conf/application.conf with %prod. / %test.
+# prefixes — there are no per-environment conf files. Only secrets are
+# gitignored, via .env (loaded by jclaw.sh into the JVM environment).
+.env
+.env.local
+.env.*.local
+
+# Play Framework runtime files
+tmp/
+logs/
+*.log
+*.pid
+
+# Play precompiled files
+precompiled/
+
+# `play javadoc` output
+javadoc/
+
+# Benchmark/harness run output. Same rule as evals/reports/ below: a report is a
+# measurement of one run on one machine, not a fact about the code, so it ages
+# into noise and bloats the history. Keep a baseline you want to diff against out
+# of band.
+reports/
+
+# Eval run output (JCLAW-875). The suites in evals/suites/ ARE tracked — they
+# are the measuring stick. Reports are per-run measurements: keep the ones you
+# want to compare against out of band, not in the history.
+evals/reports/
+
+# Memory-quality eval suites (JCLAW-529). Unlike evals/suites/, these are
+# GENERATED FROM THE OPERATOR'S OWN MEMORY CORPUS, so a case's query and its gold
+# answers are personal data by construction — "what is my NAS IP" is the secret,
+# not just a pointer to it. This repository is mirrored publicly, so they must
+# never be tracked. MemoryEvalPaths refuses to write outside this directory
+# rather than relying on the ignore rule alone.
+evals/local/
+
+# Claude Code and OpenAI Codex config.
+# Note: `.claude/*` (contents) instead of `.claude/` (directory) so git can
+# still descend into .claude/ and apply the negations below — git can't
+# re-include a path under a fully-ignored parent directory.
+.claude/*
+.agents/
+
+# …but keep checked-in slash commands so they survive fresh clones.
+# Other .claude/ subdirs (settings.local.json, state, etc.) stay ignored
+# because they hold per-developer state that shouldn't be checked in.
+!.claude/commands/
+!.claude/commands/**
+
+# Autoresearch state
+.autoresearch/
+
+# omo tool local state (per-machine, not tracked)
+.omo/
+
+# IntelliJ IDEA
+.idea/
+*.iml
+*.iws
+*.ipr
+out/
+
+# VS Code (its Java language-server build output is redirected to build/ via the
+# eclipse plugin in build.gradle.kts, so it no longer lands in bin/)
+.vscode/
+
+# Eclipse / Buildship IDE metadata (generated, same category as .idea/ above)
+.classpath
+.project
+.settings/
+
+# NetBeans
+nbproject/
+nbproject/private/
+
+# Build outputs
+dist/
+test-result/
+frontend/test-report/
+# jqwik's failure database, rewritten by every play autotest run (JCLAW-1154).
+.jqwik-database
+*.war
+*.ear
+*.zip
+*.tar.gz
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# Node.js (for frontend)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+.pnpm-store/
+
+# Frontend build outputs
+frontend/.nuxt/
+frontend/.output/
+frontend/dist/
+frontend/.cache/
+public/spa/
+
+# Operator-hosted apps (public/apps/<slug>/) are runtime data, not source.
+# The app_install tool creates public/apps/ on demand and writes each app
+# there. The whole directory is excluded from version control — and, since
+# .distignore inherits .gitignore, from the dist bundle too — so a fresh
+# checkout and the bundle have no public/apps/ until an app is installed.
+/public/apps/
+
+# SSL certificates/keys (defense-in-depth wildcards — the certs/ directory
+# itself is handled above with a !certs/.gitkeep negation). `.cert` is
+# jclaw's chosen extension via `./jclaw.sh cert` and `play enable-https`;
+# `.crt` is the more common convention elsewhere — we list both.
+*.key
+*.pem
+*.crt
+*.cert
+*.p12
+*.jks
+
+# lib/ — was the 1.12 dep target (populated by `play deps --sync`); in 1.13.x
+# (PF-90) Gradle resolves deps into ~/.gradle/caches/ and never writes to lib/.
+# Directory may still exist as stale leftover from a previous 1.12 build; in
+# either case never tracked.
+lib/
+
+# Database files
+data/
+*.db
+*.h2.db
+*.mv.db
+*.sql
+# conf/db/*.sql holds checked-in schema scripts (e.g. db-scheduler's
+# scheduled_tasks DDL) that ship with the app. The global *.sql ignore
+# above is for transient H2 dumps and similar generated files.
+!conf/db/*.sql
+*.sqlite
+*.sqlite3
+
+# Test coverage
+coverage/
+.nyc_output/
+jacoco.exec
+jacoco.xml
+
+# Code quality scanners — sonar-scanner CLI (and the SonarQube MCP that
+# wraps it) creates this on every analysis run to hold caches, the local
+# report, and scan metadata. Never tracked.
+.scannerwork/
+
+# Play modules — populated by Gradle's `extractPlayModules` task at build
+# time (copies framework-bundled modules from frameworkPath/modules/<name>
+# to <app>/modules/<name>). Regenerated each build, never tracked.
+modules/*
+
+# BMAD method install state and output (regenerated by ./jclaw.sh setup
+# via `npx bmad-method install`). The install creates ~270 files under
+# _bmad/ and ~42 skills under .claude/skills/. Both directories are
+# gitignored so BMAD upgrades — which delete and rewrite hundreds of
+# files between minor versions (e.g. 6.2.2 → 6.5.0 moved skill manifests
+# from _bmad/<module>/<skill>/SKILL.md to .claude/skills/<skill>/SKILL.md)
+# — produce zero git diffs. The setup script re-runs the install on
+# every fresh clone, restoring slash commands without committed churn.
+#
+# _bmad/custom/config.toml is the one exception, and it is deliberate: BMAD
+# never writes it (the installer regenerates _bmad/config.toml and
+# _bmad/bmm/config.yaml around it), and it is the only durable place to pin a
+# project-level value. Without it tracked, every clone silently reverts to the
+# installed defaults — e.g. project_knowledge points at docs/ root, so the next
+# /bmad-document-project writes a competing doc set beside docs/architecture/
+# instead of updating it. BMAD ships _bmad/custom/.gitignore (`*.user.toml`)
+# expecting that directory to be tracked; a blanket `_bmad/` rule makes that
+# file inert, because git never descends into an excluded directory.
+#
+# Each level must be re-included explicitly for the same reason — a bare
+# `!_bmad/custom/config.toml` under `_bmad/` is a silent no-op.
+_bmad/*
+!_bmad/custom/
+_bmad/custom/*
+!_bmad/custom/config.toml
+_bmad-output/
+
+# Global skills (track all skills in the registry)
+# Agent workspace copies are excluded via the workspace/* rule below.
+#
+# Skill-bundled binaries are excluded: they're platform-specific, typically
+# large (~tens of MB), and should be fetched by the skill's install step
+# rather than tracked in git. SKILL.md stays; the binary under tools/ does not.
+skills/whatsapp-wacli-mac/tools/wacli
+
+# Python bytecode from skill scripts (regenerated on every run, never tracked)
+__pycache__/
+*.pyc
+
+# Note: per-skill `credentials/` directories ARE tracked here, but only as
+# README templates that document the expected JSON shape. Real secret files
+# (radarr.json, etc.) live operator-local in workspace/main/skills/<skill>/
+# credentials/, which is gitignored via the workspace/* rule below.
+
+# Agent workspaces — never tracked (JCLAW-910). Everything under here is operator
+# state: SOUL/IDENTITY/USER/BOOTSTRAP/AGENT are edited by the operator and written
+# to by agents at runtime. The default agent's SOUL and IDENTITY ship as templates
+# in WorkspaceFiles and are scaffolded at boot by DefaultConfigJob, so a fresh
+# install still gets them without the files living in git.
+#
+# main's five markdown files used to be tracked via `!` exceptions here. That made
+# every release sweep the operator's own edits into a public commit — USER.md in
+# particular carried their name, employer and location.
+workspace/
+
+# Test workspaces (ephemeral, created by integration tests)
+workspace-test/
+
+# Ignore but keep empty directories
+!.gitkeep
+
+# Backup files
+*.bak
+*.swp
+*.swo
+*~
+*.tmp
+
+# Maven/Gradle local
+.mvn/
+.gradle/
+build/
+
+# PlayWright files
+.playwright-mcp/
+
+# graphify knowledge graph — rebuilt locally from source, per-machine
+graphify-out/
+
+# Tranco seed list for the scrape corpus builder (JCLAW-1081) — ~22 MB, regenerable
+evals/scrape/.cache/
+
+# Generated by `jclaw.sh shim` on Windows (JCLAW-1105); never committed.
+/jclaw.cmd
+
+# docs/ is publish-by-exception: architecture/ (the generated design set) and
+# user-guide/ (read at runtime by the in-app guide) are tracked, and every other
+# subdirectory is working material — spike verdicts, audit notes — local to the
+# clone that wrote it. A dist takes its file list from `git ls-files`, so an
+# ignored subdirectory needs no .distignore entry to stay out of the zip.
+docs/*/
+!docs/architecture/
+!docs/user-guide/

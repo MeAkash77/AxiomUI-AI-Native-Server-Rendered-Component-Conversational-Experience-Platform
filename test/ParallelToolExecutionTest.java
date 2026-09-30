@@ -1,0 +1,661 @@
+import agents.AgentExecutionSink;
+import agents.AgentRunner;
+import agents.ConversationSink;
+import agents.ToolContext;
+import agents.ToolRegistry;
+import jakarta.persistence.EntityManager;
+import llm.LlmTypes.ChatMessage;
+import llm.LlmTypes.FunctionCall;
+import llm.LlmTypes.ToolCall;
+import models.Agent;
+import models.Conversation;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import play.db.jpa.JPA;
+import play.test.Fixtures;
+import play.test.UnitTest;
+import services.ConversationService;
+import services.SubagentRegistry;
+import services.Tx;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.IdentityHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+
+/**
+ * Exercises {@link AgentRunner#executeToolsParallel}'s scheduling model:
+ * calls to different tools run on separate virtual threads (parallel),
+ * while calls to the SAME tool run sequentially in declared order on one
+ * thread (JCLAW-80 — same-tool calls share backend state so concurrent
+ * execution produces nondeterministic order under lock contention).
+ */
+class ParallelToolExecutionTest extends UnitTest {
+
+    private static final long TOOL_SLEEP_MS = 300;
+
+    private AtomicInteger concurrentExecutions;
+    private AtomicInteger peakConcurrency;
+    /** Append-only record of the order in which sleep tools began executing,
+     *  including the tool name and the sequence-within-tool so tests can assert
+     *  same-tool ordering without racing on wall-clock timestamps. */
+    private List<String> executionOrder;
+
+    @BeforeEach
+    void setup() {
+        Fixtures.deleteDatabase();
+        // JCLAW-894: lock the registry and install the canonical native set, so this
+        // class starts from a known baseline rather than whatever a concurrently
+        // running class last published.
+        ToolRegistrySync.canonicalForTest();
+        concurrentExecutions = new AtomicInteger();
+        peakConcurrency = new AtomicInteger();
+        executionOrder = java.util.Collections.synchronizedList(new ArrayList<>());
+        ToolRegistry.publish(List.of(
+                sleepTool("slow_a", false),
+                sleepTool("slow_b", false),
+                sleepTool("slow_c", false),
+                sleepTool("safe_x", true),
+                sleepTool("safe_y", true)));
+    }
+
+    @AfterEach
+    void restore() {
+        // Restore the global tool registry FIRST so no other test sees the
+        // sleep stubs published in setup().
+        ToolRegistrySync.release();
+        // Defensive: drop the per-test state holders so any straggling
+        // virtual-thread callback that captured the old reference can't
+        // mutate "stale" state into the next test method's view. The
+        // synchronizedList wrapper is the most likely culprit — clearing
+        // it makes accidental cross-test pollution loud rather than silent.
+        if (executionOrder != null) executionOrder.clear();
+        executionOrder = null;
+        concurrentExecutions = null;
+        peakConcurrency = null;
+    }
+
+    private ToolRegistry.Tool sleepTool(String toolName, boolean parallelSafe) {
+        return sleepTool(toolName, parallelSafe, null);
+    }
+
+    /** Variant that lets a test pin the {@link ToolRegistry.Tool#serializationGroup()}
+     *  key, mirroring how {@code SubagentSpawnTool}/{@code SubagentYieldTool}
+     *  override the default to opt into a shared serial queue. {@code null}
+     *  preserves the default behavior (group = name when unsafe, no group when
+     *  parallel-safe). */
+    private ToolRegistry.Tool sleepTool(String toolName, boolean parallelSafe, String groupKey) {
+        return new ToolRegistry.Tool() {
+            @Override public String name() { return toolName; }
+            @Override public String description() { return "Sleeps for the test."; }
+            @Override public Map<String, Object> parameters() {
+                return Map.of("type", "object", "properties", Map.of());
+            }
+            @Override public boolean parallelSafe() { return parallelSafe; }
+            @Override public String serializationGroup() {
+                return groupKey != null ? groupKey : ToolRegistry.Tool.super.serializationGroup();
+            }
+            @Override public String execute(String argsJson, Agent agent) {
+                executionOrder.add(toolName + ":start");
+                int nowRunning = concurrentExecutions.incrementAndGet();
+                // Track the high-water mark so we can assert actual parallelism
+                // rather than infer it from wall-clock alone.
+                peakConcurrency.updateAndGet(p -> Math.max(p, nowRunning));
+                try {
+                    Thread.sleep(TOOL_SLEEP_MS);
+                } catch (InterruptedException _) {
+                    Thread.currentThread().interrupt();
+                } finally {
+                    concurrentExecutions.decrementAndGet();
+                }
+                return "ok-from-" + toolName;
+            }
+        };
+    }
+
+    /** Create agent + conversation in the DB so the commit phase of
+     *  executeToolsParallel has real rows to write to. */
+    private long[] seedAgentAndConversation() {
+        return seedAgentAndConversation("parallel-tool-test");
+    }
+
+    private long[] seedAgentAndConversation(String agentName) {
+        return Tx.run(() -> {
+            var agent = new Agent();
+            agent.name = agentName;
+            agent.modelProvider = "test";
+            agent.modelId = "test";
+            agent.save();
+            var conv = ConversationService.create(agent, "web", "tester");
+            return new long[]{agent.id, conv.id};
+        });
+    }
+
+    private static void invokeParallel(List<ToolCall> calls, Agent agent, long convId,
+                                        List<ChatMessage> messages, AtomicBoolean cancelled)
+            throws Exception {
+        // JCLAW-21 commit 1: trailing AgentExecutionSink parameter wires
+        // per-tool-call assistant + tool-result writes through the sink
+        // abstraction. Construct a ConversationSink from the test's persisted
+        // conversation so the writes hit the same conversation_message rows the
+        // pre-sink tests assert on.
+        var conv = (Conversation) Tx.run(() -> ConversationService.findById(convId));
+        invokeParallel(calls, agent, convId, messages, cancelled, new ConversationSink(conv));
+    }
+
+    private static void invokeParallel(List<ToolCall> calls, Agent agent, long convId,
+                                        List<ChatMessage> messages, AtomicBoolean cancelled,
+                                        AgentExecutionSink sink)
+            throws Exception {
+        // JCLAW-170: signature gained the onToolCall Consumer<ToolCallEvent>
+        // parameter ahead of the image collector. We pass null here since
+        // these tests exercise scheduling semantics, not the per-call event
+        // stream — the production code tolerates null onToolCall.
+        // JCLAW-299 Phase 2: executeToolsParallel lives on
+        // agents.ParallelToolExecutor.
+        // JCLAW-883: trailing Set is the turn's offered tool names, which the
+        // dispatch guard checks against. null = unrestricted; these tests exercise
+        // scheduling semantics, not the guard.
+        var m = agents.ParallelToolExecutor.class.getDeclaredMethod("executeToolsParallel",
+                List.class, Agent.class, Long.class, List.class,
+                java.util.function.Consumer.class, java.util.function.Consumer.class,
+                List.class, AtomicBoolean.class, AgentExecutionSink.class,
+                Set.class);
+        m.setAccessible(true);
+        m.invoke(null, calls, agent, convId, messages, null, null, null, cancelled, sink, null);
+    }
+
+    @Test
+    void differentToolsRunInParallel() throws Exception {
+        // Three calls to three different tools — each lands in its own
+        // tool-name group, so they run on separate virtual threads. Wall
+        // clock should be near TOOL_SLEEP_MS (parallel) not 3× it.
+        long[] ids = seedAgentAndConversation();
+        var agent = (Agent) Agent.findById(ids[0]);
+
+        var calls = List.of(
+                new ToolCall("call-a", "function", new FunctionCall("slow_a", "{}")),
+                new ToolCall("call-b", "function", new FunctionCall("slow_b", "{}")),
+                new ToolCall("call-c", "function", new FunctionCall("slow_c", "{}")));
+        var messages = new ArrayList<ChatMessage>();
+
+        long t0 = System.nanoTime();
+        invokeParallel(calls, agent, ids[1], messages, new AtomicBoolean(false));
+        long elapsedMs = (System.nanoTime() - t0) / 1_000_000L;
+
+        // Assert actual parallelism (not just wall-clock luck): peak
+        // concurrent executions should reach 3.
+        assertEquals(3, peakConcurrency.get(),
+                "expected all 3 tools running concurrently, peak was " + peakConcurrency.get());
+
+        // Wall clock should be closer to TOOL_SLEEP_MS than 3× that. Allow
+        // 2× slack to absorb JVM warmup / scheduling jitter in CI.
+        assertTrue(elapsedMs < TOOL_SLEEP_MS * 2,
+                "expected <%dms, got %dms".formatted(TOOL_SLEEP_MS * 2, elapsedMs));
+
+        // Order invariant: tool results appear in the same order as the
+        // input tool calls — LLM history would break if they didn't.
+        assertEquals(3, messages.size());
+        assertEquals("call-a", messages.get(0).toolCallId());
+        assertEquals("call-b", messages.get(1).toolCallId());
+        assertEquals("call-c", messages.get(2).toolCallId());
+    }
+
+    @Test
+    void sameToolCallsRunSequentiallyInDeclaredOrder() throws Exception {
+        // JCLAW-80 regression: when the LLM emits multiple calls to the
+        // SAME tool in one round, they must run on a single virtual thread
+        // in declared order — not race for a shared-state lock. This
+        // guarantees behavior is deterministic rather than depending on
+        // thread scheduling or lock-acquisition fairness.
+        long[] ids = seedAgentAndConversation();
+        var agent = (Agent) Agent.findById(ids[0]);
+
+        var calls = List.of(
+                new ToolCall("nav",    "function", new FunctionCall("slow_a", "{}")),
+                new ToolCall("click",  "function", new FunctionCall("slow_a", "{}")),
+                new ToolCall("shot",   "function", new FunctionCall("slow_a", "{}")));
+        var messages = new ArrayList<ChatMessage>();
+
+        long t0 = System.nanoTime();
+        invokeParallel(calls, agent, ids[1], messages, new AtomicBoolean(false));
+        long elapsedMs = (System.nanoTime() - t0) / 1_000_000L;
+
+        // Peak concurrency MUST be 1 — if parallelism leaked through we'd
+        // see 3, which is exactly the old bug.
+        assertEquals(1, peakConcurrency.get(),
+                "same-tool calls must be sequential; peak was " + peakConcurrency.get());
+
+        // Wall clock ≥ 3 × sleep confirms serial execution (minus trivial
+        // bookkeeping). Small slack on the lower bound for scheduling.
+        assertTrue(elapsedMs >= TOOL_SLEEP_MS * 3 - 50,
+                "expected ≥%dms (3× sleep), got %dms".formatted(TOOL_SLEEP_MS * 3, elapsedMs));
+
+        // Declared order preserved in results AND in the actual start order
+        // recorded by the tool itself.
+        assertEquals(3, messages.size());
+        assertEquals("nav",   messages.get(0).toolCallId());
+        assertEquals("click", messages.get(1).toolCallId());
+        assertEquals("shot",  messages.get(2).toolCallId());
+        assertEquals(List.of("slow_a:start", "slow_a:start", "slow_a:start"), executionOrder,
+                "all three started by slow_a in order (one thread, serial)");
+    }
+
+    @Test
+    void parallelSafeToolRunsAllCallsConcurrently() throws Exception {
+        // JCLAW-81: a tool that overrides parallelSafe() → true opts out of
+        // the same-tool-name group serialization. Three calls to one safe
+        // tool run on three virtual threads → peak = 3, wall ≈ 1× sleep.
+        long[] ids = seedAgentAndConversation();
+        var agent = (Agent) Agent.findById(ids[0]);
+
+        var calls = List.of(
+                new ToolCall("x1", "function", new FunctionCall("safe_x", "{}")),
+                new ToolCall("x2", "function", new FunctionCall("safe_x", "{}")),
+                new ToolCall("x3", "function", new FunctionCall("safe_x", "{}")));
+        var messages = new ArrayList<ChatMessage>();
+
+        long t0 = System.nanoTime();
+        invokeParallel(calls, agent, ids[1], messages, new AtomicBoolean(false));
+        long elapsedMs = (System.nanoTime() - t0) / 1_000_000L;
+
+        assertEquals(3, peakConcurrency.get(),
+                "parallel-safe tool should run all 3 calls concurrently; peak was "
+                        + peakConcurrency.get());
+        assertTrue(elapsedMs < TOOL_SLEEP_MS * 2,
+                "expected <%dms (parallel), got %dms".formatted(TOOL_SLEEP_MS * 2, elapsedMs));
+
+        // Result order still preserved — parallel execution but in-order commit.
+        assertEquals(List.of("x1", "x2", "x3"),
+                messages.stream().map(ChatMessage::toolCallId).toList());
+    }
+
+    @Test
+    void mixedSafeAndUnsafeCallsUsingRightStrategyPerGroup() throws Exception {
+        // JCLAW-81: a batch that mixes parallel-safe tools with a same-tool
+        // unsafe group should use per-call threads for the safe ones and a
+        // single serial thread for the unsafe group. Two safe calls + two
+        // unsafe-same-tool calls → 3 work units → peak = 3; the unsafe group
+        // bounds wall time at ~2× sleep (two serial steps).
+        long[] ids = seedAgentAndConversation();
+        var agent = (Agent) Agent.findById(ids[0]);
+
+        var calls = List.of(
+                new ToolCall("u1", "function", new FunctionCall("slow_a", "{}")),
+                new ToolCall("s1", "function", new FunctionCall("safe_x", "{}")),
+                new ToolCall("u2", "function", new FunctionCall("slow_a", "{}")),
+                new ToolCall("s2", "function", new FunctionCall("safe_y", "{}")));
+        var messages = new ArrayList<ChatMessage>();
+
+        long t0 = System.nanoTime();
+        invokeParallel(calls, agent, ids[1], messages, new AtomicBoolean(false));
+        long elapsedMs = (System.nanoTime() - t0) / 1_000_000L;
+
+        // 3 work units: {slow_a-group}, safe_x, safe_y — all start concurrently.
+        assertEquals(3, peakConcurrency.get(),
+                "expected peak concurrency of 3 (slow_a group + 2 safe calls); got "
+                        + peakConcurrency.get());
+
+        // Wall time bounded by the slowest work unit: the slow_a group runs
+        // 2 calls serially (~2× sleep), safe calls finish in 1× sleep.
+        assertTrue(elapsedMs >= TOOL_SLEEP_MS * 2 - 50,
+                "expected ≥%dms (slow_a serial group), got %dms"
+                        .formatted(TOOL_SLEEP_MS * 2, elapsedMs));
+        assertTrue(elapsedMs < TOOL_SLEEP_MS * 3,
+                "expected <%dms (not fully serial), got %dms"
+                        .formatted(TOOL_SLEEP_MS * 3, elapsedMs));
+
+        // Declared order preserved in commit.
+        assertEquals(List.of("u1", "s1", "u2", "s2"),
+                messages.stream().map(ChatMessage::toolCallId).toList());
+    }
+
+    @Test
+    void mixedCallsGroupByNameAndParallelizeAcrossGroups() throws Exception {
+        // [a, b, a, b] → two groups (a × 2, b × 2). Each group runs on its
+        // own virtual thread → 2 threads active at peak, not 4 (no
+        // within-group parallelism) and not 1 (no accidental single-thread
+        // serialization). Both groups finish in ~2 × TOOL_SLEEP_MS.
+        long[] ids = seedAgentAndConversation();
+        var agent = (Agent) Agent.findById(ids[0]);
+
+        var calls = List.of(
+                new ToolCall("a1", "function", new FunctionCall("slow_a", "{}")),
+                new ToolCall("b1", "function", new FunctionCall("slow_b", "{}")),
+                new ToolCall("a2", "function", new FunctionCall("slow_a", "{}")),
+                new ToolCall("b2", "function", new FunctionCall("slow_b", "{}")));
+        var messages = new ArrayList<ChatMessage>();
+
+        long t0 = System.nanoTime();
+        invokeParallel(calls, agent, ids[1], messages, new AtomicBoolean(false));
+        long elapsedMs = (System.nanoTime() - t0) / 1_000_000L;
+
+        assertEquals(2, peakConcurrency.get(),
+                "expected 2 groups running in parallel, peak was " + peakConcurrency.get());
+
+        // Two groups run in parallel, each sequential internally: ~2× sleep.
+        // Lower bound: not faster than one group's serial time (2 × sleep).
+        // Upper bound: not slower than fully serial (4 × sleep).
+        assertTrue(elapsedMs >= TOOL_SLEEP_MS * 2 - 50,
+                "groups should run in parallel but each is serial inside; got %dms".formatted(elapsedMs));
+        assertTrue(elapsedMs < TOOL_SLEEP_MS * 4,
+                "groups should parallelize, not run fully serial; got %dms".formatted(elapsedMs));
+
+        // Commit order still matches declared order regardless of which
+        // group finishes first.
+        assertEquals(List.of("a1", "b1", "a2", "b2"),
+                messages.stream().map(ChatMessage::toolCallId).toList());
+    }
+
+    @Test
+    void singleToolSkipsParallelOverhead() throws Exception {
+        long[] ids = seedAgentAndConversation();
+        var agent = (Agent) Agent.findById(ids[0]);
+
+        var calls = List.<ToolCall>of(
+                new ToolCall("solo", "function", new FunctionCall("slow_a", "{}")));
+        var messages = new ArrayList<ChatMessage>();
+
+        invokeParallel(calls, agent, ids[1], messages, new AtomicBoolean(false));
+
+        assertEquals(1, messages.size());
+        assertEquals("solo", messages.getFirst().toolCallId());
+        // Peak concurrency should be 1 — no spurious virtual thread fan-out.
+        assertEquals(1, peakConcurrency.get());
+    }
+
+    @Test
+    void differentlyNamedToolsWithSharedSerializationGroupRunSequentially() throws Exception {
+        // Regression for the subagent_spawn + subagent_yield race:
+        // two distinct unsafe tools that share state (e.g. one inserts the
+        // SubagentRun row, the other reads it) must serialize even when
+        // their names differ. Both opt into the shared "subagent_lifecycle"
+        // group via {@link ToolRegistry.Tool#serializationGroup}.
+        //
+        // Before the fix, name-keyed grouping placed these in two separate
+        // VTs running in parallel — yield's findById could fire before
+        // spawn's INSERT committed and return null. After the fix, the
+        // shared group key collapses them into one serial queue in
+        // declared order: spawn finishes (commits the row) before yield
+        // begins (reads it).
+        ToolRegistry.publish(List.of(
+                sleepTool("fake_spawn", false, "subagent_lifecycle"),
+                sleepTool("fake_yield", false, "subagent_lifecycle"),
+                // A separate unsafe tool with the default (name-keyed) group
+                // must NOT be dragged into the shared queue — confirms the
+                // grouping is by key, not by some global "all-unsafe" sink.
+                sleepTool("unrelated_unsafe", false)));
+        long[] ids = seedAgentAndConversation();
+        var agent = (Agent) Agent.findById(ids[0]);
+
+        var calls = List.of(
+                new ToolCall("spawn", "function", new FunctionCall("fake_spawn", "{}")),
+                new ToolCall("yield", "function", new FunctionCall("fake_yield", "{}")),
+                new ToolCall("other", "function", new FunctionCall("unrelated_unsafe", "{}")));
+        var messages = new ArrayList<ChatMessage>();
+
+        long t0 = System.nanoTime();
+        invokeParallel(calls, agent, ids[1], messages, new AtomicBoolean(false));
+        long elapsedMs = (System.nanoTime() - t0) / 1_000_000L;
+
+        // Shared-group pair runs on ONE VT; unrelated_unsafe runs on its own VT.
+        // Peak concurrency therefore is 2, never 3 — if peak == 3, the shared
+        // group was not honored and spawn/yield were racing again.
+        assertEquals(2, peakConcurrency.get(),
+                "expected peak concurrency of 2 (shared group + 1 unrelated VT); got "
+                        + peakConcurrency.get());
+
+        // Declared order inside the shared group is the load-bearing invariant:
+        // fake_spawn:start MUST appear before fake_yield:start in the
+        // execution-order log, regardless of VT scheduling. The unrelated tool
+        // can interleave in any position relative to the pair.
+        int spawnIdx = executionOrder.indexOf("fake_spawn:start");
+        int yieldIdx = executionOrder.indexOf("fake_yield:start");
+        assertTrue(spawnIdx >= 0 && yieldIdx >= 0,
+                "both shared-group tools must record their start: " + executionOrder);
+        assertTrue(spawnIdx < yieldIdx,
+                "fake_spawn must start before fake_yield in the shared group; got "
+                        + executionOrder);
+
+        // Wall-clock floor: shared group runs 2 calls serially => >= 2x sleep.
+        // Upper bound: unrelated_unsafe runs concurrently with the group, so
+        // total stays below 3x sleep (fully serial would be 3x sleep).
+        assertTrue(elapsedMs >= TOOL_SLEEP_MS * 2 - 50,
+                "shared-group serialization should take >=%dms, got %dms"
+                        .formatted(TOOL_SLEEP_MS * 2, elapsedMs));
+        assertTrue(elapsedMs < TOOL_SLEEP_MS * 3,
+                "unrelated_unsafe should still run in parallel with the shared group; got %dms"
+                        .formatted(elapsedMs));
+
+        // Commit-order invariant unchanged: results land in declared input order.
+        assertEquals(List.of("spawn", "yield", "other"),
+                messages.stream().map(ChatMessage::toolCallId).toList());
+    }
+
+    @Test
+    void serializationGroupOverrideBeatsDefaultNameGrouping() throws Exception {
+        // Boundary check: when two tools share a serializationGroup key and
+        // a THIRD tool keeps the default (its own name as the key), the
+        // override-pair serializes against each other but not against the
+        // third tool.
+        //
+        // This pins the lookup contract in ToolRegistry.serializationGroupFor:
+        // the override is honored even when one of the participating tools
+        // hasn't opted in by name match. Without this, a future regression
+        // that special-cased "share group only when both tools agree on the
+        // override" would let yield race spawn again on the first turn after
+        // a registry reload.
+        ToolRegistry.publish(List.of(
+                sleepTool("pair_alpha", false, "shared_state"),
+                sleepTool("pair_beta",  false, "shared_state"),
+                sleepTool("loner",      false))); // default group = "loner"
+        long[] ids = seedAgentAndConversation();
+        var agent = (Agent) Agent.findById(ids[0]);
+
+        var calls = List.of(
+                new ToolCall("p1", "function", new FunctionCall("pair_alpha", "{}")),
+                new ToolCall("p2", "function", new FunctionCall("pair_beta",  "{}")),
+                new ToolCall("p3", "function", new FunctionCall("pair_alpha", "{}")),
+                new ToolCall("l1", "function", new FunctionCall("loner",      "{}")));
+        var messages = new ArrayList<ChatMessage>();
+
+        invokeParallel(calls, agent, ids[1], messages, new AtomicBoolean(false));
+
+        // 4 calls, 2 work units: {shared_state group of 3} + {loner singleton}.
+        // Peak == 2: the shared group's single VT + loner's own VT.
+        assertEquals(2, peakConcurrency.get(),
+                "shared_state group should run on ONE VT in parallel with loner; got peak "
+                        + peakConcurrency.get());
+
+        // Inside the shared group, the three calls run in declared order
+        // (p1: pair_alpha, p2: pair_beta, p3: pair_alpha). The execution-order
+        // log records the start of each — extract just the shared-group rows
+        // and assert the order matches LLM-declared.
+        var sharedGroupStarts = executionOrder.stream()
+                .filter(s -> s.startsWith("pair_alpha:") || s.startsWith("pair_beta:"))
+                .toList();
+        assertEquals(List.of("pair_alpha:start", "pair_beta:start", "pair_alpha:start"),
+                sharedGroupStarts,
+                "shared-group calls must execute in declared order on one VT");
+
+        assertEquals(List.of("p1", "p2", "p3", "l1"),
+                messages.stream().map(ChatMessage::toolCallId).toList());
+    }
+
+    @Test
+    void cancellationSkipsRemainingTools() throws Exception {
+        long[] ids = seedAgentAndConversation();
+        var agent = (Agent) Agent.findById(ids[0]);
+
+        var cancelled = new AtomicBoolean(true); // already cancelled
+        var calls = List.of(
+                new ToolCall("x", "function", new FunctionCall("slow_a", "{}")),
+                new ToolCall("y", "function", new FunctionCall("slow_b", "{}")));
+        var messages = new ArrayList<ChatMessage>();
+
+        invokeParallel(calls, agent, ids[1], messages, cancelled);
+
+        // With isCancelled true going in, no tool should have run.
+        assertEquals(0, peakConcurrency.get());
+        assertEquals(0, messages.size());
+    }
+
+    /** Records which JPA EntityManager each persisted write ran under. Play binds
+     *  exactly one EntityManager per transaction, so the distinct count is the
+     *  number of transactions the commit phase opened. */
+    private static final class TxRecordingSink extends ConversationSink {
+        private final Set<EntityManager> ems = Collections.newSetFromMap(new IdentityHashMap<>());
+        private int writes;
+
+        TxRecordingSink(Conversation conversation) {
+            super(conversation);
+        }
+
+        @Override
+        public void appendToolResult(String toolCallId, String result, String structuredJson) {
+            ems.add(JPA.em());
+            writes++;
+            super.appendToolResult(toolCallId, result, structuredJson);
+        }
+    }
+
+    @Test
+    void toolRoundCommitsOnceForTheWholeBatch() throws Exception {
+        // JCLAW-751: the commit phase runs where dispatch leaves it — a background
+        // thread with no ambient transaction — so a Tx.run per tool call cost a
+        // connection checkout, begin and commit per call. Three calls, one commit.
+        var sinkRef = new AtomicReference<TxRecordingSink>();
+        var failure = new AtomicReference<Throwable>();
+        var messages = new ArrayList<ChatMessage>();
+        var calls = List.of(
+                new ToolCall("t1", "function", new FunctionCall("safe_x", "{}")),
+                new ToolCall("t2", "function", new FunctionCall("safe_x", "{}")),
+                new ToolCall("t3", "function", new FunctionCall("safe_x", "{}")));
+
+        // The test method itself runs inside Play's per-invocation transaction, which
+        // would swallow the distinction (Tx.run joins an ambient one). Seed AND run on
+        // a thread that has none, which is also the production shape. The unique agent
+        // name keeps the committed row clear of concurrently-running test classes.
+        var runner = Thread.ofPlatform().start(() -> {
+            try {
+                var ids = seedAgentAndConversation("one-tx-" + System.nanoTime());
+                Agent agent = Tx.run(() -> Agent.findById(ids[0]));
+                Conversation conv = Tx.run(() -> ConversationService.findById(ids[1]));
+                var sink = new TxRecordingSink(conv);
+                sinkRef.set(sink);
+                invokeParallel(calls, agent, ids[1], messages, new AtomicBoolean(false), sink);
+            } catch (Throwable t) {
+                failure.set(t);
+            }
+        });
+        runner.join();
+        if (failure.get() != null) throw new IllegalStateException(failure.get());
+
+        assertEquals(3, messages.size());
+        assertEquals(3, sinkRef.get().writes, "every call must still be persisted");
+        assertEquals(1, sinkRef.get().ems.size(),
+                "the whole round must commit in ONE transaction; saw " + sinkRef.get().ems.size());
+    }
+
+    @Test
+    void generatedAttachmentFramesCarryTheSameShapeAsAConversationReload() throws Exception {
+        // JCLAW-1231: the live tool_call frame and the reload response each built the
+        // per-attachment JSON themselves, and the frame's copy had lost `deleted`.
+        var att = new models.MessageAttachment();
+        att.uuid = "att-uuid";
+        att.originalFilename = "render.png";
+        att.mimeType = "image/png";
+        att.sizeBytes = 1234L;
+        att.kind = models.MessageAttachment.KIND_IMAGE;
+        att.generated = true;
+
+        var m = agents.ParallelToolExecutor.class.getDeclaredMethod(
+                "generatedAttachmentsJson", List.class);
+        m.setAccessible(true);
+        var frame = com.google.gson.JsonParser.parseString((String) m.invoke(null, List.of(att)))
+                .getAsJsonArray().get(0).getAsJsonObject();
+
+        assertEquals(services.AttachmentService.toView(att).keySet(), frame.keySet(),
+                "the streamed frame must carry the same keys the reload response does");
+        assertFalse(frame.get("deleted").getAsBoolean(),
+                "a freshly generated attachment is present, so the chip shows no deleted marker");
+    }
+
+    // --- the turn's stop signal reaches the tool (JCLAW-1274) ---------------------------------
+
+    /** Records what {@link ToolContext#cancelled()} reads before and after {@code stop} runs mid-call. */
+    private static ToolRegistry.Tool stopWatcher(Runnable stop, List<String> seen) {
+        return new ToolRegistry.Tool() {
+            @Override public String name() { return "stop_watch"; }
+            @Override public String description() { return "Watches the stop signal for the test."; }
+            @Override public Map<String, Object> parameters() {
+                return Map.of("type", "object", "properties", Map.of());
+            }
+            @Override public String execute(String argsJson, Agent agent) {
+                var before = ToolContext.cancelled();
+                stop.run();
+                seen.add(before + "->" + ToolContext.cancelled());
+                return "ok";
+            }
+        };
+    }
+
+    private static final ToolCall WATCH = new ToolCall("watch", "function", new FunctionCall("stop_watch", "{}"));
+    private static final ToolCall ALONGSIDE = new ToolCall("x1", "function", new FunctionCall("safe_x", "{}"));
+
+    @Test
+    void theStopFlagReachesASingleCall() throws Exception {
+        long[] ids = seedAgentAndConversation();
+        var agent = (Agent) Agent.findById(ids[0]);
+        var cancelled = new AtomicBoolean();
+        var seen = Collections.synchronizedList(new ArrayList<String>());
+        ToolRegistry.publish(List.of(stopWatcher(() -> cancelled.set(true), seen)));
+
+        invokeParallel(List.of(WATCH), agent, ids[1], new ArrayList<>(), cancelled);
+
+        assertEquals(List.of("false->true"), seen);
+    }
+
+    @Test
+    void theStopFlagReachesACallInAMultiCallBatch() throws Exception {
+        long[] ids = seedAgentAndConversation();
+        var agent = (Agent) Agent.findById(ids[0]);
+        var cancelled = new AtomicBoolean();
+        var seen = Collections.synchronizedList(new ArrayList<String>());
+        ToolRegistry.publish(List.of(stopWatcher(() -> cancelled.set(true), seen), sleepTool("safe_x", true)));
+
+        invokeParallel(List.of(WATCH, ALONGSIDE), agent, ids[1], new ArrayList<>(), cancelled);
+
+        assertEquals(List.of("false->true"), seen);
+    }
+
+    @Test
+    void aSubagentStopReachesACallOnAWorkUnitThread() throws Exception {
+        // The run's scope is bound to the child's own thread; a multi-call batch runs each call on another.
+        long[] ids = seedAgentAndConversation();
+        var agent = (Agent) Agent.findById(ids[0]);
+        var runId = -ThreadLocalRandom.current().nextLong(1, Long.MAX_VALUE);
+        var seen = Collections.synchronizedList(new ArrayList<String>());
+        ToolRegistry.publish(List.of(stopWatcher(() -> SubagentRegistry.requestStop(runId), seen),
+                sleepTool("safe_x", true)));
+        SubagentRegistry.register(runId, new CompletableFuture<Void>());
+        try {
+            SubagentRegistry.callAsRun(runId, () -> {
+                invokeParallel(List.of(WATCH, ALONGSIDE), agent, ids[1], new ArrayList<>(), null);
+                return null;
+            });
+        } finally {
+            SubagentRegistry.unregister(runId);
+        }
+
+        assertEquals(List.of("false->true"), seen);
+    }
+}

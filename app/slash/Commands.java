@@ -1,0 +1,1477 @@
+package slash;
+
+import channels.TelegramModelSelector;
+import com.google.gson.JsonParser;
+import llm.LlmTypes.ModelInfo;
+import llm.ProviderRegistry;
+import llm.routing.ModelRouter;
+import models.Agent;
+import models.Conversation;
+import models.EventLog;
+import models.Message;
+import models.Prompt;
+import models.SubagentRun;
+import org.jspecify.annotations.Nullable;
+import services.ConfigService;
+import services.ConversationQueue;
+import services.ConversationService;
+import services.EventLogger;
+import services.ModelOverrideResolver;
+import services.SessionCompactor;
+import services.SubagentRegistry;
+import services.Tx;
+import utils.AppClock;
+
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Locale;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.function.Supplier;
+
+/**
+ * Chat slash-command registry and dispatcher (JCLAW-26).
+ *
+ * <p>Commands are parsed at the channel entry points (web SSE, web sync,
+ * Telegram streaming, generic channel) BEFORE the LLM round fires. A
+ * recognized command short-circuits the turn: the caller persists a canned
+ * assistant response, optionally mutates conversation state, and returns
+ * without invoking the model. Unknown slash-prefixed input falls through
+ * as normal user text — no hard rejection.
+ *
+ * <p>The "do nothing if not mine" contract is important: slash literals
+ * like {@code /start} (Telegram bot-open auto-message) MUST pass through
+ * to the LLM unless a future ticket handles them here explicitly.
+ *
+ * <h2>Persistence model</h2>
+ * The user's slash text is <b>not</b> persisted as a message — it's a
+ * control signal, not conversation content. The bot's canned response IS
+ * persisted as an assistant message in the target conversation so history
+ * reload shows the acknowledgment.
+ *
+ * <h2>/reset ordering</h2>
+ * {@link Conversation#contextSince} is written <i>after</i> the assistant
+ * response is appended, so the acknowledgment stays out of the next LLM
+ * context window (its {@code createdAt} will be less than the watermark).
+ */
+public final class Commands {
+
+    // Event-log category for all entries emitted by the slash dispatcher.
+    private static final String EVENT_CATEGORY_SLASH = "SLASH_COMMAND";
+
+    // Suffix appended to log messages when a conversation id is in scope; the
+    // call sites concatenate ` for conversation ` + current.id to keep grep-able.
+    private static final String FOR_CONVERSATION_SUFFIX = " for conversation ";
+
+    // Capability-display tokens used in the /model output and reused across vision/audio/thinking.
+    private static final String CAP_SUPPORTED = "supported";
+    private static final String CAP_NOT_SUPPORTED = "not supported";
+
+    // Trailing-token line suffix in the /usage response — each line ends "<n> tokens\n".
+    private static final String TOKENS_LINE_SUFFIX = " tokens\n";
+
+    // Common error responses from the /subagent subcommand parser.
+    private static final String MISSING_RUN_ID_MSG = "Missing run id.";
+    private static final String NOT_FOUND_SUFFIX = " not found.";
+
+    // Reply to an owner-only command invoked by a turn the channel could not attribute to the owner.
+    private static final String NOT_OWNER_MSG = "Only the operator can use this command.";
+
+    private Commands() {}
+
+    /**
+     * Recognized commands. Unknown slash-prefixed input returns empty
+     * Optional from {@link #parse}.
+     *
+     * <p>The {@code shortDescription} is the string shown in Telegram's
+     * native autocomplete dropdown when the user types {@code /}
+     * (JCLAW-99). Keep them short — Telegram truncates long descriptions.
+     */
+    public enum Command {
+        NEW("/new", "Start a fresh conversation"),
+        RESET("/reset", "Clear the LLM's memory for this conversation"),
+        COMPACT("/compact", "Summarize older turns to free context"),
+        HELP("/help", "Show available commands"),
+        MODEL("/model", "Show current model and its capabilities"),
+        THINK("/think", "Set reasoning effort for this conversation"),
+        USAGE("/usage", "Show context usage for this conversation"),
+        STOP("/stop", "Interrupt the current generation"),
+        SUBAGENT("/subagent", "Inspect, kill, or read transcripts of subagent runs"),
+        // Deliberately channel-neutral: the web composer inserts the text for
+        // editing, every other channel replies with it to copy — a bot cannot
+        // prefill a message box on Telegram or Slack (JCLAW-1073).
+        PROMPT("/prompt", "Use a saved prompt from your library");
+
+        public final String literal;
+        public final String shortDescription;
+        Command(String literal, String shortDescription) {
+            this.literal = literal;
+            this.shortDescription = shortDescription;
+        }
+
+        /** Name without the leading slash — the form Telegram's BotCommand expects. */
+        public String bareName() { return literal.substring(1); }
+    }
+
+    /** Canned response text for {@link Command#HELP}. */
+    public static final String HELP_TEXT = """
+            Available commands:
+            • /new — start a fresh conversation (creates a new thread)
+            • /reset — clear the LLM's memory for this conversation (keeps the thread)
+            • /compact — summarize older turns to free context (optional: /compact focus-hint)
+            • /help — show this message
+            • /model — show current model and its capabilities (/model NAME switches this conversation)
+            • /think — reasoning effort for this conversation (/think off, /think level, /think reset)
+            • /usage — show context usage for this conversation
+            • /stop — interrupt the current generation
+            • /subagent — inspect, kill, or read transcripts (list, info ID, log ID, kill ID, history ID)
+            • /prompt — use a saved prompt from your library (/prompt search-words)""";
+
+    /**
+     * Canned response for {@link Command#NEW}. The leading {@code >} line
+     * becomes an HTML {@code <blockquote>} via {@code TelegramMarkdownFormatter},
+     * which Telegram renders with a colored vertical bar on the left edge —
+     * a native, unmistakable session-boundary marker. Web chat renders the
+     * same markdown with its own blockquote styling, so the visual cue
+     * works across both channels without channel-specific content.
+     */
+    public static final String NEW_TEXT = """
+            > New Conversation
+
+            What would you like to discuss?""";
+
+    /** Canned response for {@link Command#RESET}. See {@link #NEW_TEXT} for the blockquote rationale. */
+    public static final String RESET_TEXT = """
+            > Context Cleared
+
+            I no longer remember our earlier exchange in this conversation.""";
+
+    /**
+     * Outcome of handling a slash command.
+     *
+     * @param conversation  the (possibly new) Conversation the command
+     *                      ran against — slash commands like {@code /new}
+     *                      open a fresh Conversation, so the caller
+     *                      must use this rather than the request's
+     *                      original conversation
+     * @param responseText  user-visible reply text (markdown) the
+     *                      transport should render
+     * @param command       which {@link Command} the input parsed as
+     */
+    public record Result(@Nullable Conversation conversation, String responseText, Command command) {}
+
+    /**
+     * Parse the first token of {@code text} as a recognized command.
+     * Case-insensitive. Leading/trailing whitespace ignored. Anything
+     * after the command (e.g. {@code "/help foo bar"}) is discarded —
+     * commands don't currently take arguments.
+     */
+    public static Optional<Command> parse(String text) {
+        if (text == null) return Optional.empty();
+        var trimmed = text.strip();
+        if (!trimmed.startsWith("/")) return Optional.empty();
+        var firstSpace = indexOfWhitespace(trimmed);
+        var head = firstSpace < 0 ? trimmed : trimmed.substring(0, firstSpace);
+        head = stripBotSuffix(head);
+        for (var cmd : Command.values()) {
+            if (cmd.literal.equalsIgnoreCase(head)) return Optional.of(cmd);
+        }
+        return Optional.empty();
+    }
+
+    /**
+     * JCLAW-367: Telegram addresses a bot in a group as {@code /cmd@botname}.
+     * Strip the trailing {@code @<botusername>} from a command token so the
+     * enum match sees the bare {@code /cmd}. A token without an {@code @}
+     * suffix is returned unchanged; the {@code @} is only stripped from a
+     * leading-slash command token, never from arguments (those aren't passed
+     * here — {@code head} is the first whitespace-delimited token).
+     */
+    private static String stripBotSuffix(String head) {
+        if (!head.startsWith("/")) return head;
+        int at = head.indexOf('@');
+        return at < 0 ? head : head.substring(0, at);
+    }
+
+    private static int indexOfWhitespace(String s) {
+        for (int i = 0; i < s.length(); i++) {
+            if (Character.isWhitespace(s.charAt(i))) return i;
+        }
+        return -1;
+    }
+
+    /**
+     * Convenience: {@link #parse} + {@link #execute}. Returns empty when
+     * the text is not a recognized slash command (including unknown
+     * slash-prefixed input) — caller should proceed with the normal LLM
+     * flow in that case.
+     *
+     * @param current may be null only for channels that haven't resolved a
+     *                conversation yet; {@code /reset} and {@code /help}
+     *                will be treated as no-ops in that case.
+     */
+    public static Optional<Result> handle(String text, Agent agent, String channelType,
+                                           String peerId, @Nullable Conversation current) {
+        return parse(text).map(cmd -> execute(cmd, agent, channelType, peerId, current, extractArgs(text)));
+    }
+
+    /**
+     * Extract the argument portion of a slash-command text — everything after
+     * the first whitespace. Returns null when the command has no arguments.
+     * {@code /model openrouter/gpt-5} yields {@code "openrouter/gpt-5"};
+     * {@code /model} yields null.
+     *
+     * <p>Public so callers that already {@link #parse} can thread the raw
+     * user text through the args-carrying {@link #execute} overload
+     * without re-running the parser.
+     */
+    public static @Nullable String extractArgs(String text) {
+        if (text == null) return null;
+        var trimmed = text.strip();
+        var firstSpace = indexOfWhitespace(trimmed);
+        if (firstSpace < 0) return null;
+        var rest = trimmed.substring(firstSpace + 1).strip();
+        return rest.isEmpty() ? null : rest;
+    }
+
+    /**
+     * JCLAW-349: Slack reserves {@code /}-prefixed input for native slash commands,
+     * which Slack refuses to deliver inside a thread — and the Assistant pane is a
+     * thread, so {@code /reset} can never reach the bot there. On Slack the lifecycle
+     * commands are therefore typed with a {@code !} prefix in an ordinary message,
+     * which Slack delivers normally. Rewrite a leading {@code !<known-command>} to
+     * its canonical {@code /<command>} form so the shared interception
+     * ({@link #parse}/{@link #execute}) handles it unchanged — args survive
+     * ({@code !model x/y} → {@code /model x/y}). Anything else — a bare {@code !}, an
+     * unknown {@code !foo}, or non-{@code !} text — is returned verbatim so it flows
+     * to the LLM as normal content.
+     */
+    public static String rewriteBangCommand(String text) {
+        if (text == null || text.length() < 2 || text.charAt(0) != '!') return text;
+        var candidate = "/" + text.substring(1);
+        return parse(candidate).isPresent() ? candidate : text;
+    }
+
+    /**
+     * True when {@code text}'s first token is {@code /start} (case-insensitive).
+     *
+     * <p>{@code /start} is deliberately NOT a {@link Command}: on Telegram it
+     * must fall through to the LLM once a conversation exists, so it can't go
+     * through the always-short-circuiting {@link #execute} path. The Telegram
+     * entry point (JCLAW-97) checks this and only intercepts the FIRST contact,
+     * running the {@link #startIntroPrompt} self-introduction turn.
+     */
+    public static boolean isStart(String text) {
+        if (text == null) return false;
+        var trimmed = text.strip();
+        var firstSpace = indexOfWhitespace(trimmed);
+        var head = firstSpace < 0 ? trimmed : trimmed.substring(0, firstSpace);
+        // JCLAW-367: tolerate the Telegram group form /start@botname.
+        head = stripBotSuffix(head);
+        return "/start".equalsIgnoreCase(head);
+    }
+
+    /** Execute a previously-parsed command. See class javadoc for side effects. */
+    public static Result execute(Command cmd, Agent agent, String channelType,
+                                  String peerId, @Nullable Conversation current) {
+        return execute(cmd, agent, channelType, peerId, current, null);
+    }
+
+    /**
+     * Argument-aware execute overload (JCLAW-108). {@code args} is the text
+     * following the command literal with leading/trailing whitespace stripped;
+     * null or empty when none. Only {@code /model} currently consumes args:
+     * {@code /model NAME} writes the conversation-scoped override,
+     * {@code /model reset} clears it.
+     *
+     * <p>Treats the turn as owner-initiated; a channel that can carry a guest calls the
+     * {@code ownerInitiated} overload instead.
+     */
+    public static Result execute(Command cmd, Agent agent, String channelType,
+                                  String peerId, @Nullable Conversation current, @Nullable String args) {
+        return execute(cmd, agent, channelType, peerId, current, args, true);
+    }
+
+    /**
+     * JCLAW-1228: owner-gated execute. {@code ownerInitiated} is false whenever the channel
+     * could not attribute the turn to the binding owner — a guest in a Telegram group, any
+     * WhatsApp sender, or a user of an owner-less Slack binding. Owner-only commands are
+     * refused for such a turn; every other command runs unchanged.
+     */
+    public static Result execute(Command cmd, Agent agent, String channelType, String peerId,
+                                  @Nullable Conversation current, @Nullable String args,
+                                  boolean ownerInitiated) {
+        if (!ownerInitiated && ownerOnly(cmd, args)) {
+            EventLogger.warn(EVENT_CATEGORY_SLASH, Agent.nameOf(agent), channelType,
+                    "Refused %s from a non-owner turn on peer=%s".formatted(cmd.literal, peerId));
+            // Not persisted: a guest's refused command must not write into the owner's transcript.
+            return new Result(current, NOT_OWNER_MSG, cmd);
+        }
+        return switch (cmd) {
+            case NEW -> executeNew(agent, channelType, peerId);
+            case RESET -> executeReset(agent, channelType, current);
+            case COMPACT -> executeCompact(agent, channelType, current, args);
+            case HELP -> executeHelp(agent, channelType, current);
+            case MODEL -> executeModel(agent, channelType, current, args);
+            case THINK -> executeThink(agent, channelType, current, args);
+            case USAGE -> executeUsage(agent, channelType, current);
+            case STOP -> executeStop(agent, channelType, current);
+            case SUBAGENT -> executeSubagent(agent, channelType, current, args);
+            case PROMPT -> executePrompt(agent, channelType, current, args);
+        };
+    }
+
+    /** {@code /subagent} reaches every run on the instance and {@code /prompt} returns the
+     *  operator's library; of the {@code /model} forms only the writes (NAME, reset) qualify —
+     *  bare and {@code status} just read. */
+    private static boolean ownerOnly(Command cmd, @Nullable String args) {
+        return switch (cmd) {
+            case SUBAGENT, PROMPT -> true;
+            case MODEL -> args != null && !args.isBlank() && !args.equalsIgnoreCase("status");
+            case NEW, RESET, COMPACT, HELP, THINK, USAGE, STOP -> false;
+        };
+    }
+
+    private static Result executeNew(Agent agent, String channelType, String peerId) {
+        var newConv = Tx.run(() -> {
+            var conv = ConversationService.create(agent, channelType, peerId);
+            ConversationService.appendAssistantMessage(conv, NEW_TEXT, null);
+            return conv;
+        });
+        EventLogger.info(EVENT_CATEGORY_SLASH, Agent.nameOf(agent), channelType,
+                "/new → new conversation %d for peer=%s".formatted(newConv.id, peerId));
+        return new Result(newConv, NEW_TEXT, Command.NEW);
+    }
+
+    /**
+     * The synthetic instruction that drives the {@code /start} self-introduction
+     * (JCLAW-430). Sent to the LLM in place of the bare {@code /start} so the
+     * agent introduces itself in its own voice — its identity/persona comes from
+     * its md-file system prompt, already assembled — and lists the slash commands
+     * (supplied here so they're always accurate). The AgentRunner /start path
+     * runs it as a normal streaming turn on a fresh conversation.
+     */
+    public static String startIntroPrompt() {
+        return """
+                A new user just opened a chat with you by sending /start. Introduce \
+                yourself in your own voice: briefly say who you are and what you can \
+                help them with, drawing on your identity and instructions. Then list \
+                the slash commands they can use:
+                • /new — start a fresh conversation
+                • /reset — clear your memory for this chat
+                • /compact — summarize older turns to free up context
+                • /help — show the command list
+                • /model — show the current model
+                • /usage — show context usage for this chat
+                • /stop — interrupt a response in progress
+                • /subagent — inspect, kill, or read subagent transcripts
+                Keep it concise and friendly.""";
+    }
+
+    private static Result executeReset(Agent agent, String channelType, @Nullable Conversation current) {
+        if (current == null) {
+            var fallback = "No active conversation to reset.";
+            EventLogger.warn(EVENT_CATEGORY_SLASH, Agent.nameOf(agent), channelType,
+                    "/reset with no current conversation");
+            return new Result(null, fallback, Command.RESET);
+        }
+        final Long convId = current.id;
+        var updated = Tx.run(() -> {
+            var conv = (Conversation) Conversation.findById(convId);
+            if (conv == null) return null;
+            // The ack text is delivered to the user by the caller (via SSE
+            // complete frame on web, sink.seal on Telegram) but NOT persisted
+            // as a Message row. /reset is a control signal; storing it as
+            // content created a timing-sensitive filter rule (the ack's
+            // createdAt had to align with contextSince across JDBC driver
+            // rounding) that flaked on lower-resolution Linux clocks.
+            // Keeping it transient sidesteps the problem entirely — the
+            // event_log entry below is the durable record of the reset.
+            conv.contextSince = AppClock.now();
+            conv.save();
+            return conv;
+        });
+        EventLogger.info(EVENT_CATEGORY_SLASH, Agent.nameOf(agent), channelType,
+                "/reset for conversation %d".formatted(convId));
+        return new Result(updated != null ? updated : current, RESET_TEXT, Command.RESET);
+    }
+
+    /**
+     * {@code /stop} — interrupt an in-flight assistant turn for this conversation.
+     *
+     * <p>Sets {@link services.ConversationQueue#cancellationFlag} so
+     * {@link agents.AgentRunner}'s {@code checkCancelled} polls short-circuit
+     * the streaming loop on the next checkpoint. The shared
+     * {@code AtomicBoolean} works because {@code tryAcquire} (which any active
+     * stream has already passed through) creates the {@code QueueState} via
+     * {@code computeIfAbsent} — so the streaming thread and this dispatcher
+     * thread receive the same object reference, and the volatile write is
+     * visible immediately.
+     *
+     * <p>On Telegram this fully interrupts in-flight processing. On web,
+     * {@code AgentRunner.runStreaming} polls a per-request token created in
+     * {@code ApiChatController}, not {@code ConversationQueue.cancellationFlag},
+     * so this command is largely a no-op there — the in-product stop button
+     * remains the primary mechanism for the web channel. Worth keeping in
+     * the shared registry anyway: typed {@code /stop} surfaces uniformly
+     * across channels and the web reply is informative either way.
+     *
+     * <p>Like {@code /reset}, the ack is delivered via the channel transport
+     * (SSE complete frame on web, sink.seal on Telegram) but NOT persisted
+     * as a Message row — {@code /stop} is a control signal, not conversation
+     * content, and persisting "Stopped." next to whatever partial assistant
+     * content the canceled stream left behind would clutter history and
+     * skew {@code /usage} accounting.
+     */
+    private static Result executeStop(Agent agent, String channelType, @Nullable Conversation current) {
+        if (current == null) {
+            EventLogger.info(EVENT_CATEGORY_SLASH, Agent.nameOf(agent), channelType,
+                    "/stop with no current conversation");
+            return new Result(null, "No active conversation. Nothing to stop.", Command.STOP);
+        }
+        if (!ConversationQueue.isBusy(current.id)) {
+            EventLogger.info(EVENT_CATEGORY_SLASH, Agent.nameOf(agent), channelType,
+                    "/stop for conversation %d — nothing in flight".formatted(current.id));
+            return new Result(current, "Nothing to stop.", Command.STOP);
+        }
+        ConversationQueue.cancellationFlag(current.id).set(true);
+        EventLogger.info(EVENT_CATEGORY_SLASH, Agent.nameOf(agent), channelType,
+                "/stop signalled cancellation for conversation %d".formatted(current.id));
+        return new Result(current, "Stopped.", Command.STOP);
+    }
+
+    /**
+     * {@code /compact [hint]} — manually trigger session compaction
+     * (JCLAW-38). Bypasses the auto-trigger's too-few-turns guard so
+     * users can summarize on demand even on smaller conversations, and
+     * accepts an optional guidance hint that's appended to the
+     * summarization prompt (e.g. {@code /compact focus on the SQL
+     * migration work}).
+     *
+     * <p>Cycle-safety is preserved — boundaries still anchor at user
+     * messages, so tool_call/tool_result pairs are never split. The
+     * response is a canned acknowledgment with turn-count and rough
+     * token size of the summary; the summary itself is in the DB
+     * ({@link models.SessionCompaction}) and re-injected into the next
+     * turn's system prompt by {@link services.SessionCompactor#appendSummaryToPrompt}.
+     *
+     * <p>Runs the summarization LLM call synchronously on the caller's
+     * thread — the channel's response shows up only after the
+     * summarizer returns. This matches {@code /model NAME}'s validation
+     * latency and is acceptable for an explicit user-requested action.
+     */
+    private static Result executeCompact(Agent agent, String channelType, @Nullable Conversation current,
+                                          @Nullable String args) {
+        if (current == null) {
+            var fallback = "No active conversation to compact.";
+            EventLogger.warn(EVENT_CATEGORY_SLASH, Agent.nameOf(agent), channelType,
+                    "/compact with no current conversation");
+            return new Result(null, fallback, Command.COMPACT);
+        }
+
+        // Provider selection mirrors AgentRunner.run: override → agent default → registry primary.
+        // The router (JCLAW-1222) resolves to its chat-class model, as for any call outside a turn.
+        var configured = ModelOverrideResolver.resolve(current, agent);
+        var resolved = ModelRouter.concrete(configured.provider(), configured.modelId());
+        var providerName = resolved != null ? resolved.provider() : configured.provider();
+        var primary = ProviderRegistry.get(providerName);
+        if (primary == null) primary = ProviderRegistry.getPrimary();
+        if (primary == null) {
+            var msg = "> Compaction failed\n\nNo LLM provider is configured. Add one in Settings.";
+            persistCompactAckAndLog(agent, channelType, current, msg, "no-provider");
+            return new Result(current, msg, Command.COMPACT);
+        }
+
+        var modelId = resolved != null ? resolved.modelId() : configured.modelId();
+        var modelLabel = primary.config().name() + "/" + modelId;
+        var maxOutput = ConfigService.getInt("chat.compactionMaxTokens", 8192);
+
+        final var capturedPrimary = primary;
+        final var capturedModelId = modelId;
+        SessionCompactor.Summarizer summarizer = sumMsgs -> {
+            // Slash-command-triggered compaction has no inbound chat-channel
+            // context (it runs on a programmatic invocation), so dispatcher_wait
+            // for this call records under "unknown".
+            var resp = capturedPrimary.chat(
+                    Objects.requireNonNull(capturedModelId, "no model configured for compaction"),
+                    sumMsgs, List.of(), maxOutput, null, null);
+            return SessionCompactor.firstChoiceText(resp);
+        };
+
+        var result = SessionCompactor.compact(current.id, modelLabel, summarizer,
+                /*force*/ true, args);
+        var responseText = buildCompactResponseText(result, args);
+        persistCompactAckAndLog(agent, channelType, current, responseText,
+                result.compacted() ? "compacted %d turns".formatted(result.turnsCompacted())
+                        : "skipped: " + result.skipReason());
+
+        return new Result(current, responseText, Command.COMPACT);
+    }
+
+    /**
+     * Format the canned ack for {@link #executeCompact} — Telegram and
+     * web both render the leading {@code >} as a blockquote for a clear
+     * visual boundary.
+     */
+    private static String buildCompactResponseText(SessionCompactor.CompactionResult result, @Nullable String args) {
+        if (!result.compacted()) {
+            var reason = result.skipReason();
+            if ("no safe boundary or below min-turns".equals(reason)) {
+                return "> Nothing to compact\n\nThis conversation doesn't have enough earlier turns to summarize yet.";
+            }
+            if ("llm error".equals(reason)) {
+                return "> Compaction failed\n\nThe summarization LLM call errored out. Older turns remain in the active context.";
+            }
+            if ("empty summary".equals(reason)) {
+                return "> Compaction failed\n\nThe summarization model returned an empty response. Older turns remain in the active context.";
+            }
+            return "> Compaction skipped\n\n" + (reason != null ? reason : "unknown reason");
+        }
+        var approxTokens = Math.max(1, result.summaryChars() / 4);
+        var hintNote = (args != null && !args.isBlank()) ? " (guidance: " + args.strip() + ")" : "";
+        return """
+                > Conversation Compacted%s
+
+                Summarized %d earlier turns into ~%d tokens. Older messages remain in history and will stop being shipped to the model starting next turn."""
+                .formatted(hintNote, result.turnsCompacted(), approxTokens);
+    }
+
+    private static void persistCompactAckAndLog(Agent agent, String channelType,
+                                                 Conversation current, String text, String outcome) {
+        final Long convId = current.id;
+        final String responseFinal = text;
+        Tx.run(() -> {
+            var conv = (Conversation) Conversation.findById(convId);
+            if (conv != null) {
+                ConversationService.appendAssistantMessage(conv, responseFinal, null);
+            }
+        });
+        EventLogger.info(EVENT_CATEGORY_SLASH, Agent.nameOf(agent), channelType,
+                "/compact for conversation %d: %s".formatted(convId, outcome));
+    }
+
+    /**
+     * {@code /prompt <query>} — reply with a saved prompt's text so the user can
+     * copy, edit and send it (JCLAW-1073).
+     *
+     * <p>Replying rather than running it keeps the property the web picker
+     * protects: the user sees and adjusts the prompt before the model does. The
+     * web composer intercepts {@code /prompt} client-side and inserts the text
+     * directly, so this branch is what every other channel gets — a bot cannot
+     * prefill a message box on Telegram or Slack.
+     *
+     * <p>Ambiguity is reported, never guessed: running the wrong 2000-character
+     * prompt costs a model call and a confusing answer.
+     */
+    private static Result executePrompt(Agent agent, String channelType, @Nullable Conversation current,
+                                         @Nullable String args) {
+        // Prompt.findAllOrdered issues a JPQL query and needs an active
+        // EntityManager, so the whole handler is wrapped exactly as /usage is:
+        // the Telegram polling thread has no request-scoped transaction, and
+        // Tx.run joins the web one rather than opening a second.
+        var responseFinal = Tx.run(() -> {
+            var all = Prompt.findAllOrdered();
+            String response;
+            if (all.isEmpty()) {
+                response = "No saved prompts yet. Add some on the Prompts page.";
+            } else if (args == null) {
+                response = "Usage: /prompt <search words>\n\nSaved prompts:\n" + titleList(all);
+            } else {
+                var matches = matchPrompts(all, args);
+                response = switch (matches.size()) {
+                    case 0 -> "No saved prompt matches \"" + args + "\".\n\nSaved prompts:\n" + titleList(all);
+                    case 1 -> renderPrompt(matches.getFirst());
+                    default -> "Several prompts match \"" + args + "\" — narrow the search:\n" + titleList(matches);
+                };
+            }
+            persistCannedResponseInTx(current, response);
+            return response;
+        });
+        EventLogger.info(EVENT_CATEGORY_SLASH, Agent.nameOf(agent), channelType,
+                "/prompt " + (args == null ? "(list)" : args)
+                        + (current != null ? FOR_CONVERSATION_SUFFIX + current.id : ""));
+        return new Result(current, responseFinal, Command.PROMPT);
+    }
+
+    /** Title/tag substring match, case-insensitive — the same rule the web picker uses. */
+    private static List<Prompt> matchPrompts(List<Prompt> all, String query) {
+        var q = query.strip().toLowerCase();
+        return all.stream()
+                .filter(p -> p.title.toLowerCase().contains(q)
+                        || (p.tags != null && p.tags.toLowerCase().contains(q)))
+                .toList();
+    }
+
+    private static String titleList(List<Prompt> prompts) {
+        var sb = new StringBuilder();
+        for (var p : prompts) {
+            sb.append("• ").append(p.title).append('\n');
+        }
+        return sb.toString().stripTrailing();
+    }
+
+    /**
+     * Title, then the body inside a fenced block. The fence is what makes this
+     * copyable: Telegram and Slack both render it as a code block with a
+     * one-tap copy control, and the content is a prompt to reuse verbatim.
+     */
+    private static String renderPrompt(Prompt p) {
+        return "**" + p.title + "**\n\n```\n" + p.content + "\n```";
+    }
+
+    private static Result executeHelp(Agent agent, String channelType, @Nullable Conversation current) {
+        var helpText = helpTextFor(channelType);
+        if (current != null) {
+            final Long convId = current.id;
+            Tx.run(() -> {
+                var conv = (Conversation) Conversation.findById(convId);
+                if (conv != null) {
+                    ConversationService.appendAssistantMessage(conv, helpText, null);
+                }
+            });
+        }
+        EventLogger.info(EVENT_CATEGORY_SLASH, Agent.nameOf(agent), channelType,
+                "/help" + (current != null ? FOR_CONVERSATION_SUFFIX + current.id : ""));
+        return new Result(current, helpText, Command.HELP);
+    }
+
+    /**
+     * Channel-appropriate help listing. On Slack the lifecycle commands are invoked
+     * with a {@code !} prefix (JCLAW-349 — slash commands don't reach threads), so
+     * the Slack help lists the {@code !} forms; every other channel uses the
+     * canonical {@code /} forms ({@link #HELP_TEXT}). The Slack listing is built from
+     * {@link Command} so it can't drift from the actual command set.
+     */
+    public static String helpTextFor(String channelType) {
+        if (!"slack".equals(channelType)) return HELP_TEXT;
+        var sb = new StringBuilder(
+                "Available commands — Slack reserves / for slash commands (which don't work in "
+                + "threads), so use a ! prefix:\n");
+        for (var c : Command.values()) {
+            sb.append("• !").append(c.bareName()).append(" — ").append(c.shortDescription).append('\n');
+        }
+        return sb.toString();
+    }
+
+    /**
+     * {@code /model} — three argument forms (JCLAW-107 for the first, JCLAW-108
+     * for the other two):
+     * <ul>
+     *   <li>{@code /model} — show the current model's identity, capabilities,
+     *       context window, and pricing. Honors any conversation-scoped
+     *       override when displaying.</li>
+     *   <li>{@code /model NAME} — set the conversation-scoped override to
+     *       {@code NAME} (parsed as {@code provider/model-id}). Validates
+     *       the pair exists in the provider registry; writes both override
+     *       columns atomically; includes a shrinkage warning when the new
+     *       model's context window is smaller than the current input-token
+     *       estimate.</li>
+     *   <li>{@code /model reset} — clear the override, reverting to the
+     *       agent's default.</li>
+     * </ul>
+     * Validation failures render a helpful response; no state is mutated.
+     */
+    private static Result executeModel(Agent agent, String channelType, @Nullable Conversation current,
+                                        @Nullable String args) {
+        if (args == null || args.isBlank()) {
+            return executeModelSummary(agent, channelType, current);
+        }
+        if (args.equalsIgnoreCase("status")) {
+            // /model status — the full detail view, callable explicitly on any channel.
+            return executeModelStatus(agent, channelType, current);
+        }
+        if (args.equalsIgnoreCase("reset")) {
+            return executeModelReset(agent, channelType, current);
+        }
+        return executeModelSwitch(agent, channelType, current, args);
+    }
+
+    /**
+     * JCLAW-109: on Telegram, render the short summary with an inline-keyboard selector.
+     * The handler sends the keyboard message itself via TelegramChannel.sendMessageWithKeyboard,
+     * so we return an empty responseText — processInboundForAgentStreaming skips the default
+     * sink.seal when the text is empty. Web/tests/no-conversation fall back to full detail.
+     */
+    private static Result executeModelSummary(Agent agent, String channelType, @Nullable Conversation current) {
+        if ("telegram".equals(channelType) && current != null && agent != null) {
+            var delivered = TelegramModelSelector.sendSummary(agent, current);
+            EventLogger.info(EVENT_CATEGORY_SLASH, agent.name, channelType,
+                    "/model (summary+keyboard) for conversation " + current.id
+                            + (delivered ? "" : " — delivery failed"));
+            return new Result(current, delivered ? "" : buildModelResponse(agent, current), Command.MODEL);
+        }
+        return persistAndLogModel(agent, channelType, current, "/model",
+                () -> buildModelResponse(agent, current));
+    }
+
+    private static Result executeModelStatus(Agent agent, String channelType, @Nullable Conversation current) {
+        return persistAndLogModel(agent, channelType, current, "/model status",
+                () -> buildModelResponse(agent, current));
+    }
+
+    private static Result executeModelReset(Agent agent, String channelType, @Nullable Conversation current) {
+        return persistAndLogModel(agent, channelType, current, "/model reset",
+                () -> performModelReset(agent, current));
+    }
+
+    private static Result executeModelSwitch(Agent agent, String channelType, @Nullable Conversation current,
+                                              String args) {
+        return persistAndLogModel(agent, channelType, current, "/model " + args,
+                () -> performModelSwitch(agent, current, args));
+    }
+
+    /** Tx-wrap response build, persist a canned assistant message, and emit the SLASH_COMMAND event log. */
+    private static Result persistAndLogModel(Agent agent, String channelType, @Nullable Conversation current,
+                                             String logPrefix, Supplier<String> build) {
+        return persistAndLog(agent, channelType, current, logPrefix, build, Command.MODEL);
+    }
+
+    private static Result persistAndLog(Agent agent, String channelType, @Nullable Conversation current,
+                                        String logPrefix, Supplier<String> build, Command command) {
+        var responseText = Tx.run(() -> {
+            var text = build.get();
+            persistCannedResponseInTx(current, text);
+            return text;
+        });
+        EventLogger.info(EVENT_CATEGORY_SLASH, Agent.nameOf(agent), channelType,
+                logPrefix + (current != null ? FOR_CONVERSATION_SUFFIX + current.id : ""));
+        return new Result(current, responseText, command);
+    }
+
+    // ---- /think (JCLAW-1196): the conversation's reasoning effort, never the agent's default ----
+
+    private static Result executeThink(Agent agent, String channelType, @Nullable Conversation current,
+                                       @Nullable String args) {
+        var trimmed = args == null ? "" : args.strip();
+        return persistAndLog(agent, channelType, current, "/think" + (trimmed.isEmpty() ? "" : " " + trimmed),
+                () -> performThink(agent, current, trimmed), Command.THINK);
+    }
+
+    /** Body of {@code /think}: no argument reports, {@code reset} clears, anything else sets. */
+    public static String performThink(@Nullable Agent agent, @Nullable Conversation current, String args) {
+        if (agent == null) return "No agent bound to this conversation.";
+        if (args.isEmpty()) return buildThinkResponse(agent, current);
+        if (current == null) return "No active conversation — cannot change thinking without a target.";
+        var managed = (Conversation) Conversation.findById(current.id);
+        if (managed == null) return "Conversation disappeared mid-change — try again.";
+        if (args.equalsIgnoreCase("reset")) {
+            boolean hadOverride = managed.thinkingModeOverride != null;
+            ConversationService.setThinkingOverride(managed, null);
+            return hadOverride
+                    ? "Cleared the conversation's thinking override. Reverted to agent default ("
+                            + describeAgentThinking(agent) + ")."
+                    : "This conversation had no thinking override. The agent default ("
+                            + describeAgentThinking(agent) + ") remains in effect.";
+        }
+        var mode = args.toLowerCase(Locale.ROOT);
+        var rejection = ConversationService.thinkingOverrideRejection(
+                ModelOverrideResolver.provider(current, agent), ModelOverrideResolver.modelId(current, agent), mode);
+        if (rejection != null) {
+            return rejection + " Use `/think off`, `/think <level>` or `/think reset`; `/model` lists the levels.";
+        }
+        ConversationService.setThinkingOverride(managed, mode);
+        var what = Conversation.THINKING_OFF.equals(mode)
+                ? "Thinking is off for this conversation."
+                : "Thinking effort for this conversation is now `" + mode + "`.";
+        return what + "\nAgent default (" + describeAgentThinking(agent)
+                + ") is unchanged. Use `/think reset` to revert this conversation.";
+    }
+
+    static String buildThinkResponse(Agent agent, @Nullable Conversation current) {
+        var model = resolveModel(agent, current);
+        var effective = ModelOverrideResolver.thinkingMode(current, agent);
+        var sb = new StringBuilder("Thinking: ");
+        if (model.isEmpty() || !model.get().supportsThinking()) {
+            sb.append("not supported by ").append(effectiveProviderName(agent, current))
+                    .append('/').append(effectiveModelIdFor(agent, current));
+        } else {
+            sb.append(effective == null ? "off" : "effort " + effective);
+            var levels = model.get().effectiveThinkingLevels();
+            if (!levels.isEmpty()) sb.append("\nLevels: ").append(String.join(", ", levels));
+        }
+        if (ModelOverrideResolver.hasThinkingOverride(current)) {
+            sb.append("\n(Conversation override active — agent default is ")
+                    .append(describeAgentThinking(agent)).append(')');
+        }
+        sb.append("\nUse `/think off`, `/think <level>` or `/think reset`.");
+        return sb.toString();
+    }
+
+    private static String describeAgentThinking(Agent agent) {
+        return agent.thinkingMode == null || agent.thinkingMode.isBlank() ? "off" : agent.thinkingMode;
+    }
+
+    /**
+     * {@code /usage} — render the current conversation's context usage. Sums
+     * the latest assistant turn's {@code prompt} and {@code completion} tokens
+     * (current context size, not lifetime — lifetime cost is JCLAW-108's
+     * aggregator) and expresses the prompt as a percentage of the resolved
+     * model's {@code contextWindow}. Divide-by-zero is guarded: if the
+     * discovered model has no context window, the percentage is rendered as
+     * "unknown (model metadata incomplete)".
+     */
+    private static Result executeUsage(Agent agent, String channelType, @Nullable Conversation current) {
+        // buildUsageResponse calls ConversationService.loadRecentMessages,
+        // which issues a JPQL query and needs an active EntityManager. Wrap
+        // the full handler in Tx.run so the polling-thread entry point
+        // (Telegram) gets a transaction — the web SSE path already runs
+        // inside a request-scoped tx, and Tx.run joins that instead of
+        // opening a new one.
+        var responseText = Tx.run(() -> {
+            var text = buildUsageResponse(agent, current);
+            persistCannedResponseInTx(current, text);
+            return text;
+        });
+        EventLogger.info(EVENT_CATEGORY_SLASH, Agent.nameOf(agent), channelType,
+                "/usage" + (current != null ? FOR_CONVERSATION_SUFFIX + current.id : ""));
+        return new Result(current, responseText, Command.USAGE);
+    }
+
+    /**
+     * Persist a canned (slash-command) assistant reply when the caller has
+     * already opened a transaction. Avoids a redundant Tx.run() nesting when
+     * the handler body is itself wrapped in one (the {@code /usage} case,
+     * which reads message history).
+     */
+    private static void persistCannedResponseInTx(@Nullable Conversation current, String responseText) {
+        if (current == null) return;
+        var conv = (Conversation) Conversation.findById(current.id);
+        if (conv != null) {
+            ConversationService.appendAssistantMessage(conv, responseText, null);
+        }
+    }
+
+    /**
+     * Lookup the effective model in its provider's configured model list.
+     * Honors the conversation-scoped override (JCLAW-108) when present;
+     * otherwise falls back to the agent's default model.
+     */
+    private static Optional<ModelInfo> resolveModel(Agent agent, @Nullable Conversation current) {
+        return ModelRouter.findModel(effectiveProviderName(agent, current), effectiveModelIdFor(agent, current));
+    }
+
+    /** Resolve the effective provider name — override when present, else agent default. */
+    private static @Nullable String effectiveProviderName(Agent agent, @Nullable Conversation current) {
+        return ModelOverrideResolver.provider(current, agent);
+    }
+
+    /** Resolve the effective model id — override when present, else agent default. */
+    private static @Nullable String effectiveModelIdFor(Agent agent, @Nullable Conversation current) {
+        return ModelOverrideResolver.modelId(current, agent);
+    }
+
+    public static String buildModelResponse(Agent agent, @Nullable Conversation current) {
+        if (agent == null) return "No agent bound to this conversation.";
+        var providerName = effectiveProviderName(agent, current);
+        var modelId = effectiveModelIdFor(agent, current);
+        var overrideActive = ModelOverrideResolver.hasOverride(current);
+        var model = resolveModel(agent, current);
+        if (model.isEmpty()) {
+            return "Model not found in provider config (%s/%s). Re-assign the agent's model or restore the provider entry."
+                    .formatted(providerName, modelId);
+        }
+        var m = model.get();
+        var thinkingLine = m.supportsThinking()
+                ? CAP_SUPPORTED + renderThinkingSelection(agent, current, m)
+                : CAP_NOT_SUPPORTED;
+        var sb = new StringBuilder();
+        sb.append("Model: ").append(providerName).append('/').append(modelId).append('\n');
+        if (overrideActive) {
+            // Make the scope explicit — users coming from OpenClaw expect
+            // session-scoped switches; JClaw's override is conversation-scoped
+            // and a /model reset returns to the agent default.
+            sb.append("(Conversation override active — agent default is ")
+                    .append(agent.modelProvider).append('/').append(agent.modelId)
+                    .append(")\n");
+        }
+        if (m.name() != null && !m.name().isBlank() && !m.name().equals(modelId)) {
+            sb.append("Display name: ").append(m.name()).append('\n');
+        }
+        sb.append("Provider: ").append(providerName).append('\n');
+        sb.append("Context window: ").append(formatTokenCapacity(m.contextWindow())).append('\n');
+        sb.append("Max output: ").append(formatTokenCapacity(m.maxTokens())).append('\n');
+        sb.append("Thinking: ").append(thinkingLine).append('\n');
+        sb.append("Vision: ").append(m.supportsVision() ? CAP_SUPPORTED : CAP_NOT_SUPPORTED).append('\n');
+        sb.append("Audio: ").append(m.supportsAudio() ? CAP_SUPPORTED : CAP_NOT_SUPPORTED).append('\n');
+        sb.append("Video: ").append(m.supportsVideo() ? CAP_SUPPORTED : CAP_NOT_SUPPORTED).append('\n');
+        sb.append("Tools: ").append(m.toolCallingSupported() ? CAP_SUPPORTED : CAP_NOT_SUPPORTED).append('\n');
+        sb.append("Pricing (per 1M tokens): ").append(formatPricing(m));
+        return sb.toString();
+    }
+
+    /**
+     * Execute {@code /model NAME} — parse NAME as {@code provider/model-id},
+     * validate, write the override, and return a confirmation (possibly with
+     * a shrinkage warning). Validation failures return an explanatory message
+     * without mutating state. Caller is responsible for opening the transaction.
+     */
+    public static String performModelSwitch(Agent agent, @Nullable Conversation current, String args) {
+        if (current == null) {
+            return "No active conversation — cannot switch models without a target.";
+        }
+        if (agent == null) {
+            return "No agent bound to this conversation — cannot switch models.";
+        }
+        int slash = args.indexOf('/');
+        if (slash <= 0 || slash == args.length() - 1) {
+            return "Unrecognized model format. Use `/model provider/model-id` "
+                    + "(for example `/model openrouter/google-flash-preview`) "
+                    + "or `/model reset` to revert to the agent default.";
+        }
+        var newProvider = args.substring(0, slash).strip();
+        var newModelId = args.substring(slash + 1).strip();
+        if (newProvider.isEmpty() || newModelId.isEmpty()) {
+            return "Unrecognized model format. Use `/model provider/model-id` "
+                    + "(for example `/model openrouter/google-flash-preview`).";
+        }
+        if (!ModelRouter.PROVIDER.equals(newProvider) && ProviderRegistry.get(newProvider) == null) {
+            return "Provider `%s` is not configured. Available providers appear under Settings → Providers; "
+                    .formatted(newProvider)
+                    + "add one there before switching to it.";
+        }
+        var resolved = ModelRouter.findModel(newProvider, newModelId);
+        if (resolved.isEmpty()) {
+            return "Provider `%s` has no model with id `%s`. Run `/model` to see the current model "
+                    .formatted(newProvider, newModelId)
+                    + "or check Settings → Providers for the available list.";
+        }
+
+        // Warn if the new model's context window is smaller than the estimated
+        // current context size — the next turn's trim will drop oldest messages.
+        var shrinkage = computeShrinkageWarning(resolved.get(), current);
+
+        // Reload the persistence-context entity so the save() below writes to
+        // the managed instance, not a detached copy.
+        var managed = (Conversation) Conversation.findById(current.id);
+        if (managed == null) {
+            return "Conversation disappeared mid-switch — try again.";
+        }
+        ConversationService.setModelOverride(managed, newProvider, newModelId);
+
+        var sb = new StringBuilder();
+        sb.append("Switched this conversation to `").append(newProvider).append('/').append(newModelId).append("`.\n");
+        sb.append("Agent default (").append(agent.modelProvider).append('/').append(agent.modelId)
+                .append(") is unchanged. Use `/model reset` to revert this conversation.");
+        if (shrinkage != null) sb.append('\n').append(shrinkage);
+        return sb.toString();
+    }
+
+    /**
+     * Execute {@code /model reset} — clear both override columns, revert to the
+     * agent default, and return a confirmation. Caller owns the transaction.
+     */
+    static String performModelReset(Agent agent, @Nullable Conversation current) {
+        if (current == null) {
+            return "No active conversation — nothing to reset.";
+        }
+        if (agent == null) {
+            return "No agent bound to this conversation — cannot reset.";
+        }
+        var managed = (Conversation) Conversation.findById(current.id);
+        if (managed == null) {
+            return "Conversation disappeared mid-reset — try again.";
+        }
+        boolean hadOverride = managed.modelProviderOverride != null && managed.modelIdOverride != null;
+        ConversationService.clearModelOverride(managed);
+        if (!hadOverride) {
+            return "This conversation had no override. The agent default (" + agent.modelProvider
+                    + "/" + agent.modelId + ") remains in effect.";
+        }
+        return "Cleared the conversation's model override. Reverted to agent default "
+                + agent.modelProvider + "/" + agent.modelId + ".";
+    }
+
+    /**
+     * Compute a human-readable shrinkage warning when switching to a model
+     * whose context window is smaller than the estimated current context size.
+     * The size estimate is the latest assistant turn's {@code prompt} — i.e.
+     * what was actually in the model's view on the last turn, same signal
+     * JCLAW-107's {@code /usage} uses. Returns null when no warning applies.
+     */
+    private static @Nullable String computeShrinkageWarning(ModelInfo newModel, Conversation current) {
+        int newWindow = newModel.contextWindow();
+        if (newWindow <= 0) return null;
+        var messages = ConversationService.loadRecentMessages(current);
+        var latest = findLatestAssistantUsage(messages);
+        if (latest.isEmpty()) return null;
+        int currentInput = latest.get().prompt();
+        if (currentInput <= newWindow) return null;
+        return "Warning: %s's %s context window is smaller than the current context (%s estimated). "
+                .formatted(newModel.id(), formatTokenCapacity(newWindow), formatTokens(currentInput))
+                + "Older messages will be trimmed on the next turn.";
+    }
+
+    private static String renderThinkingSelection(Agent agent, @Nullable Conversation current, ModelInfo m) {
+        var mode = ModelOverrideResolver.thinkingMode(current, agent);
+        var scope = ModelOverrideResolver.hasThinkingOverride(current) ? ", conversation override" : "";
+        if (mode == null || mode.isBlank()) return " (not currently enabled" + scope + ")";
+        var levels = m.thinkingLevels();
+        if (levels != null && !levels.isEmpty() && !levels.contains(mode)) {
+            return " (current setting %s is not advertised by this model — effectively off%s)"
+                    .formatted(mode, scope);
+        }
+        return " (effort: %s%s)".formatted(mode, scope);
+    }
+
+    private static String formatPricing(ModelInfo m) {
+        if (m.promptPrice() < 0 && m.completionPrice() < 0
+                && m.cachedReadPrice() < 0 && m.cacheWritePrice() < 0) {
+            return "unknown";
+        }
+        var parts = new ArrayList<String>(4);
+        parts.add("input " + formatPrice(m.promptPrice()));
+        parts.add("output " + formatPrice(m.completionPrice()));
+        parts.add("cache read " + formatPrice(m.cachedReadPrice()));
+        parts.add("cache write " + formatPrice(m.cacheWritePrice()));
+        return String.join(", ", parts);
+    }
+
+    private static String formatPrice(double perMillion) {
+        if (perMillion < 0) return "n/a";
+        if (perMillion == 0) return "free";
+        // Keep two decimals up to $9.99, three for sub-dollar granularity.
+        return perMillion < 1.0
+                ? "$%.3f".formatted(perMillion)
+                : "$%.2f".formatted(perMillion);
+    }
+
+    static String buildUsageResponse(Agent agent, @Nullable Conversation current) {
+        if (current == null) return "No active conversation — no usage to report.";
+        // JCLAW-108: resolveModel honors the conversation override; the Model
+        // line below also reflects the effective id so switching mid-chat
+        // shows the new model in subsequent /usage output.
+        var model = resolveModel(agent, current);
+        var effectiveProvider = effectiveProviderName(agent, current);
+        var effectiveModel = effectiveModelIdFor(agent, current);
+        var messages = ConversationService.loadRecentMessages(current);
+        var latest = findLatestAssistantUsage(messages);
+        int prompt = latest.map(TokenUsage::prompt).orElse(0);
+        int completion = latest.map(TokenUsage::completion).orElse(0);
+        int total = prompt + completion;
+
+        var sb = new StringBuilder();
+        sb.append("Input: ").append(formatTokens(prompt)).append(TOKENS_LINE_SUFFIX);
+        sb.append("Output: ").append(formatTokens(completion)).append(TOKENS_LINE_SUFFIX);
+        sb.append("Total: ").append(formatTokens(total)).append(TOKENS_LINE_SUFFIX);
+        sb.append("Context: ").append(renderContextLine(prompt, model)).append('\n');
+        sb.append("Model: ")
+                .append(effectiveProvider != null ? effectiveProvider : "?")
+                .append('/')
+                .append(effectiveModel != null ? effectiveModel : "?");
+        return sb.toString();
+    }
+
+    /**
+     * Walk messages newest-first, returning a {@code TokenUsage} from the
+     * most recent assistant turn that has usage data. Skips user, tool, and
+     * assistant-without-usage rows (fresh conversations, turns without provider
+     * usage, slash-command acks). Returns an empty Optional when no such turn
+     * exists — callers render zeros in that case.
+     */
+    private record TokenUsage(int prompt, int completion) {}
+
+    private static Optional<TokenUsage> findLatestAssistantUsage(List<Message> messages) {
+        if (messages == null || messages.isEmpty()) return Optional.empty();
+        for (int i = messages.size() - 1; i >= 0; i--) {
+            var m = messages.get(i);
+            if (!"assistant".equals(m.role)) continue;
+            if (m.usageJson == null || m.usageJson.isBlank()) continue;
+            try {
+                var obj = JsonParser.parseString(m.usageJson).getAsJsonObject();
+                // Skip durationMs-only rows (canceled turns, turns where the
+                // provider didn't return usage). Those carry no "prompt" field
+                // and reporting them as "current context = 0" would mislead
+                // the user when the actual last successful turn had real
+                // context. Keep scanning back for a turn with real tokens.
+                if (!obj.has("prompt")) continue;
+                int prompt = obj.get("prompt").getAsInt();
+                int completion = obj.has("completion") ? obj.get("completion").getAsInt() : 0;
+                return Optional.of(new TokenUsage(prompt, completion));
+            } catch (Exception _) {
+                // Malformed usageJson — skip and keep scanning.
+            }
+        }
+        return Optional.empty();
+    }
+
+    private static String renderContextLine(int prompt, Optional<ModelInfo> model) {
+        if (model.isEmpty() || model.get().contextWindow() <= 0) {
+            return "unknown (model metadata incomplete)";
+        }
+        int cw = model.get().contextWindow();
+        int pct = (int) Math.round(prompt * 100.0 / cw);
+        return "%d%% of %s tokens used".formatted(pct, formatTokenCapacity(cw));
+    }
+
+    /**
+     * Render a token count as a human-friendly capacity string: {@code 200000} →
+     * {@code "200K"}, {@code 1000000} → {@code "1M"}, {@code 2048000} →
+     * {@code "2.0M"}. Uses decimal (1K = 1000) matching provider-published
+     * context-window values like Anthropic's "200K" and Google's "2M". Returns
+     * {@code "?"} when the value is non-positive.
+     */
+    private static String formatTokenCapacity(int tokens) {
+        if (tokens <= 0) return "?";
+        if (tokens >= 1_000_000) {
+            double m = tokens / 1_000_000.0;
+            return m == Math.floor(m) ? "%.0fM".formatted(m) : "%.1fM".formatted(m);
+        }
+        if (tokens >= 1_000) return "%dK".formatted(tokens / 1_000);
+        return Integer.toString(tokens);
+    }
+
+    private static String formatTokens(int tokens) {
+        return "%,d".formatted(tokens);
+    }
+
+    // ── /subagent ─────────────────────────────────────────────────────────
+    //
+    // JCLAW-271: operator-facing introspection + kill surface for subagent
+    // runs spawned by the current parent conversation. The five subcommands
+    // map 1:1 to the AC:
+    //   list           — RUNNING + recently-terminal rows scoped to current
+    //   info <id>      — full metadata for a single run
+    //   log <id>       — chronological EventLog rows matching run id
+    //   kill <id>      — flip RUNNING → KILLED, interrupt the VT, emit event
+    //   history <id>   — JCLAW-274: child conversation transcript (role,
+    //                    content, tool calls/results, timestamps), formatted
+    //                    as plain text for chat-bubble display
+    // Output is plain text suitable for a chat bubble; the SubagentRuns
+    // admin page (separate Vue route) gets the same data via the new
+    // /api/subagent-runs REST endpoint, and full transcripts via the
+    // "View transcript" per-row link that opens the child conversation in
+    // the standard chat viewer.
+
+    /** Max EventLog rows returned by {@code /subagent log}. Chosen so the
+     *  output stays readable in a chat bubble while still covering a
+     *  multi-turn child run's typical event-rate. */
+    private static final int SUBAGENT_LOG_LIMIT = 50;
+
+    /** JCLAW-274: max messages rendered inline by {@code /subagent history}.
+     *  Long transcripts get the first N + a footer pointing at the admin
+     *  page's "View transcript" link. Lower than {@link #SUBAGENT_LOG_LIMIT}
+     *  because per-message content is far chunkier than per-event lines. */
+    private static final int SUBAGENT_HISTORY_LIMIT = 20;
+
+    /** JCLAW-274: per-message content hard cap when rendering inline. The
+     *  full content stays accessible via the conversation viewer; this just
+     *  keeps a runaway LLM essay from monopolising a chat bubble. */
+    private static final int SUBAGENT_HISTORY_CONTENT_CAP = 500;
+
+    private static Result executeSubagent(Agent agent, String channelType,
+                                           @Nullable Conversation current, @Nullable String args) {
+        var sub = parseSubagentArgs(args);
+        var responseText = Tx.run(() -> {
+            var text = buildSubagentResponse(agent, current, sub);
+            persistCannedResponseInTx(current, text);
+            return text;
+        });
+        EventLogger.info(EVENT_CATEGORY_SLASH, Agent.nameOf(agent), channelType,
+                "/subagent " + (sub.kind() != null ? sub.kind() : "(no-args)")
+                        + (sub.id() != null ? " " + sub.id() : "")
+                        + (current != null ? FOR_CONVERSATION_SUFFIX + current.id : ""));
+        return new Result(current, responseText, Command.SUBAGENT);
+    }
+
+    /** Outcome of parsing the subcommand portion of {@code /subagent ARGS}. */
+    private record SubagentArgs(@Nullable String kind, @Nullable Long id, @Nullable String error) {
+
+        /** The subcommand, non-null whenever {@link #error()} is null — every branch
+         *  that leaves {@code kind} unset sets {@code error}. */
+        String resolvedKind() {
+            if (kind == null) throw new IllegalStateException("SubagentArgs.kind is null; check error() first");
+            return kind;
+        }
+    }
+
+    private static SubagentArgs parseSubagentArgs(@Nullable String args) {
+        if (args == null || args.isBlank()) {
+            return new SubagentArgs("list", null, null);
+        }
+        var trimmed = args.strip();
+        var space = indexOfWhitespace(trimmed);
+        var head = (space < 0 ? trimmed : trimmed.substring(0, space)).toLowerCase();
+        var rest = space < 0 ? "" : trimmed.substring(space + 1).strip();
+        return switch (head) {
+            case "list" -> new SubagentArgs("list", null, null);
+            case "info", "log", "kill", "history" -> {
+                if (rest.isEmpty()) {
+                    yield new SubagentArgs(head, null,
+                            "Missing run id. Usage: /subagent " + head + " <run-id>");
+                }
+                try {
+                    yield new SubagentArgs(head, Long.parseLong(rest), null);
+                } catch (NumberFormatException _) {
+                    yield new SubagentArgs(head, null,
+                            "Invalid run id '" + rest + "' — expected a numeric SubagentRun id.");
+                }
+            }
+            default -> new SubagentArgs(null, null,
+                    "Unknown subcommand '" + head + "'. "
+                            + "Available: list, info <id>, log <id>, kill <id>, history <id>.");
+        };
+    }
+
+    /** Build the response text for a parsed {@code /subagent} call. Must run
+     *  inside a Tx so the DB lookups have an active EntityManager. */
+    private static String buildSubagentResponse(Agent agent, @Nullable Conversation current, SubagentArgs sub) {
+        var error = sub.error();
+        if (error != null) {
+            return error;
+        }
+        return switch (sub.resolvedKind()) {
+            case "list" -> renderSubagentList(current);
+            case "info" -> renderSubagentInfo(sub.id());
+            case "log" -> renderSubagentLog(sub.id());
+            case "kill" -> renderSubagentKill(agent, sub.id());
+            case "history" -> renderSubagentHistory(agent, sub.id());
+            default -> "Unknown /subagent subcommand.";
+        };
+    }
+
+    private static String renderSubagentList(@Nullable Conversation current) {
+        if (current == null) {
+            return "No active conversation — /subagent list requires a parent conversation.";
+        }
+        // AC: scoped to the current parent conversation. RUNNING first, then
+        // most recent. JPQL doesn't allow enum literals in ORDER BY, so we
+        // fetch with a startedAt-DESC sort and re-sort in Java to lift the
+        // RUNNING rows to the top (stable, small N — limit 50). Limit a
+        // generous 50 so a long-running parent's history still fits;
+        // anything more goes to the admin page.
+        List<SubagentRun> runs = SubagentRun.find(
+                "parentConversation = ?1 ORDER BY startedAt DESC",
+                current).fetch(50);
+        if (runs.isEmpty()) {
+            return "No subagent runs in this conversation.";
+        }
+        runs = new ArrayList<>(runs);
+        runs.sort((a, b) -> {
+            int aRunning = a.status == SubagentRun.Status.RUNNING ? 0 : 1;
+            int bRunning = b.status == SubagentRun.Status.RUNNING ? 0 : 1;
+            if (aRunning != bRunning) return Integer.compare(aRunning, bRunning);
+            // Tie-break: newer first. startedAt is non-null per @PrePersist.
+            return b.startedAt.compareTo(a.startedAt);
+        });
+        var sb = new StringBuilder();
+        sb.append("Subagent runs for this conversation:\n");
+        for (var run : runs) {
+            sb.append('\n').append(formatRunSummary(run));
+        }
+        return sb.toString();
+    }
+
+    private static String renderSubagentInfo(@Nullable Long runId) {
+        if (runId == null) return MISSING_RUN_ID_MSG;
+        var run = (SubagentRun) SubagentRun.findById(runId);
+        if (run == null) return "Run " + runId + NOT_FOUND_SUFFIX;
+        // Pull mode/context from the most recent SUBAGENT_SPAWN event for this
+        // run id. Those fields aren't on SubagentRun directly — the typed
+        // EventLogger helpers stash them in the JSON details payload.
+        var spawnEvent = findSpawnEventDetails(runId);
+        String mode = spawnEvent != null ? extractJsonField(spawnEvent, "mode") : null;
+        String context = spawnEvent != null ? extractJsonField(spawnEvent, "context") : null;
+
+        var sb = new StringBuilder();
+        sb.append("Subagent run #").append(run.id).append('\n');
+        sb.append("Parent agent: ").append(run.parentAgent != null ? run.parentAgent.name : "?").append('\n');
+        sb.append("Child agent: ").append(run.childAgent != null ? run.childAgent.name : "?").append('\n');
+        sb.append("Parent conversation: ").append(run.parentConversation != null ? run.parentConversation.id : "?").append('\n');
+        sb.append("Child conversation: ").append(run.childConversation != null ? run.childConversation.id : "?").append('\n');
+        sb.append("Mode: ").append(mode != null ? mode : "?").append('\n');
+        sb.append("Context: ").append(context != null ? context : "?").append('\n');
+        sb.append("Status: ").append(run.status.name()).append('\n');
+        sb.append("Started: ").append(run.startedAt != null ? run.startedAt.toString() : "?").append('\n');
+        sb.append("Ended: ").append(run.endedAt != null ? run.endedAt.toString() : "—").append('\n');
+        sb.append("Outcome: ").append(formatRunOutcome(run.outcome));
+        return sb.toString();
+    }
+
+    /**
+     * Truncate long outcomes so an LLM-essay reply doesn't blow up the chat
+     * bubble; the full text is on the child Conversation page anyway. Returns
+     * a dash when no outcome has been recorded.
+     */
+    private static String formatRunOutcome(String outcome) {
+        if (outcome == null || outcome.isBlank()) return "—";
+        return outcome.length() > 500 ? outcome.substring(0, 497) + "..." : outcome;
+    }
+
+    private static String renderSubagentLog(@Nullable Long runId) {
+        if (runId == null) return MISSING_RUN_ID_MSG;
+        // The run must exist before we promise log rows for it; surface a
+        // clear 404 rather than an empty list (which an operator would
+        // misread as "no events" when the id is actually a typo).
+        var run = (SubagentRun) SubagentRun.findById(runId);
+        if (run == null) return "Run " + runId + NOT_FOUND_SUFFIX;
+
+        // EventLog.details is a JSON blob containing run_id. H2's LIKE on a
+        // small set of rows is cheap; we filter further in Java to extract
+        // the canonical run_id field rather than matching string prefixes
+        // that could collide with a substring elsewhere in the payload.
+        List<EventLog> rows = EventLog.<EventLog>find(
+                "details LIKE ?1 AND category LIKE 'SUBAGENT_%' ORDER BY timestamp ASC",
+                runIdLikePattern(runId)).fetch(SUBAGENT_LOG_LIMIT);
+        if (rows.isEmpty()) {
+            return "No events for run " + runId + ".";
+        }
+        var sb = new StringBuilder();
+        sb.append("Events for subagent run #").append(runId).append(":\n");
+        for (var row : rows) {
+            sb.append('\n')
+                    .append(row.timestamp != null ? row.timestamp.toString() : "?")
+                    .append(' ').append(row.level)
+                    .append(' ').append(row.category)
+                    .append(" — ").append(row.message != null ? row.message : "");
+        }
+        return sb.toString();
+    }
+
+    private static String renderSubagentKill(Agent agent, @Nullable Long runId) {
+        if (runId == null) return MISSING_RUN_ID_MSG;
+        var reason = agent != null
+                ? "Killed by operator via /subagent kill (agent " + agent.name + ")"
+                : "Killed by operator via /subagent kill";
+        var result = SubagentRegistry.kill(runId, reason);
+        return result.message();
+    }
+
+    /**
+     * JCLAW-274: {@code /subagent history <id>} — render the child
+     * conversation's transcript inline as plain text. Permission mirrors
+     * the {@link tools.ConversationHistoryTool} tool path: the calling agent
+     * must own the run. JClaw is single-operator and has no operator-role /
+     * multi-user concept, so this parent-agent ownership is the whole gate.
+     *
+     * <p>Renders up to {@link #SUBAGENT_HISTORY_LIMIT} messages with each
+     * one's content capped at {@link #SUBAGENT_HISTORY_CONTENT_CAP} chars.
+     * For longer transcripts the footer points at {@code /subagents}'s
+     * "View transcript" link so the operator gets the full thing in the
+     * standard conversation viewer.
+     */
+    private static String renderSubagentHistory(Agent agent, @Nullable Long runId) {
+        if (runId == null) return MISSING_RUN_ID_MSG;
+        var run = (SubagentRun) SubagentRun.findById(runId);
+        if (run == null) return "Run " + runId + NOT_FOUND_SUFFIX;
+        // Same parent-owned gate as ConversationHistoryTool.
+        if (agent == null
+                || run.parentAgent == null
+                || !agent.id.equals(run.parentAgent.id)) {
+            return "Run " + runId + " is not owned by the calling agent.";
+        }
+        var childConv = run.childConversation;
+        if (childConv == null) {
+            return "Run " + runId + " has no child conversation (audit row is malformed).";
+        }
+
+        // Fetch one beyond the limit so we know whether to render the
+        // "more available" footer without a separate count query.
+        int fetchLimit = SUBAGENT_HISTORY_LIMIT + 1;
+        List<Message> rows = Message.<Message>find(
+                "conversation = ?1 ORDER BY createdAt ASC", childConv).fetch(fetchLimit);
+        if (rows.isEmpty()) {
+            return "Subagent run #" + runId + " transcript: (no messages yet)";
+        }
+        boolean hasMore = rows.size() > SUBAGENT_HISTORY_LIMIT;
+        var rendered = hasMore ? rows.subList(0, SUBAGENT_HISTORY_LIMIT) : rows;
+
+        var sb = new StringBuilder();
+        sb.append("Transcript for subagent run #").append(runId)
+                .append(" (child conversation ").append(childConv.id).append("):");
+        for (var msg : rendered) {
+            sb.append("\n\n").append(formatHistoryMessage(msg));
+        }
+        if (hasMore) {
+            int total = (int) Message.count("conversation = ?1", childConv);
+            int remaining = total - SUBAGENT_HISTORY_LIMIT;
+            sb.append("\n\n(... ").append(remaining)
+                    .append(" more messages — view full at /subagents → View transcript)");
+        }
+        return sb.toString();
+    }
+
+    /** Compact plain-text rendering of a single transcript Message. Tool
+     *  calls/results are summarized rather than printed verbatim (they're
+     *  often JSON walls that drown out the actual reasoning). */
+    private static String formatHistoryMessage(Message msg) {
+        var sb = new StringBuilder();
+        sb.append('[')
+                .append(msg.createdAt != null ? msg.createdAt.toString() : "?")
+                .append("] ")
+                .append(msg.role != null ? msg.role : "?")
+                .append(':');
+        if (msg.content != null && !msg.content.isBlank()) {
+            sb.append(' ').append(truncateContent(msg.content));
+        }
+        if (msg.toolCalls != null && !msg.toolCalls.isBlank()) {
+            sb.append("\n  tool_calls: ").append(summarizeToolField(msg.toolCalls));
+        }
+        if (msg.toolResults != null && !msg.toolResults.isBlank()) {
+            sb.append("\n  tool_results: ").append(summarizeToolField(msg.toolResults));
+        }
+        return sb.toString();
+    }
+
+    private static String truncateContent(String s) {
+        if (s.length() <= SUBAGENT_HISTORY_CONTENT_CAP) return s;
+        return s.substring(0, SUBAGENT_HISTORY_CONTENT_CAP - 3) + "...";
+    }
+
+    /** Tool-call / tool-result fields are JSON. For chat-bubble display we
+     *  only want a compact length-and-prefix marker so the operator can
+     *  tell *that* a tool ran without dumping its full payload. */
+    private static String summarizeToolField(String s) {
+        var len = s.length();
+        var preview = s.length() > 120 ? s.substring(0, 117) + "..." : s;
+        // Collapse whitespace so a pretty-printed JSON blob stays on a
+        // single line in the bubble.
+        preview = preview.replaceAll("\\s+", " ").trim();
+        return "(" + len + " chars) " + preview;
+    }
+
+    /** Compact one-line summary of a SubagentRun for the {@code list} view. */
+    private static String formatRunSummary(SubagentRun run) {
+        var label = run.childAgent != null ? run.childAgent.name : "(unnamed)";
+        var sb = new StringBuilder();
+        sb.append("#").append(run.id)
+                .append(' ').append(run.status.name())
+                .append(' ').append(label)
+                .append(" started=").append(run.startedAt != null ? run.startedAt.toString() : "?");
+        if (run.endedAt != null) {
+            var durSec = Duration.between(run.startedAt, run.endedAt).toSeconds();
+            sb.append(" duration=").append(durSec).append('s');
+        }
+        return sb.toString();
+    }
+
+    /** LIKE pattern matching the canonical {@code "run_id":"<id>"} marker inside
+     *  an EventLog.details JSON blob. Single owner for the marker shape so the
+     *  two finders can't drift from the EventLogger writer's contract. */
+    private static String runIdLikePattern(Long runId) {
+        return "%\"run_id\":\"" + runId + "\"%";
+    }
+
+    /** Find the most recent SUBAGENT_SPAWN event for a given run id and
+     *  return its {@code details} JSON, or null when no event exists yet. */
+    private static @Nullable String findSpawnEventDetails(Long runId) {
+        List<EventLog> rows = EventLog.<EventLog>find(
+                "category = ?1 AND details LIKE ?2 ORDER BY timestamp DESC",
+                "SUBAGENT_SPAWN", runIdLikePattern(runId)).fetch(1);
+        return rows.isEmpty() ? null : rows.getFirst().details;
+    }
+
+    /** Tiny JSON-field extractor — Gson is heavy for a single-key lookup
+     *  in a known-shape payload. Returns null on missing key or unparseable
+     *  input (the SUBAGENT_* details payload is always a flat object). */
+    private static @Nullable String extractJsonField(String json, String key) {
+        if (json == null || json.isBlank()) return null;
+        try {
+            var obj = JsonParser.parseString(json).getAsJsonObject();
+            if (!obj.has(key) || obj.get(key).isJsonNull()) return null;
+            return obj.get(key).getAsString();
+        } catch (Exception _) {
+            return null;
+        }
+    }
+}

@@ -1,0 +1,281 @@
+package services;
+
+import models.EventLog;
+import org.jspecify.annotations.Nullable;
+import play.Logger;
+import utils.AppClock;
+import utils.GsonHolder;
+
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+public class EventLogger {
+
+    /**
+     * The stored message cap, matching {@code EventLog.message}'s column length. Longer messages are
+     * cut from the tail — so a caller whose message must keep its last part (an actionable error's
+     * retry instruction) renders to this cap itself rather than letting the tail be dropped here.
+     */
+    public static final int MESSAGE_MAX_CHARS = 500;
+
+    private EventLogger() {}
+
+    private static final String LEVEL_ERROR = "ERROR";
+
+    /** Category for rejected webhooks that failed platform signature verification (JCLAW-16). */
+    public static final String WEBHOOK_SIGNATURE_FAILURE = "WEBHOOK_SIGNATURE_FAILURE";
+
+    // JCLAW-272: subagent lifecycle event taxonomy, emitted by JCLAW-265 (spawn),
+    // JCLAW-266 (limit exceeded) and JCLAW-270/273 (completion).
+    public static final String SUBAGENT_SPAWN = "SUBAGENT_SPAWN";
+    public static final String SUBAGENT_COMPLETE = "SUBAGENT_COMPLETE";
+    public static final String SUBAGENT_ERROR = "SUBAGENT_ERROR";
+    public static final String SUBAGENT_KILL = "SUBAGENT_KILL";
+    public static final String SUBAGENT_LIMIT_EXCEEDED = "SUBAGENT_LIMIT_EXCEEDED";
+    public static final String SUBAGENT_TIMEOUT = "SUBAGENT_TIMEOUT";
+
+    private static final ConcurrentLinkedQueue<EventLog> pending = new ConcurrentLinkedQueue<>();
+    private static final int BATCH_SIZE = 20;
+
+    /** Set at the start of graceful shutdown (by the @OnApplicationStop hooks).
+     *  Once true, EventLogger logs to the file only and skips DB persistence:
+     *  the JPA layer is tearing down, so a batched flush would fail to begin a
+     *  transaction and emit a spurious "Failed to flush N event logs" WARN.
+     *  File logging — the actual shutdown observability — is unaffected. */
+    private static final AtomicBoolean shuttingDown = new AtomicBoolean(false);
+
+    /** Marks shutdown started — called first by every @OnApplicationStop hook,
+     *  before any subsystem teardown, so EventLogger goes file-only and the
+     *  shutdown logging doesn't trip the batch flush. The first caller (any
+     *  hook; Play doesn't order them) also logs the "Shutting down JClaw"
+     *  banner: the symmetric counterpart to Play's "Application 'JClaw' is now
+     *  started !" and the opening bookend to "Graceful shutdown complete". The
+     *  compareAndSet keeps the banner to exactly one line even if two hooks
+     *  race. */
+    public static void markShuttingDown() {
+        // Flush the pending tail to the DB BEFORE flipping the flag: once
+        // shuttingDown is set, both record() and flush() go file-only, so any
+        // events queued by the scheduled @Every("30s") flush window but not yet
+        // batched would otherwise be lost on a clean stop (JCLAW-402). This
+        // bypasses flush()'s shuttingDown early-return via flushPendingForShutdown().
+        flushPendingForShutdown();
+        if (shuttingDown.compareAndSet(false, true)) {
+            info("shutdown", "Shutting down JClaw");
+        }
+    }
+
+    /**
+     * Drain and persist the pending queue regardless of the shuttingDown flag.
+     * Used by {@link #markShuttingDown()} to write the tail before the
+     * file-only flip; flush() itself early-returns once shuttingDown is set.
+     * Public so the shutdown-tail behavior is unit-testable without flipping
+     * the process-global flag (which would race concurrent tests — see
+     * EventLoggerTest's JCLAW-334 note).
+     */
+    public static void flushPendingForShutdown() {
+        var batch = new ArrayList<EventLog>();
+        EventLog e;
+        while ((e = pending.poll()) != null) batch.add(e);
+        if (batch.isEmpty()) return;
+
+        try {
+            Tx.run(() -> { for (var ev : batch) ev.save(); });
+        } catch (Exception ex) {
+            Logger.warn("Failed to flush %d event logs on shutdown: %s", batch.size(), ex.getMessage());
+        }
+    }
+
+    /** True once graceful shutdown has begun. Lets shutdown-path code skip DB
+     *  work that can't run (the JPA layer is tearing down) and isn't needed —
+     *  e.g. MCP allowlist revocation, which the next boot's connect resyncs. */
+    public static boolean isShuttingDown() {
+        return shuttingDown.get();
+    }
+
+    @SuppressWarnings("java:S6213") // 'record' as method name predates the restricted identifier; rename would churn callers/tests with no real ambiguity
+    public static void record(String level, String category, String message, @Nullable String details) {
+        record(level, category, null, null, message, details);
+    }
+
+    @SuppressWarnings("java:S6213") // 'record' as method name predates the restricted identifier; rename would churn callers/tests with no real ambiguity
+    public static void record(String level, String category, @Nullable String agentId, @Nullable String channel,
+                              String message, @Nullable String details) {
+        // Log to SLF4J first (always safe)
+        var logMessage = "[%s/%s] %s".formatted(category, level, message);
+        switch (level) {
+            case LEVEL_ERROR -> Logger.error(logMessage);
+            case "WARN" -> Logger.warn(logMessage);
+            default -> Logger.info(logMessage);
+        }
+
+        // During graceful shutdown stay file-only: the JPA layer is closing, so
+        // queuing for DB persistence is pointless and would trip the batch flush
+        // into a doomed "begin transaction failed". The file line above is what
+        // shutdown observability needs.
+        if (shuttingDown.get()) return;
+
+        // Queue for batch persistence — avoids opening a new transaction per log entry
+        // when called from virtual threads (e.g., during tool-execution loops).
+        var event = new EventLog();
+        // Stamped now: the batched save can run up to 30 s later.
+        event.timestamp = AppClock.now();
+        event.level = level;
+        event.category = category;
+        event.agentId = agentId;
+        event.channel = channel;
+        event.message = message != null && message.length() > MESSAGE_MAX_CHARS
+                ? message.substring(0, MESSAGE_MAX_CHARS - 3) + "..." : message;
+        event.details = details;
+        pending.add(event);
+
+        if (pending.size() >= BATCH_SIZE) {
+            flush();
+        }
+    }
+
+    /**
+     * Discard all queued events without persisting. For test isolation only.
+     */
+    public static void clear() {
+        pending.clear();
+        shuttingDown.set(false);
+    }
+
+    /**
+     * Persist all queued events in a single transaction. Call at natural
+     * boundaries (end of agent turn, end of request) or when the batch
+     * threshold is reached.
+     */
+    public static void flush() {
+        if (shuttingDown.get()) return;
+        var batch = new ArrayList<EventLog>();
+        EventLog e;
+        while ((e = pending.poll()) != null) batch.add(e);
+        if (batch.isEmpty()) return;
+
+        try {
+            Tx.run(() -> { for (var ev : batch) ev.save(); });
+        } catch (Exception ex) {
+            Logger.warn("Failed to flush %d event logs: %s", batch.size(), ex.getMessage());
+        }
+    }
+
+    public static void info(String category, String message) {
+        record("INFO", category, message, null);
+    }
+
+    public static void info(String category, String message, @Nullable String details) {
+        record("INFO", category, message, details);
+    }
+
+    public static void info(String category, @Nullable String agentId, @Nullable String channel, String message) {
+        record("INFO", category, agentId, channel, message, null);
+    }
+
+    public static void warn(String category, String message) {
+        record("WARN", category, message, null);
+    }
+
+    public static void warn(String category, String message, @Nullable String details) {
+        record("WARN", category, message, details);
+    }
+
+    public static void warn(String category, @Nullable String agentId, @Nullable String channel, String message) {
+        record("WARN", category, agentId, channel, message, null);
+    }
+
+    public static void error(String category, String message) {
+        record(LEVEL_ERROR, category, message, null);
+    }
+
+    public static void error(String category, String message, @Nullable String details) {
+        record(LEVEL_ERROR, category, message, details);
+    }
+
+    public static void error(String category, @Nullable String agentId, @Nullable String channel, String message) {
+        record(LEVEL_ERROR, category, agentId, channel, message, null);
+    }
+
+    public static void error(String category, String message, @Nullable Throwable t) {
+        record(LEVEL_ERROR, category, message, t != null ? t.toString() : null);
+    }
+
+    // ----- JCLAW-272: typed subagent lifecycle helpers ---------------------
+    //
+    // Each helper builds a JSON details payload with a consistent shape so
+    // downstream consumers (frontend events page, future analytics) can
+    // parse without category-specific branches. Fields are nullable —
+    // not every category carries every key (e.g. LIMIT_EXCEEDED has no
+    // child yet, TIMEOUT has no mode/context distinction worth recording).
+    // The parent agent id also flows into EventLog.agentId so the existing
+    // per-agent filter on /api/logs still works.
+
+    /** SUBAGENT_SPAWN — parent dispatched a child agent. */
+    public static void recordSubagentSpawn(String parentAgentId, @Nullable String childAgentId,
+                                           String runId, @Nullable String mode, @Nullable String context) {
+        record("INFO", SUBAGENT_SPAWN, parentAgentId, null,
+                "Subagent spawned",
+                subagentDetails(parentAgentId, childAgentId, runId, mode, context, null, null));
+    }
+
+    /** SUBAGENT_COMPLETE — child finished successfully. {@code outcome} is a short tag (e.g. "ok"). */
+    public static void recordSubagentComplete(String parentAgentId, @Nullable String childAgentId,
+                                              String runId, @Nullable String mode, @Nullable String context,
+                                              String outcome) {
+        record("INFO", SUBAGENT_COMPLETE, parentAgentId, null,
+                "Subagent completed",
+                subagentDetails(parentAgentId, childAgentId, runId, mode, context, outcome, null));
+    }
+
+    /** SUBAGENT_ERROR — child raised an unrecoverable error. */
+    public static void recordSubagentError(String parentAgentId, @Nullable String childAgentId,
+                                           @Nullable String runId, @Nullable String mode, @Nullable String context,
+                                           @Nullable String reason) {
+        record(LEVEL_ERROR, SUBAGENT_ERROR, parentAgentId, null,
+                "Subagent error",
+                subagentDetails(parentAgentId, childAgentId, runId, mode, context, null, reason));
+    }
+
+    /** SUBAGENT_KILL — operator or supervisor terminated a running child. */
+    public static void recordSubagentKill(@Nullable String parentAgentId, @Nullable String childAgentId,
+                                          String runId, @Nullable String mode, @Nullable String context,
+                                          String reason) {
+        record("WARN", SUBAGENT_KILL, parentAgentId, null,
+                "Subagent killed",
+                subagentDetails(parentAgentId, childAgentId, runId, mode, context, null, reason));
+    }
+
+    /** SUBAGENT_LIMIT_EXCEEDED — spawn refused (concurrency, depth, etc.). No child id yet. */
+    public static void recordSubagentLimitExceeded(String parentAgentId, String reason) {
+        record("WARN", SUBAGENT_LIMIT_EXCEEDED, parentAgentId, null,
+                "Subagent spawn limit exceeded",
+                subagentDetails(parentAgentId, null, null, null, null, null, reason));
+    }
+
+    /** SUBAGENT_TIMEOUT — child exceeded its wall-clock budget. */
+    public static void recordSubagentTimeout(String parentAgentId, String runId) {
+        record("WARN", SUBAGENT_TIMEOUT, parentAgentId, null,
+                "Subagent timed out",
+                subagentDetails(parentAgentId, null, runId, null, null, null, null));
+    }
+
+    @SuppressWarnings("java:S107") // intentional one-arg-per-payload-key; bundling into a DTO buys nothing here
+    private static String subagentDetails(@Nullable String parentAgentId, @Nullable String childAgentId,
+                                          @Nullable String runId, @Nullable String mode, @Nullable String context,
+                                          @Nullable String outcome, @Nullable String reason) {
+        // LinkedHashMap preserves field order in the rendered JSON, which keeps
+        // tail -f tail of details readable when humans skim the events page.
+        var payload = new LinkedHashMap<String, Object>();
+        payload.put("parent_agent_id", parentAgentId);
+        payload.put("child_agent_id", childAgentId);
+        payload.put("run_id", runId);
+        payload.put("mode", mode);          // "session" | "inline"
+        payload.put("context", context);    // "fresh" | "inherit"
+        payload.put("outcome", outcome);
+        payload.put("reason", reason);
+        return GsonHolder.GSON.toJson(payload, Map.class);
+    }
+}

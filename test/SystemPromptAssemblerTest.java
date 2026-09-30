@@ -1,0 +1,555 @@
+import agents.CurrentTimeInjector;
+import agents.SystemPromptAssembler;
+import memory.MemoryStore;
+import models.Agent;
+import models.Conversation;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import play.test.Fixtures;
+import play.test.UnitTest;
+import services.AgentService;
+import services.ConfigService;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.Instant;
+import java.util.List;
+import java.util.Set;
+
+/**
+ * Service-layer tests for {@link SystemPromptAssembler}, focused on the
+ * cacheable-prefix invariant and the JCLAW-128 prompt-cache boundary
+ * placement that depends on it.
+ *
+ * <p>Coverage breakdown:
+ * <ul>
+ *   <li>Workspace file order — SOUL → IDENTITY → USER → BOOTSTRAP → AGENT.</li>
+ *   <li>Cache boundary marker — present once, sits between the stable prefix
+ *       and the per-turn memories section, and {@code breakdown()} reports
+ *       prefix/suffix sizes consistent with that placement.</li>
+ *   <li>Skills XML — emitted when the agent has at least one skill on disk,
+ *       absent otherwise.</li>
+ *   <li>Channel guidance — Web, Telegram, and Voice sections render their
+ *       distinctive bodies; Slack/WhatsApp/null/unknown skip the section entirely.</li>
+ *   <li>Blank file handling — a blank workspace markdown file silently drops
+ *       from the output instead of injecting an empty section.</li>
+ * </ul>
+ */
+class SystemPromptAssemblerTest extends UnitTest {
+
+    @BeforeEach
+    void setup() {
+        Fixtures.deleteDatabase();
+        ConfigService.clearCache();
+    }
+
+    // ── JCLAW-532: recall ranking uses real relevance, not rank position ──
+
+    private static MemoryStore.MemoryEntry entry(String id, double importance, double relevance) {
+        return new MemoryStore.MemoryEntry(id, "1", "text-" + id, "fact",
+                importance, Instant.EPOCH, relevance);
+    }
+
+    @Test
+    void rankRecallRanksByRealRelevanceNotImportance() {
+        // A strongly-matching low-importance memory must beat a weakly-matching
+        // high-importance one. Weights 0.7 relevance / 0.3 importance:
+        //   strong = 0.7*1.0 + 0.3*0.2 = 0.76
+        //   weak   = 0.7*0.3 + 0.3*1.0 = 0.51
+        // The pre-fix code derived relevance from list position, so a weak hit at
+        // index 0/1 got ~0.9-1.0 and its importance weight could win.
+        var strong = entry("strong", 0.2, 1.0);
+        var weak = entry("weak", 1.0, 0.3);
+        var ranked = SystemPromptAssembler.rankRecall(
+                List.of(weak, strong), Set.of(), 0.7, 0.3, 10);
+        assertEquals(List.of("strong", "weak"),
+                ranked.stream().map(MemoryStore.MemoryEntry::id).toList());
+    }
+
+    @Test
+    void rankRecallExcludesCoreIdsAndHonorsLimit() {
+        var a = entry("a", 0.5, 1.0);
+        var b = entry("b", 0.5, 0.8);
+        var c = entry("c", 0.5, 0.6);
+        // "a" is already shown as a core memory -> excluded; limit caps to one.
+        var ranked = SystemPromptAssembler.rankRecall(
+                List.of(a, b, c), Set.of("a"), 0.7, 0.3, 1);
+        assertEquals(List.of("b"),
+                ranked.stream().map(MemoryStore.MemoryEntry::id).toList());
+    }
+
+    private Agent newAgent(String name) {
+        // AgentService.create seeds the workspace + the five .md files.
+        return AgentService.create(name, "openrouter", "gpt-4.1");
+    }
+
+    private void writeWorkspaceFile(String agentName, String filename, String content) throws Exception {
+        var path = AgentService.workspacePath(agentName).resolve(filename);
+        Files.writeString(path, content);
+    }
+
+    // =====================
+    // Workspace file order: SOUL → IDENTITY → USER → BOOTSTRAP → AGENT
+    // =====================
+
+    @Test
+    void workspaceFilesAppearInDeclaredNarrativeOrder() throws Exception {
+        var agent = newAgent("spa-order-1");
+        // Stamp each workspace file with a distinctive sentinel so we can read
+        // their absolute positions back out of the assembled prompt.
+        writeWorkspaceFile(agent.name, "SOUL.md", "MARKER_SOUL_5e8a");
+        writeWorkspaceFile(agent.name, "IDENTITY.md", "MARKER_IDENTITY_5e8a");
+        writeWorkspaceFile(agent.name, "USER.md", "MARKER_USER_5e8a");
+        writeWorkspaceFile(agent.name, "BOOTSTRAP.md", "MARKER_BOOTSTRAP_5e8a");
+        writeWorkspaceFile(agent.name, "AGENT.md", "MARKER_AGENT_5e8a");
+
+        var prompt = SystemPromptAssembler.assemble(agent, null, null, "web").systemPrompt();
+
+        int soul = prompt.indexOf("MARKER_SOUL_5e8a");
+        int identity = prompt.indexOf("MARKER_IDENTITY_5e8a");
+        int user = prompt.indexOf("MARKER_USER_5e8a");
+        int bootstrap = prompt.indexOf("MARKER_BOOTSTRAP_5e8a");
+        int agentMd = prompt.indexOf("MARKER_AGENT_5e8a");
+
+        assertTrue(soul >= 0, "SOUL marker missing");
+        assertTrue(identity > soul, "IDENTITY must follow SOUL");
+        assertTrue(user > identity, "USER must follow IDENTITY");
+        assertTrue(bootstrap > user, "BOOTSTRAP must follow USER");
+        assertTrue(agentMd > bootstrap, "AGENT must follow BOOTSTRAP");
+    }
+
+    @Test
+    void blankWorkspaceFileIsDroppedSilently() throws Exception {
+        var agent = newAgent("spa-blank-drop");
+        writeWorkspaceFile(agent.name, "USER.md", "   \n  \n");
+        writeWorkspaceFile(agent.name, "AGENT.md", "MARKER_AGENT_BD");
+
+        var prompt = SystemPromptAssembler.assemble(agent, null, null, "web").systemPrompt();
+        // AGENT.md content still appears; the blank USER.md leaves no trace.
+        assertTrue(prompt.contains("MARKER_AGENT_BD"));
+        // No stray blank lines that could only come from USER.md being emitted —
+        // the appendSection guard is what we're really pinning here.
+        assertFalse(prompt.contains("\n\n\n\n\n"),
+                "blank file should not introduce stacked empty paragraphs");
+    }
+
+    // =====================
+    // Cache boundary marker placement
+    // =====================
+
+    @Test
+    void cacheBoundaryMarkerAppearsExactlyOnce() {
+        var agent = newAgent("spa-cache-once");
+        var prompt = SystemPromptAssembler.assemble(agent, null, null, "web").systemPrompt();
+        int first = prompt.indexOf(SystemPromptAssembler.CACHE_BOUNDARY_MARKER);
+        int last = prompt.lastIndexOf(SystemPromptAssembler.CACHE_BOUNDARY_MARKER);
+        assertTrue(first >= 0, "marker must be present in the assembled prompt");
+        assertEquals(first, last,
+                "the cache boundary marker must appear exactly once");
+    }
+
+    @Test
+    void cacheBoundarySitsBetweenEnvironmentAndMemoriesSections() {
+        // Environment is the last section in the cacheable prefix; memories are
+        // the only section after the boundary. This pin enforces the JCLAW-128
+        // ordering invariant the prompt cache relies on.
+        var agent = newAgent("spa-boundary-sandwich");
+        // Force a memory recall by passing a user message — even with no memory
+        // store seeded, the section header path is taken and we can verify
+        // ordering against environment.
+        var prompt = SystemPromptAssembler.assemble(agent, "tell me about cats", null, "web").systemPrompt();
+
+        int env = prompt.indexOf("## Environment");
+        int marker = prompt.indexOf(SystemPromptAssembler.CACHE_BOUNDARY_MARKER);
+        assertTrue(env >= 0, "environment header missing");
+        assertTrue(marker > env,
+                "cache boundary marker must come after the environment section");
+    }
+
+    @Test
+    void environmentNamesTheConversationsEffectiveModelOverTheAgentDefault() {
+        // JCLAW-1198: a conversation on an overridden model must be told so, or it
+        // introduces itself as the agent's default and researches the wrong model.
+        var agent = newAgent("spa-env-override");
+        var conv = new Conversation();
+        conv.modelProviderOverride = "ollama-cloud";
+        conv.modelIdOverride = "deepseek-v4-flash";
+        var prompt = SystemPromptAssembler.assemble(agent, null, null, "web", null, conv).systemPrompt();
+
+        assertTrue(prompt.contains("- Model: deepseek-v4-flash\n- Provider: ollama-cloud\n"), prompt);
+        assertFalse(prompt.contains("- Model: gpt-4.1\n"), "the agent default must not leak into an overridden turn");
+    }
+
+    @Test
+    void environmentNamesTheAgentDefaultWithoutAConversationOrAnOverride() {
+        var agent = newAgent("spa-env-default");
+        var expected = "- Model: gpt-4.1\n- Provider: openrouter\n";
+        assertTrue(SystemPromptAssembler.assemble(agent, null, null, "web").systemPrompt().contains(expected),
+                "no conversation: the agent default");
+        assertTrue(SystemPromptAssembler.assemble(agent, null, null, "web", null, new Conversation()).systemPrompt()
+                .contains(expected), "conversation without an override: the agent default");
+    }
+
+    @Test
+    void retrievalDisciplineSitsInTheCacheablePrefix() {
+        // The retrieval-calibration guidance is static, so it must stay above the
+        // cache boundary — below it would churn the per-agent-day prefix cache.
+        var agent = newAgent("spa-retrieval-discipline");
+        var prompt = SystemPromptAssembler.assemble(agent, "tell me about cats", null, "web").systemPrompt();
+
+        int retrieval = prompt.indexOf("## Retrieval Discipline");
+        int marker = prompt.indexOf(SystemPromptAssembler.CACHE_BOUNDARY_MARKER);
+        assertTrue(retrieval >= 0, "Retrieval Discipline header missing");
+        assertTrue(marker > retrieval,
+                "Retrieval Discipline must sit above the cache boundary (stable prefix)");
+    }
+
+    @Test
+    void roleFramingPresentAndInTheCacheablePrefix() {
+        // The harness/operator identity block is static, so it anchors the cacheable
+        // prefix; its lead position (before the persona) is guaranteed by buildPrompt.
+        var agent = newAgent("spa-role-framing");
+        var prompt = SystemPromptAssembler.assemble(agent, "hello", null, "web").systemPrompt();
+
+        int role = prompt.indexOf("## Your Role");
+        int marker = prompt.indexOf(SystemPromptAssembler.CACHE_BOUNDARY_MARKER);
+        assertTrue(role >= 0, "Your Role header missing");
+        assertTrue(marker > role, "Your Role must sit above the cache boundary (stable prefix)");
+        assertTrue(prompt.contains("single-operator automation harness"),
+                "role block must name JClaw's single-operator harness identity");
+    }
+
+    @Test
+    void breakdownReportsPrefixAndSuffixCharsAroundMarker() {
+        var agent = newAgent("spa-breakdown-split");
+        var bd = SystemPromptAssembler.breakdown(agent, null, "web");
+        // Without a user message the memories section is empty, but the marker
+        // still bisects the prompt and breakdown reports the split.
+        assertTrue(bd.cacheablePrefixChars() > 0,
+                "non-empty cacheable prefix expected");
+        assertTrue(bd.cacheablePrefixChars() < bd.totalChars(),
+                "prefix must be a strict subset of total chars");
+        assertEquals(SystemPromptAssembler.CACHE_BOUNDARY_MARKER,
+                bd.cacheBoundaryMarker(),
+                "breakdown must echo the canonical marker constant");
+    }
+
+    // =====================
+    // Current date/time (no longer part of the system prompt at all)
+    // =====================
+
+    @Test
+    void currentTimeIsAbsentFromTheSystemPrompt() {
+        var agent = newAgent("spa-current-time");
+        var prompt = SystemPromptAssembler.assemble(agent, null, null, "web").systemPrompt();
+        assertFalse(prompt.contains(CurrentTimeInjector.HEADING),
+                "the clock changes every minute, and even below the cache boundary it sat "
+                        + "ahead of the whole conversation history in the token stream — so a "
+                        + "minute rollover re-processed every history token. It now rides the "
+                        + "last user message; see CurrentTimeInjector.");
+        assertFalse(prompt.contains("- Current date:"),
+                "the cacheable Environment block must not carry the date either");
+    }
+
+    // =====================
+    // Skills XML emission
+    // =====================
+
+    @Test
+    void skillsXmlOmittedWhenAgentHasNoSkills() {
+        var agent = newAgent("spa-skills-absent");
+        // Fresh workspace has skills/ directory but no SKILL.md inside.
+        var prompt = SystemPromptAssembler.assemble(agent, null, null, "web").systemPrompt();
+        assertFalse(prompt.contains("<available_skills>"),
+                "no skills means no <available_skills> XML block");
+        assertFalse(prompt.contains("## Tool Catalog"),
+                "tool catalog is gated on skills being present");
+    }
+
+    @Test
+    void skillsXmlEmittedWhenAgentHasAtLeastOneSkill() throws Exception {
+        var agent = newAgent("spa-skills-present");
+        // Seed a minimal SKILL.md under skills/test-skill/. SkillLoader requires
+        // YAML frontmatter with at least name + description; the body is freeform.
+        var skillDir = AgentService.workspacePath(agent.name).resolve("skills").resolve("test-skill");
+        Files.createDirectories(skillDir);
+        Files.writeString(skillDir.resolve("SKILL.md"), """
+                ---
+                name: test-skill
+                description: A skill seeded by SystemPromptAssemblerTest
+                ---
+
+                Pretend skill body for the assembler test.
+                """);
+        // SkillLoader caches per agent — reset so the freshly-seeded skill is
+        // visible without waiting for the TTL.
+        agents.SkillLoader.clearCache();
+
+        var prompt = SystemPromptAssembler.assemble(agent, null, null, "web").systemPrompt();
+        assertTrue(prompt.contains("<available_skills>"),
+                "<available_skills> must be emitted when at least one skill loads");
+        assertTrue(prompt.contains("test-skill"),
+                "skill name must appear in the rendered XML");
+    }
+
+    // =====================
+    // Channel guidance
+    // =====================
+
+    @Test
+    void telegramChannelInjectsTelegramGuidance() {
+        var agent = newAgent("spa-channel-telegram");
+        var prompt = SystemPromptAssembler.assemble(agent, null, null, "telegram").systemPrompt();
+        assertTrue(prompt.contains("Channel Guidance (telegram)"),
+                "telegram must produce a Channel Guidance header");
+        // Distinctive Telegram-specific copy.
+        assertTrue(prompt.contains("Telegram") || prompt.contains("telegram"),
+                "guidance body should reference Telegram");
+        assertTrue(prompt.contains("4000 characters") || prompt.contains("inline photos"),
+                "guidance body should include Telegram-specific hints");
+        assertFalse(prompt.toLowerCase().contains("lewis"), "only web chat draws the lewis fence");
+        assertFalse(prompt.contains("language hint structure"), "only web chat draws the structure fence");
+    }
+
+    @Test
+    void webChannelInjectsWebGuidance() {
+        var agent = newAgent("spa-channel-web");
+        var prompt = SystemPromptAssembler.assemble(agent, null, null, "web").systemPrompt();
+        assertTrue(prompt.contains("Channel Guidance (web)"),
+                "web must produce a Channel Guidance header");
+        assertTrue(prompt.contains("admin chat UI") || prompt.contains("download chips"),
+                "guidance body should include web-specific hints");
+        assertTrue(prompt.contains("language hint lewis"),
+                "web guidance must teach the lewis fence the chat draws");
+        assertTrue(prompt.contains("language hint structure"),
+                "web guidance must teach the structure fence the chat draws in 3D");
+    }
+
+    @Test
+    void voiceChannelInjectsSpokenGuidanceNotWebGuidance() {
+        // JCLAW-797: a voice turn is tagged "voice" (its history still lives on
+        // the shared "web" conversation). The prompt must tell the model it's in
+        // a spoken exchange — not hand it the web-UI markdown guidance, which is
+        // what made the model claim it "can't hear" the user.
+        var agent = newAgent("spa-channel-voice");
+        var prompt = SystemPromptAssembler.assemble(agent, null, null, "voice").systemPrompt();
+        assertTrue(prompt.contains("Channel Guidance (voice)"),
+                "voice must produce a Channel Guidance header");
+        assertTrue(prompt.contains("live voice conversation")
+                        && prompt.contains("text-to-speech"),
+                "guidance body should describe the spoken STT/TTS surface");
+        assertTrue(prompt.contains("never tell them you lack audio"),
+                "guidance must forbid the 'I can't hear you' failure mode");
+        assertFalse(prompt.contains("admin chat UI"),
+                "voice must NOT get the web-UI markdown guidance");
+        assertFalse(prompt.toLowerCase().contains("lewis"), "only web chat draws the lewis fence");
+        assertFalse(prompt.contains("language hint structure"), "only web chat draws the structure fence");
+    }
+
+    @Test
+    void slackChannelSkipsGuidanceSection() {
+        var agent = newAgent("spa-channel-slack");
+        var prompt = SystemPromptAssembler.assemble(agent, null, null, "slack").systemPrompt();
+        assertFalse(prompt.contains("Channel Guidance"),
+                "slack has no registered guidance — section must be omitted");
+        assertFalse(prompt.toLowerCase().contains("lewis"), "only web chat draws the lewis fence");
+        assertFalse(prompt.contains("language hint structure"), "only web chat draws the structure fence");
+    }
+
+    @Test
+    void whatsappChannelSkipsGuidanceSection() {
+        var agent = newAgent("spa-channel-wa");
+        var prompt = SystemPromptAssembler.assemble(agent, null, null, "whatsapp").systemPrompt();
+        assertFalse(prompt.contains("Channel Guidance"));
+        assertFalse(prompt.toLowerCase().contains("lewis"), "only web chat draws the lewis fence");
+        assertFalse(prompt.contains("language hint structure"), "only web chat draws the structure fence");
+    }
+
+    @Test
+    void unknownChannelSkipsGuidanceSection() {
+        var agent = newAgent("spa-channel-unknown");
+        var prompt = SystemPromptAssembler.assemble(agent, null, null, "rocketchat").systemPrompt();
+        assertFalse(prompt.contains("Channel Guidance"),
+                "unrecognized channels must not trigger guidance");
+    }
+
+    @Test
+    void nullChannelSkipsGuidanceSection() {
+        var agent = newAgent("spa-channel-null");
+        var prompt = SystemPromptAssembler.assemble(agent, null, null, null).systemPrompt();
+        assertFalse(prompt.contains("Channel Guidance"));
+    }
+
+    @Test
+    void channelTypeIsCaseInsensitive() {
+        var agent = newAgent("spa-channel-case");
+        var prompt = SystemPromptAssembler.assemble(agent, null, null, "TELEGRAM").systemPrompt();
+        assertTrue(prompt.contains("Channel Guidance (telegram)"),
+                "uppercase channelType must still resolve to the telegram body");
+    }
+
+    // =====================
+    // Execution Bias memory bullet tracks MemoryAutoCapture.captureEligible
+    // =====================
+
+    @Test
+    void autocaptureOnAgentIsToldItRemembersAutomatically() {
+        var agent = newAgent("spa-mem-on");
+
+        var prompt = SystemPromptAssembler.assemble(agent, "test").systemPrompt();
+
+        assertTrue(prompt.contains("You remember durable facts automatically"),
+                "an autocapture-enabled agent keeps the automatic-capture guidance");
+        assertFalse(prompt.contains("Automatic memory capture is not running for this conversation"),
+                "the off-variant must not appear for an autocapture-enabled agent");
+    }
+
+    @Test
+    void autocaptureOffAgentIsToldToStoreOnlyWhenDirected() {
+        var agent = newAgent("spa-mem-off");
+        agent.memoryAutocaptureEnabled = false;
+        agent.save();
+
+        var prompt = SystemPromptAssembler.assemble(agent, "test").systemPrompt();
+
+        assertTrue(prompt.contains("Automatic memory capture is not running for this conversation"),
+                "an autocapture-disabled agent must be told capture is off");
+        assertTrue(prompt.contains("only when the operator explicitly directs you to remember"),
+                "storing must be scoped to an explicit operator instruction");
+        assertFalse(prompt.contains("You remember durable facts automatically"),
+                "the automatic-capture claim must not survive the toggle being off");
+        assertFalse(prompt.contains("that is what the automatic capture is for"),
+                "the off-variant must not defer proactive saves to a capture that is not running");
+    }
+
+    /** Subagents are excluded from capture (JCLAW-539), so they get the same off-variant. */
+    @Test
+    void subagentIsNotToldItRemembersAutomatically() {
+        var parent = newAgent("spa-mem-parent");
+        var child = newAgent("spa-mem-child");
+        child.parentAgent = parent;
+        child.save();
+
+        var prompt = SystemPromptAssembler.assemble(child, "test").systemPrompt();
+
+        assertFalse(prompt.contains("You remember durable facts automatically"),
+                "a subagent never gets autocapture, so it must not be told otherwise");
+        assertTrue(prompt.contains("Automatic memory capture is not running for this conversation"),
+                "a subagent gets the manual-storage guidance");
+    }
+
+    /** Voice turns are excluded from capture (JCLAW-866) even with the agent toggle on. */
+    @Test
+    void voiceConversationDropsTheAutomaticCaptureClaim() {
+        var agent = newAgent("spa-mem-voice");
+
+        var prompt = SystemPromptAssembler.assemble(agent, null, null, "voice").systemPrompt();
+
+        assertFalse(prompt.contains("You remember durable facts automatically"),
+                "a voice turn is never auto-captured, so the claim must not be made there");
+        assertTrue(prompt.contains("Automatic memory capture is not running for this conversation"),
+                "a voice turn gets the manual-storage guidance");
+    }
+
+    @Test
+    void nonVoiceChannelKeepsTheAutomaticCaptureGuidance() {
+        var agent = newAgent("spa-mem-web");
+
+        var prompt = SystemPromptAssembler.assemble(agent, null, null, "web").systemPrompt();
+
+        assertTrue(prompt.contains("You remember durable facts automatically"),
+                "the voice exclusion must not leak into other channels");
+    }
+
+    // =====================
+    // Cleanup so workspace dirs don't accumulate across runs
+    // =====================
+
+    @AfterAll
+    static void cleanupWorkspaceDirs() {
+        var root = AgentService.workspaceRoot();
+        if (!Files.exists(root)) return;
+        try (var stream = Files.list(root)) {
+            stream.filter(p -> p.getFileName().toString().startsWith("spa-"))
+                    .forEach(SystemPromptAssemblerTest::deleteRecursively);
+        } catch (Exception _) {
+            // best-effort
+        }
+    }
+
+    private static void deleteRecursively(Path p) {
+        if (!Files.exists(p)) return;
+        try (var walk = Files.walk(p)) {
+            walk.sorted(java.util.Comparator.reverseOrder()).forEach(child -> {
+                try { Files.delete(child); } catch (Exception _) { /* best-effort */ }
+            });
+        } catch (Exception _) {
+            // best-effort
+        }
+    }
+
+    // =====================
+    // Loadtest agent: minimal prompt for fair cross-provider benchmarks
+    // =====================
+
+    @Test
+    void loadtestAgentEmitsOnlySafetyExecutionBiasAndChannelGuidance() throws Exception {
+        var agent = newAgent(services.LoadTestRunner.LOADTEST_AGENT_NAME);
+        // Add a workspace file the loadtest path should IGNORE — proves the
+        // slim path is genuinely skipping content rather than the test
+        // happening to land on an empty workspace.
+        writeWorkspaceFile(agent.name, "AGENT.md", "MARKER_AGENT_LOADTEST_SHOULD_NOT_APPEAR");
+
+        var assembled = SystemPromptAssembler.assemble(agent, "anything", null, "web");
+        var prompt = assembled.systemPrompt();
+
+        // Dump to /tmp for empirical inspection — operators can cat the file
+        // after `play autotest` to see exactly what bytes ship for the
+        // loadtest agent. Best-effort; failures here don't break the test.
+        try {
+            Files.writeString(Path.of("/tmp/jclaw-loadtest-prompt.txt"), prompt);
+        } catch (Exception _) { /* ok */ }
+
+        assertTrue(prompt.contains("## Safety"),
+                "Safety section must appear in the loadtest prompt");
+        assertTrue(prompt.contains("Execution Bias") || prompt.contains("Execution") || prompt.contains("execution"),
+                "Execution Bias section must appear in the loadtest prompt");
+        assertTrue(prompt.toLowerCase().contains("channel guidance"),
+                "Channel Guidance section must appear when channelType is 'web'");
+
+        // Negative assertions — every other section must be absent.
+        assertFalse(prompt.contains("MARKER_AGENT_LOADTEST_SHOULD_NOT_APPEAR"),
+                "Loadtest path must NOT include workspace file content");
+        assertFalse(prompt.contains("Workspace File Delivery"),
+                "Loadtest path must NOT include the workspace-file-delivery convention section");
+        assertFalse(prompt.contains("Environment"),
+                "Loadtest path must NOT include the environment-info section");
+        // JCLAW-281: the Execution Bias section now references "Tool Catalog"
+        // by name in a behavioral rule about MCP/tools categorization. Assert
+        // on the literal section header so this stays a check that the
+        // section itself isn't rendered, not that the phrase never appears.
+        assertFalse(prompt.contains("## Tool Catalog"),
+                "Loadtest path must NOT include the tool-catalog section");
+        // Same reasoning as the Tool Catalog assertion above: match the section header,
+        // not the word. A bare "memories" also matches the Execution Bias bullet, whose
+        // capture-off variant reads "memories already stored are still loaded back for
+        // you" — prose about the section, not the section (JCLAW-942).
+        assertFalse(prompt.contains(SystemPromptAssembler.RECALL_HEADING),
+                "Loadtest path must NOT include the recalled-memories section");
+
+        assertTrue(assembled.skills().isEmpty(),
+                "Loadtest path must return zero skills (regardless of whether disk has any)");
+    }
+
+    @Test
+    void loadtestAgentSkipsChannelGuidanceWhenChannelHasNone() {
+        var agent = newAgent(services.LoadTestRunner.LOADTEST_AGENT_NAME);
+        // Slack has no registered channel guidance → section silently absent.
+        var assembled = SystemPromptAssembler.assemble(agent, "x", null, "slack");
+        assertFalse(assembled.systemPrompt().toLowerCase().contains("channel guidance"),
+                "Channel Guidance section must be absent for channels without registered guidance");
+        assertTrue(assembled.systemPrompt().contains("## Safety"),
+                "Safety still appears regardless of channel");
+    }
+}

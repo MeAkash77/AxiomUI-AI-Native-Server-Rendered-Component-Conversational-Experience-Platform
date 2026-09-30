@@ -1,0 +1,87 @@
+package models;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.PostPersist;
+import jakarta.persistence.PostRemove;
+import jakarta.persistence.PostUpdate;
+import jakarta.persistence.Table;
+import org.hibernate.annotations.Cache;
+import org.hibernate.annotations.CacheConcurrencyStrategy;
+import play.cache.CacheConfig;
+import play.cache.Caches;
+import services.Tx;
+
+import java.time.Duration;
+import java.util.Optional;
+
+@Entity
+@Table(name = "channel_config")
+// JCLAW-205: Hibernate L2 cache via Caffeine. Catches direct entity-by-ID
+// reads. The findByType lookup below is a separate Caches.named layer
+// because L2 caches by primary key, not by secondary unique fields like
+// channelType — the JPQL query still runs without it. The two layers are
+// complementary: L2 cuts the field re-fetch on hit, the named cache cuts
+// the SQL altogether.
+@Cache(usage = CacheConcurrencyStrategy.READ_WRITE)
+public class ChannelConfig extends TimestampedModel {
+
+    @Column(name = "channel_type", nullable = false, unique = true)
+    public String channelType;
+
+    @Column(name = "config_json", nullable = false, columnDefinition = "TEXT")
+    public String configJson;
+
+    @Column(nullable = false)
+    public boolean enabled = false;
+
+    // Keep the TTL cache coherent with JPA lifecycle. Without this hook a test
+    // (or background job) that reads "telegram" before a row exists poisons the
+    // cache with an empty Optional for 60 s — subsequent writes inside that
+    // window are invisible to the next read.
+    @PostPersist
+    @PostUpdate
+    @PostRemove
+    void invalidateCache() {
+        // Immediate, because the admin save path re-reads this row inside its own
+        // transaction — ApiChannelsController.save calls reconcileRunner after saving, and
+        // starting or stopping the wrong runner is worse than a stale cache entry.
+        evictCache(channelType);
+        // And again once the write is durable (JCLAW-1042): these callbacks fire at flush, so
+        // a reader racing the flush-to-commit window re-populates the cache from the row the
+        // commit has not written yet, and that entry then outlives the commit for the full TTL.
+        var type = channelType;
+        Tx.afterCommit(() -> evictCache(type));
+    }
+
+    // JCLAW-203: secondary-key lookup cache. Stores Optional<ChannelConfig>
+    // so a missing row is memoized as Optional.empty rather than re-queried
+    // on every miss (negative caching). Caller reads scalar fields only
+    // (configJson, enabled) so the entity can safely outlive its tx.
+    private static final play.cache.Cache<String, Optional<ChannelConfig>> cache = Caches.named(
+            "channel-configs",
+            CacheConfig.newBuilder()
+                    .expireAfterWrite(Duration.ofSeconds(60))
+                    .build());
+
+    public static ChannelConfig findByType(String channelType) {
+        // Callers on SDK threads (Telegram long-polling executor) and virtual
+        // threads spawned from webhook controllers have no JPA transaction
+        // bound. Wrap the cache-miss DB read in Tx.run — it short-circuits
+        // when the caller is already inside a transaction (the admin save
+        // path), so managed-entity semantics are preserved there.
+        return cache.get(channelType, k -> Tx.run(() ->
+                Optional.ofNullable((ChannelConfig) ChannelConfig.find("channelType", k).first())))
+                .orElse(null);
+    }
+
+    /** Evict the cache for a specific channel type (call after admin updates). */
+    public static void evictCache(String channelType) {
+        cache.invalidate(channelType);
+    }
+
+    /** Evict all cached channel configs. */
+    public static void evictAllCache() {
+        cache.invalidateAll();
+    }
+}

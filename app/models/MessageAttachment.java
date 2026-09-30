@@ -1,0 +1,185 @@
+package models;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.Index;
+import jakarta.persistence.JoinColumn;
+import jakarta.persistence.ManyToOne;
+import jakarta.persistence.PrePersist;
+import jakarta.persistence.Table;
+import org.hibernate.annotations.Cache;
+import org.hibernate.annotations.CacheConcurrencyStrategy;
+import org.hibernate.annotations.ColumnDefault;
+import org.hibernate.annotations.OnDelete;
+import org.hibernate.annotations.OnDeleteAction;
+import play.db.jpa.Model;
+import utils.AppClock;
+
+import java.time.Instant;
+import java.util.List;
+
+/**
+ * Persisted record of a file attached to a user {@link Message}. Backs the
+ * vision/multimodal flow (JCLAW-25): the upload endpoint stages bytes on
+ * disk under {@code workspace/{agent.name}/attachments/{conversation_id}/{uuid}.{ext}}
+ * and writes one row here per file; the send path fetches rows for the
+ * outgoing message, reads bytes from {@link #storagePath}, and threads
+ * image attachments into the provider payload as OpenAI-style content parts.
+ */
+@Entity
+@Table(name = "chat_message_attachment", indexes = {
+        @Index(name = "idx_attachment_message", columnList = "message_id"),
+        @Index(name = "idx_attachment_uuid", columnList = "uuid", unique = true)
+})
+// JCLAW-205 follow-up: read on attachment download (findByUuid) and
+// every chat-history render that contains attachments (findByMessage).
+// Rows are immutable after create (operator can't edit an attachment;
+// they're recreated by re-upload), so the cache hit rate approaches
+// 100% once warm. The transcript column can be sizeable for audio
+// attachments but is still bounded; no @Lob/blob bytes live in the
+// row itself (storagePath points at the on-disk file).
+@Cache(usage = CacheConcurrencyStrategy.READ_WRITE)
+public class MessageAttachment extends Model {
+
+    public static final String KIND_IMAGE = "IMAGE";
+    public static final String KIND_AUDIO = "AUDIO";
+    public static final String KIND_VIDEO = "VIDEO";
+    public static final String KIND_FILE = "FILE";
+
+    @ManyToOne(optional = false)
+    @JoinColumn(name = "message_id", nullable = false)
+    @OnDelete(action = OnDeleteAction.CASCADE)
+    public Message message;
+
+    /** Client-facing opaque identifier; never the DB primary key. */
+    @Column(nullable = false, unique = true, length = 36)
+    public String uuid;
+
+    @Column(name = "original_filename", nullable = false)
+    public String originalFilename;
+
+    /** Workspace-relative path, e.g. {@code main/attachments/42/<uuid>.png}. */
+    @Column(name = "storage_path", nullable = false)
+    public String storagePath;
+
+    @Column(name = "mime_type", nullable = false)
+    public String mimeType;
+
+    @Column(name = "size_bytes", nullable = false)
+    public long sizeBytes;
+
+    /** One of {@link #KIND_IMAGE} or {@link #KIND_FILE}. */
+    @Column(nullable = false, length = 16)
+    public String kind;
+
+    /** Whisper transcript for audio attachments; nullable until JCLAW-165 wires the writer. */
+    @Column(columnDefinition = "TEXT")
+    public String transcript;
+
+    /** JCLAW-211: cached image caption for the non-vision fallback — computed once via
+     *  {@link services.caption.ImageCaptionService} and reused across replays, history search, and
+     *  the text-only-model path. Deliberately distinct from {@link #transcript} so a video with both
+     *  audio and visual content can carry each. Nullable; the writer is wired in JCLAW-215. */
+    @Column(columnDefinition = "TEXT")
+    public String caption;
+
+    /** JCLAW-218: cached temporal text summary for the text-only (text-summary) video fallback — the per-frame
+     *  captions assembled into a {@code [hh:mm:ss]} timeline, computed once by the
+     *  video-understanding pipeline and reused across replays and history search. Each frame
+     *  caption is its own LLM call, so re-deriving this is N times costlier than a single image
+     *  caption. Deliberately distinct from {@link #transcript} and {@link #caption} so a video
+     *  with audio, a still caption, and a temporal summary can carry each. Nullable; the writer is
+     *  wired in JCLAW-222. */
+    @Column(columnDefinition = "TEXT")
+    public String videoSummary;
+
+    /** JCLAW-227: true when this image was produced by the {@code generate_image} tool (image-generation
+     *  epic) rather than uploaded by the user. Lets the chat UI badge generated images and keeps
+     *  generated/uploaded provenance distinguishable. {@code @ColumnDefault} keeps the ALTER safe on a
+     *  populated table (existing rows default false without a manual migration). */
+    @Column(nullable = false)
+    @ColumnDefault("false")
+    public boolean generated = false;
+
+    /** JCLAW-227: JSON metadata for a generated image (prompt, model, provider, seed) — surfaced in the
+     *  chat UI tooltip. Null for uploaded attachments. Nullable TEXT, mirroring {@link #caption} etc. */
+    @Column(name = "generation_metadata", columnDefinition = "TEXT")
+    public String generationMetadata;
+
+    /** JCLAW-234: links a generated-video placeholder to its {@code VideoGenerationJob} (JCLAW-230) so the
+     *  runner can fill it on completion and the chat UI can poll the job's progress. Null for every
+     *  uploaded / non-video attachment. Nullable, so the ALTER is safe on the populated table without a
+     *  {@code @ColumnDefault} (only NOT NULL adds need one).
+     *
+     *  <p>A plain id rather than a foreign key (JCLAW-984), the mirror of
+     *  {@code VideoGenerationJob#resultAttachmentId}. Neither side owns the other: the job is owned by
+     *  its agent and conversation, this row by its message, and both chains cascade from the same
+     *  conversation — so the pair is normally deleted together and a constraint would buy nothing. What
+     *  it would cost is real: this class is mapped {@code cascade = ALL, orphanRemoval = true} on
+     *  {@code Message.attachments}, so an association across this link fails the flush with
+     *  {@code TransientPropertyValueException} before any {@code ON DELETE} rule is consulted. */
+    @Column(name = "generation_job_id")
+    public Long generationJobId;
+
+    /** JCLAW-209: true once the user deletes this attachment's file from the workspace via the chat UI.
+     *  The on-disk bytes are removed but the row is retained so the chip can show a "deleted from
+     *  workspace" marker on reload (the prompt/provenance stays a permanent record). {@code @ColumnDefault}
+     *  keeps the ALTER safe on the populated table — existing rows default false without a migration. */
+    @Column(nullable = false)
+    @ColumnDefault("false")
+    public boolean deleted = false;
+
+    @Column(name = "created_at", nullable = false, updatable = false)
+    public Instant createdAt;
+
+    @PrePersist
+    void onCreate() {
+        createdAt = AppClock.now();
+    }
+
+    public boolean isImage() {
+        return KIND_IMAGE.equals(kind);
+    }
+
+    public boolean isAudio() {
+        return KIND_AUDIO.equals(kind);
+    }
+
+    public boolean isVideo() {
+        return KIND_VIDEO.equals(kind);
+    }
+
+    /** Classify a MIME string into one of the persisted kinds. */
+    public static String kindForMime(String mime) {
+        if (mime == null) return KIND_FILE;
+        if (mime.startsWith("image/")) return KIND_IMAGE;
+        if (mime.startsWith("audio/")) return KIND_AUDIO;
+        if (mime.startsWith("video/")) return KIND_VIDEO;
+        return KIND_FILE;
+    }
+
+    public static MessageAttachment findByUuid(String uuid) {
+        if (uuid == null) return null;
+        return MessageAttachment.find("uuid", uuid).first();
+    }
+
+    public static List<MessageAttachment> findByMessage(Message message) {
+        return MessageAttachment.find("message = ?1 ORDER BY id ASC", message).fetch();
+    }
+
+    /** JCLAW-694: the most recent user-uploaded (non-generated) image in a conversation, or null.
+     *  Resolves the reference image for {@code generate_image}'s image-to-image / style-transfer
+     *  path — generated images are excluded so a prior generation isn't fed back as a reference. */
+    public static MessageAttachment findLatestUploadedImage(Long conversationId) {
+        if (conversationId == null) return null;
+        return MessageAttachment.find(
+                "message.conversation.id = ?1 and kind = ?2 and generated = false ORDER BY id DESC",
+                conversationId, KIND_IMAGE).first();
+    }
+
+    /** JCLAW-234: the placeholder row linked to a video-generation job (null until the tool creates one). */
+    public static MessageAttachment findByGenerationJobId(Long jobId) {
+        if (jobId == null) return null;
+        return MessageAttachment.find("generationJobId", jobId).first();
+    }
+}

@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- shutdownHook="disable": keep appenders open during graceful shutdown so
+     logs emitted from Play's @OnApplicationStop (e.g. ShutdownJob's sequence)
+     aren't dropped by log4j2's own shutdown hook closing them first. Safe here
+     — all appenders are synchronous + immediateFlush. -->
+<Configuration status="WARN" shutdownHook="disable">
+    <Appenders>
+        <Console name="Console" target="SYSTEM_OUT">
+            <PatternLayout pattern="%d{HH:mm:ss.SSS} [%t] %-5level %logger{36} - %msg%n"/>
+        </Console>
+        <RollingFile name="File" fileName="logs/application.log"
+                     filePattern="logs/application-%d{yyyy-MM-dd}-%i.log.gz">
+            <PatternLayout pattern="%d{yyyy-MM-dd HH:mm:ss.SSS} [%t] %-5level %logger{36} - %msg%n"/>
+            <Policies>
+                <TimeBasedTriggeringPolicy interval="1" modulate="true"/>
+                <SizeBasedTriggeringPolicy size="50MB"/>
+            </Policies>
+            <!-- Retention is the Delete action, never max=. max bounds the %i
+                 counter, so on the date-only pattern this used to carry it had nothing
+                 to count and pruned nothing: 70 daily archives had accumulated under
+                 "max=30" (JCLAW-1057).
+                 %i is required by the size policy above — two rollovers in one day would
+                 otherwise be handed the same name and the second would overwrite the
+                 first. max caps that counter; the default of 7 would start discarding a
+                 busy day's archives at 50MB each.
+                 The -N in the regex is optional so archives written before %i was added
+                 are still pruned. Delete runs on rollover, so a backlog clears at the
+                 next one rather than at startup. -->
+            <DefaultRolloverStrategy max="100">
+                <Delete basePath="logs" maxDepth="1">
+                    <IfFileName regex="application-\d{4}-\d{2}-\d{2}(-\d+)?\.log\.gz"/>
+                    <IfLastModified age="P30D"/>
+                </Delete>
+            </DefaultRolloverStrategy>
+        </RollingFile>
+    </Appenders>
+    <Loggers>
+        <Logger name="play" level="INFO"/>
+        <Root level="INFO">
+            <AppenderRef ref="Console"/>
+            <AppenderRef ref="File"/>
+        </Root>
+    </Loggers>
+</Configuration>

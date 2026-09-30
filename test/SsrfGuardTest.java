@@ -1,0 +1,650 @@
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
+import play.test.UnitTest;
+import utils.HttpFactories;
+import utils.SsrfGuard;
+
+import java.net.InetAddress;
+import java.net.URI;
+import java.net.UnknownHostException;
+import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+/**
+ * Unit tests for {@link SsrfGuard}. The IP-range checks are pure functions
+ * of {@link InetAddress} predicates, so these don't need any network: we
+ * construct addresses directly from literals and assert the classification.
+ */
+class SsrfGuardTest extends UnitTest {
+
+    // example.com's long-standing public address, served in place of DNS: the public-host paths run without a resolver.
+    private static final Map<String, String> EXAMPLE_COM = Map.of("example.com", "93.184.215.14");
+
+    // --- isUnsafe: blocked ranges ---
+
+    @Test
+    void isUnsafeRejectsLoopbackIpv4() throws Exception {
+        assertTrue(SsrfGuard.isUnsafe(InetAddress.getByName("127.0.0.1")));
+        assertTrue(SsrfGuard.isUnsafe(InetAddress.getByName("127.255.255.254")));
+    }
+
+    @Test
+    void isUnsafeRejectsLoopbackIpv6() throws Exception {
+        assertTrue(SsrfGuard.isUnsafe(InetAddress.getByName("::1")));
+    }
+
+    @Test
+    void isUnsafeRejectsLinkLocalAwsMetadata() throws Exception {
+        // 169.254.169.254 is the AWS/Azure/GCP instance metadata endpoint —
+        // the Capital One 2019 breach URL. This test is the canary.
+        assertTrue(SsrfGuard.isUnsafe(InetAddress.getByName("169.254.169.254")));
+        assertTrue(SsrfGuard.isUnsafe(InetAddress.getByName("169.254.0.1")));
+    }
+
+    @Test
+    void isUnsafeRejectsRfc1918Ranges() throws Exception {
+        // 10/8
+        assertTrue(SsrfGuard.isUnsafe(InetAddress.getByName("10.0.0.1")));
+        // 172.16/12
+        assertTrue(SsrfGuard.isUnsafe(InetAddress.getByName("172.16.0.1")));
+        // 192.168/16
+        assertTrue(SsrfGuard.isUnsafe(InetAddress.getByName("192.168.1.1")));
+    }
+
+    @Test
+    void isUnsafeRejectsAnyLocal() throws Exception {
+        assertTrue(SsrfGuard.isUnsafe(InetAddress.getByName("0.0.0.0")));
+    }
+
+    @Test
+    void isUnsafeRejectsMulticast() throws Exception {
+        assertTrue(SsrfGuard.isUnsafe(InetAddress.getByName("224.0.0.1")));
+        assertTrue(SsrfGuard.isUnsafe(InetAddress.getByName("239.255.255.255")));
+    }
+
+    @Test
+    void isUnsafeRejectsNat64EmbeddedLoopback() throws Exception {
+        // 64:ff9b::/96 is the RFC 6052 well-known prefix: the low 32 bits are an IPv4
+        // address, and a host with a NAT64 path translates the connection to it. So
+        // 64:ff9b::7f00:1 IS 127.0.0.1, and none of the JDK's predicates say so —
+        // isLoopbackAddress() answers false because the address itself is not ::1.
+        assertTrue(SsrfGuard.isUnsafe(InetAddress.getByName("64:ff9b::7f00:1")),
+                "NAT64-embedded loopback must be refused");
+        assertTrue(SsrfGuard.isUnsafe(InetAddress.getByName("64:ff9b::a9fe:a9fe")),
+                "NAT64-embedded link-local (cloud metadata) must be refused");
+        assertTrue(SsrfGuard.isUnsafe(InetAddress.getByName("64:ff9b::c0a8:1")),
+                "NAT64-embedded RFC1918 must be refused");
+        // The embedded address decides it: a NAT64 mapping of a public address is a
+        // legitimate way to reach that public address.
+        assertFalse(SsrfGuard.isUnsafe(InetAddress.getByName("64:ff9b::808:808")),
+                "NAT64-embedded 8.8.8.8 is a public destination");
+    }
+
+    @Test
+    void isUnsafeRejectsNonRoutableIpv4Ranges() throws Exception {
+        // Not routable on the public internet, so a URL naming one is either a mistake
+        // or an attempt to probe the host's own stack. The JDK has no predicate for
+        // any of them.
+        assertTrue(SsrfGuard.isUnsafe(InetAddress.getByName("240.0.0.1")), "240/4 reserved");
+        assertTrue(SsrfGuard.isUnsafe(InetAddress.getByName("255.255.255.255")), "broadcast");
+        assertTrue(SsrfGuard.isUnsafe(InetAddress.getByName("192.0.2.1")), "TEST-NET-1");
+        assertTrue(SsrfGuard.isUnsafe(InetAddress.getByName("198.18.0.1")), "benchmark range");
+        assertTrue(SsrfGuard.isUnsafe(InetAddress.getByName("100.64.0.1")), "CGNAT");
+    }
+
+    // --- isUnsafe: routable public IPs ---
+
+    @Test
+    void isUnsafeAcceptsPublicIpv4() throws Exception {
+        // 8.8.8.8 (Google DNS) — a known public routable address.
+        assertFalse(SsrfGuard.isUnsafe(InetAddress.getByName("8.8.8.8")));
+        // 1.1.1.1 (Cloudflare DNS).
+        assertFalse(SsrfGuard.isUnsafe(InetAddress.getByName("1.1.1.1")));
+    }
+
+    // --- SAFE_DNS: one-unsafe-record poisons the whole lookup ---
+
+    @Test
+    void safeDnsRejectsLoopbackHostname() {
+        // "localhost" resolves to 127.0.0.1 — must throw UnknownHostException
+        // with our SSRF marker, not open a socket.
+        var ex = assertThrows(UnknownHostException.class,
+                () -> SsrfGuard.SAFE_DNS.lookup("localhost"));
+        assertTrue(ex.getMessage().contains("SSRF guard"),
+                "exception must identify the guard: " + ex.getMessage());
+    }
+
+    // --- assertSafeScheme ---
+
+    @Test
+    void assertSafeSchemeAcceptsHttpAndHttps() {
+        SsrfGuard.assertSafeScheme(URI.create("http://example.com/"));
+        SsrfGuard.assertSafeScheme(URI.create("https://example.com/path?q=1"));
+        // Case-insensitive: uppercase scheme must also pass.
+        SsrfGuard.assertSafeScheme(URI.create("HTTPS://example.com/"));
+    }
+
+    @Test
+    void assertSafeSchemeRejectsFileScheme() {
+        var uri = URI.create("file:///etc/passwd");
+        var ex = assertThrows(SecurityException.class,
+                () -> SsrfGuard.assertSafeScheme(uri));
+        assertTrue(ex.getMessage().contains("scheme not allowed"),
+                "exception must explain: " + ex.getMessage());
+    }
+
+    @Test
+    void assertSafeSchemeRejectsExoticSchemes() {
+        // gopher is a classic SSRF-amplifier (Redis RCE via gopher://),
+        // data: can embed payloads, ftp: is legacy and widely forbidden.
+        for (var scheme : new String[] {"gopher", "ftp", "data", "jar", "ldap"}) {
+            var uri = URI.create(scheme + "://evil/");
+            assertThrows(SecurityException.class,
+                    () -> SsrfGuard.assertSafeScheme(uri),
+                    "scheme " + scheme + " must be rejected");
+        }
+    }
+
+    @Test
+    void assertSafeSchemeRejectsHostlessUri() {
+        var uri = URI.create("http:///no-host");
+        var ex = assertThrows(SecurityException.class,
+                () -> SsrfGuard.assertSafeScheme(uri));
+        assertTrue(ex.getMessage().contains("no host"),
+                "exception must identify the missing host: " + ex.getMessage());
+    }
+
+    // --- buildGuardedClient ---
+
+    @Test
+    void buildGuardedClientHasRedirectsDisabled() {
+        // Manual redirect handling is load-bearing: callers must walk each
+        // hop through assertSafeScheme, which the client skips itself.
+        var client = SsrfGuard.buildGuardedClient(5, 10);
+        assertFalse(client.followRedirects(),
+                "guarded client must NOT auto-follow redirects");
+        assertFalse(client.followSslRedirects(),
+                "guarded client must NOT auto-follow SSL redirects");
+    }
+
+    @Test
+    void buildGuardedClientUsesSafeDns() {
+        var client = SsrfGuard.buildGuardedClient(5, 10);
+        assertSame(SsrfGuard.SAFE_DNS, client.dns(),
+                "guarded client must wire SAFE_DNS — this is the whole point");
+    }
+
+    // ── JCLAW-116: full-URL helpers for callers outside the OkHttp path ──
+
+    @Test
+    void assertUrlSafeRejectsLoopbackLiteral() {
+        assertThrows(SecurityException.class,
+                () -> SsrfGuard.assertUrlSafe("http://127.0.0.1:9000/admin"));
+        assertThrows(SecurityException.class,
+                () -> SsrfGuard.assertUrlSafe("http://[::1]/"));
+    }
+
+    @Test
+    void assertUrlSafeRejectsCloudMetadataLiteral() {
+        // The classic EC2/GCP metadata IP — MUST stay blocked via the
+        // literal-IP path in assertSafeScheme.
+        assertThrows(SecurityException.class,
+                () -> SsrfGuard.assertUrlSafe(
+                        "http://169.254.169.254/latest/meta-data/iam/security-credentials/"));
+    }
+
+    @Test
+    void assertUrlSafeRejectsPrivateNetworkLiteral() {
+        assertThrows(SecurityException.class,
+                () -> SsrfGuard.assertUrlSafe("http://10.0.0.5/"));
+        assertThrows(SecurityException.class,
+                () -> SsrfGuard.assertUrlSafe("http://192.168.1.1/"));
+        assertThrows(SecurityException.class,
+                () -> SsrfGuard.assertUrlSafe("http://172.16.0.1/"));
+    }
+
+    @Test
+    void assertUrlSafeRejectsFileScheme() {
+        assertThrows(SecurityException.class,
+                () -> SsrfGuard.assertUrlSafe("file:///etc/passwd"));
+    }
+
+    @Test
+    void assertUrlSafeAcceptsPublicUrl() {
+        // localhost name and loopback IPs have been ruled out; a public hostname should pass.
+        SsrfGuard.callWithHostsForTest(EXAMPLE_COM, () -> {
+            SsrfGuard.assertUrlSafe("https://example.com/");
+            return null;
+        });
+    }
+
+    @Test
+    void isUrlSafeNonThrowingReturnsFalseForUnsafe() {
+        // Hot-path variant used by route interceptors — never throws.
+        assertFalse(SsrfGuard.isUrlSafe("http://127.0.0.1/"));
+        assertFalse(SsrfGuard.isUrlSafe("http://169.254.169.254/"));
+        assertFalse(SsrfGuard.isUrlSafe("file:///etc/passwd"));
+        assertFalse(SsrfGuard.isUrlSafe("not-a-valid-url"));
+    }
+
+    @Test
+    void isUrlSafeNonThrowingReturnsTrueForPublic() {
+        assertTrue(SsrfGuard.callWithHostsForTest(EXAMPLE_COM, () -> SsrfGuard.isUrlSafe("https://example.com/")));
+    }
+
+    // ── JCLAW-145: IPv6 link-local / ULA, IPv4 decimal integer form ──
+
+    @Test
+    void isUnsafeRejectsIpv6LinkLocal() throws Exception {
+        // fe80::/10 — JDK's isLinkLocalAddress covers this range.
+        assertTrue(SsrfGuard.isUnsafe(InetAddress.getByName("fe80::1")));
+        assertTrue(SsrfGuard.isUnsafe(InetAddress.getByName("fe80::dead:beef")));
+    }
+
+    @Test
+    void assertUrlSafeRejectsIpv6LinkLocalLiteral() {
+        assertThrows(SecurityException.class,
+                () -> SsrfGuard.assertUrlSafe("http://[fe80::1]/"));
+    }
+
+    @Test
+    void isUnsafeRejectsIpv6UniqueLocal() throws Exception {
+        // fc00::/7 — Unique Local Address (RFC 4193). JDK's predicate
+        // coverage misses this: isSiteLocalAddress only matches the
+        // deprecated fec0::/10. SsrfGuard must add an explicit prefix
+        // check. If this test regresses, a ULA-reachable service inside
+        // the host's network becomes SSRF-reachable.
+        assertTrue(SsrfGuard.isUnsafe(InetAddress.getByName("fc00::1")));
+        assertTrue(SsrfGuard.isUnsafe(InetAddress.getByName("fd00::1")));
+        assertTrue(SsrfGuard.isUnsafe(InetAddress.getByName("fcde:ad:be:ef::1")));
+    }
+
+    @Test
+    void isUnsafeDoesNotRejectNonUlaIpv6() throws Exception {
+        // 2001:db8::/32 is documentation-reserved — non-ULA, non-link-local,
+        // non-loopback. Must NOT be blocked (false positives break real
+        // IPv6 endpoints).
+        assertFalse(SsrfGuard.isUnsafe(InetAddress.getByName("2001:db8::1")));
+        // fe00::1 is near the ULA range but above it (starts with 0xFE,
+        // not 0xFC or 0xFD). Must not be captured by the ULA check.
+        assertFalse(SsrfGuard.isUnsafe(InetAddress.getByName("fe00::1")));
+    }
+
+    @Test
+    void assertUrlSafeRejectsIpv6UlaLiteral() {
+        assertThrows(SecurityException.class,
+                () -> SsrfGuard.assertUrlSafe("http://[fc00::1]/"));
+        assertThrows(SecurityException.class,
+                () -> SsrfGuard.assertUrlSafe("http://[fd12::1]/"));
+    }
+
+    @Test
+    void assertUrlSafeRejectsIpv4DecimalLoopback() {
+        // 2130706433 == 0x7F000001 == 127.0.0.1. isLikelyIpLiteral counts an all-digit
+        // host as a literal, so assertSafeScheme parses it with InetAddress, which reads
+        // a bare decimal as packed IPv4, and refuses the loopback before any DNS lookup.
+        assertThrows(SecurityException.class,
+                () -> SsrfGuard.assertUrlSafe("http://2130706433/"));
+    }
+
+    // ── JCLAW-731: parser-differential hardening + literal-IP pinning ──
+
+    @Test
+    void assertUrlSafeRejectsEmbeddedCredentials() {
+        // Userinfo blurs which token the host is across Java's URI parser and
+        // Chromium's WHATWG parser. Reject it even when the parsed host is
+        // itself public — LLM browse URLs never carry credentials.
+        assertThrows(SecurityException.class,
+                () -> SsrfGuard.assertUrlSafe("http://user:pass@example.com/"));
+        assertThrows(SecurityException.class,
+                () -> SsrfGuard.assertUrlSafe("http://attacker@example.com/"));
+        assertFalse(SsrfGuard.isUrlSafe("http://user:pass@example.com/"));
+    }
+
+    @Test
+    void assertUrlSafeRejectsBackslashAuthority() {
+        // Browsers remap '\' to '/', so the authority can end earlier than
+        // java.net.URI thinks: http://internal.example\@evil/ connects to
+        // internal.example in Chromium. Reject any backslash outright.
+        assertThrows(SecurityException.class,
+                () -> SsrfGuard.assertUrlSafe("http://good.example\\@169.254.169.254/"));
+        assertThrows(SecurityException.class,
+                () -> SsrfGuard.assertUrlSafe("http://example.com\\..evil.com/"));
+    }
+
+    @Test
+    void assertUrlSafeRejectsControlAndSpaceChars() {
+        // Browsers strip tab/CR/LF mid-URL before re-parsing, moving the
+        // authority boundary. Reject raw control chars and spaces.
+        assertThrows(SecurityException.class,
+                () -> SsrfGuard.assertUrlSafe("http://exa\tmple.com/"));
+        assertThrows(SecurityException.class,
+                () -> SsrfGuard.assertUrlSafe("http://exa\nmple.com/"));
+        assertThrows(SecurityException.class,
+                () -> SsrfGuard.assertUrlSafe("http://exam ple.com/"));
+    }
+
+    @Test
+    void pinnedUrlRewritesHostToValidatedLiteralIp() throws Exception {
+        // The pin resolves the host once, validates the IP, and hands back a
+        // URL whose authority IS that literal IP — so the string validated is
+        // byte-for-byte the string fetched (no hostname left to re-resolve).
+        var pinned = SsrfGuard.callWithHostsForTest(EXAMPLE_COM, () -> SsrfGuard.pinnedUrl("https://example.com/path?q=1#frag"));
+        var pinnedHost = URI.create(pinned).getHost();
+        assertNotNull(pinnedHost, "pinned URL must have a host");
+        assertFalse(pinnedHost.contains("example.com"),
+                "pinned host must be a literal IP, not the hostname: " + pinned);
+        // The literal round-trips through InetAddress and is itself safe.
+        assertFalse(SsrfGuard.isUnsafe(InetAddress.getByName(
+                pinnedHost.replace("[", "").replace("]", ""))));
+        assertTrue(SsrfGuard.isUrlSafe(pinned),
+                "the pinned literal-IP URL must itself pass the guard");
+        // Path, query, and fragment survive the rewrite.
+        assertTrue(pinned.endsWith("/path?q=1#frag"),
+                "pin must preserve path/query/fragment: " + pinned);
+    }
+
+    @Test
+    void pinnedUrlLeavesApprovedLiteralIpUnchanged() {
+        // A public literal IP is already pinned — nothing to resolve, returned
+        // verbatim so port and path are untouched.
+        assertEquals("http://8.8.8.8:8080/x?y=1",
+                SsrfGuard.pinnedUrl("http://8.8.8.8:8080/x?y=1"));
+    }
+
+    @Test
+    void pinnedUrlRejectsUnsafeAndDifferentialUrls() {
+        // Pinning must fail closed on everything assertUrlSafe rejects.
+        assertThrows(SecurityException.class,
+                () -> SsrfGuard.pinnedUrl("http://169.254.169.254/latest/meta-data/"));
+        assertThrows(SecurityException.class,
+                () -> SsrfGuard.pinnedUrl("http://127.0.0.1/"));
+        assertThrows(SecurityException.class,
+                () -> SsrfGuard.pinnedUrl("http://localhost/"));
+        assertThrows(SecurityException.class,
+                () -> SsrfGuard.pinnedUrl("http://user@example.com/"));
+        assertThrows(SecurityException.class,
+                () -> SsrfGuard.pinnedUrl("file:///etc/passwd"));
+    }
+
+    @Test
+    void ipv4OctalPrefixDoesNotCollideWithLoopback() throws Exception {
+        // Pin: modern JDKs do NOT interpret leading-zero octets as octal per
+        // RFC 5735 hardening. InetAddress.getByName("0177.0.0.1") yields
+        // 177.0.0.1, NOT 127.0.0.1. If this assertion ever fails, the JDK
+        // has re-introduced octal parsing and SsrfGuard needs an explicit
+        // pre-DNS normaliser to catch `0177` → 127 before resolution.
+        var resolved = InetAddress.getByName("0177.0.0.1");
+        assertEquals("177.0.0.1", resolved.getHostAddress(),
+                "JDK must not interpret leading-zero octets as octal");
+        assertFalse(resolved.isLoopbackAddress(),
+                "0177.0.0.1 resolved to a loopback — JDK regression, SsrfGuard "
+                        + "needs explicit octal handling");
+    }
+
+    // --- hostResolverRule: browser DNS pin (JCLAW-731) ---
+
+    @Test
+    void hostResolverRuleEmptyForApprovedLiteralIp() {
+        // A public literal IP passes assertUrlSafe and needs no pin — it IS the IP.
+        assertTrue(SsrfGuard.hostResolverRule("http://1.1.1.1/").isEmpty());
+    }
+
+    @Test
+    void hostResolverRuleThrowsOnUnsafeLiteral() {
+        assertThrows(SecurityException.class,
+                () -> SsrfGuard.hostResolverRule("http://127.0.0.1/"));
+    }
+
+    @Test
+    void hostResolverRuleThrowsOnUnsafeHostname() {
+        // localhost resolves to loopback → rejected before any pin is emitted.
+        assertThrows(SecurityException.class,
+                () -> SsrfGuard.hostResolverRule("http://localhost:9000/"));
+    }
+
+    // ── JCLAW-1280: a blocked address is a refusal a caller can tell apart ──
+
+    @Test
+    void aBlockedAddressThrowsBlockedAddressException() {
+        assertThrows(SsrfGuard.BlockedAddressException.class,
+                () -> SsrfGuard.assertUrlSafe("http://127.0.0.1:9000/admin"), "a blocked literal");
+        var resolved = assertThrows(SsrfGuard.BlockedAddressException.class,
+                () -> SsrfGuard.assertUrlSafe("http://localhost:9000/"), "a name that resolves to a blocked address");
+        assertTrue(resolved.getMessage().startsWith("SSRF guard: host localhost resolves to blocked address "),
+                resolved.getMessage());
+        assertThrows(SsrfGuard.BlockedAddressException.class,
+                () -> SsrfGuard.hostResolverRule("http://169.254.169.254/"));
+        assertThrows(SsrfGuard.BlockedAddressException.class,
+                () -> SsrfGuard.assertProviderUrlSafe("http://169.254.169.254/"), "the provider guard's literal");
+    }
+
+    @Test
+    void aRefusalForAnyOtherReasonIsAPlainSecurityException() {
+        assertThrowsExactly(SecurityException.class,
+                () -> SsrfGuard.assertUrlSafe("http://nonexistent-host-jclaw-1280.invalid/"), "a host that does not resolve");
+        assertThrowsExactly(SecurityException.class,
+                () -> SsrfGuard.assertUrlSafe("http://user@example.com/"), "userinfo");
+        assertThrowsExactly(SecurityException.class,
+                () -> SsrfGuard.assertUrlSafe("file:///etc/passwd"), "a scheme");
+    }
+
+    // ── JCLAW-1285: characters a browser sends raw after the host do not make a URL unparseable ──
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "http://8.8.8.8/css?family=Roboto|Open+Sans",
+            "http://8.8.8.8/img?a=b^c{d}e`f",
+            "http://8.8.8.8/sale?off=100%",
+            "http://8.8.8.8/p%2?q=%zz",
+            "http://8.8.8.8/x#frag|^{}",
+            "http://8.8.8.8/a[0].js",
+            "http://8.8.8.8/p|q/r^s"})
+    void aRawCharacterAfterTheHostIsJudgedOnTheHost(String url) {
+        assertDoesNotThrow(() -> SsrfGuard.assertUrlSafe(url), url);
+        assertEquals(Optional.empty(), SsrfGuard.hostResolverRule(url), url);
+        assertEquals(url, SsrfGuard.pinnedUrl(url), "a literal IP is returned as given");
+    }
+
+    @Test
+    void aBlockedAddressIsStillRefusedWhateverItsQueryHolds() {
+        assertThrows(SsrfGuard.BlockedAddressException.class,
+                () -> SsrfGuard.assertUrlSafe("http://127.0.0.1/css?family=Roboto|Open+Sans"));
+        assertThrows(SsrfGuard.BlockedAddressException.class,
+                () -> SsrfGuard.assertUrlSafe("http://169.254.169.254/latest?x={y}"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"http://exa|mple.com/", "http://8.8.8.8^/x", "http://{8.8.8.8}/", "http://ho%zzst/"})
+    void theSameCharactersInTheAuthorityAreStillRefused(String url) {
+        var refused = assertThrows(SecurityException.class, () -> SsrfGuard.assertUrlSafe(url), url);
+        assertTrue(refused.getMessage().startsWith("SSRF guard: unparseable URL"),
+                "the authority is parsed as written, not re-encoded: " + refused.getMessage());
+    }
+
+    @Test
+    void aPrefixThatIsNotASchemeIsParsedStrictly() {
+        var refused = assertThrows(SecurityException.class, () -> SsrfGuard.assertUrlSafe("1http://8.8.8.8/a|b"));
+        assertTrue(refused.getMessage().startsWith("SSRF guard: unparseable URL"), refused.getMessage());
+    }
+
+    @Test
+    void aPinnedUrlKeepsTheCallersRawTail() {
+        var pinned = SsrfGuard.callWithHostsForTest(
+                EXAMPLE_COM, () -> SsrfGuard.pinnedUrl("https://example.com/a[0]/p|q?family=Roboto|Open+Sans&off=100%#a^b"));
+        assertTrue(pinned.endsWith("/a[0]/p|q?family=Roboto|Open+Sans&off=100%#a^b"),
+                "the tail is not re-encoded: " + pinned);
+        assertFalse(pinned.contains("example.com"), "the host is pinned to a literal: " + pinned);
+        assertTrue(SsrfGuard.isUrlSafe(pinned), "the pinned URL itself passes the guard: " + pinned);
+    }
+
+    @Test
+    void anAuthorityOnlyUrlPinsToJustTheAddress() {
+        // There is no tail to carry over, and a rebuild that appended one would put the caller's
+        // whole URL — scheme included — after the pinned host.
+        var pinned = SsrfGuard.callWithHostsForTest(EXAMPLE_COM, () -> SsrfGuard.pinnedUrl("https://example.com"));
+        assertFalse(pinned.contains("example.com"), "the host is pinned to a literal: " + pinned);
+        assertEquals(pinned.indexOf("://"), pinned.lastIndexOf("://"),
+                "nothing may be appended after the authority: " + pinned);
+        assertTrue(SsrfGuard.isUrlSafe(pinned), pinned);
+    }
+
+    @Test
+    void theProviderGuardStillRefusesARawQueryCharacter() {
+        // A saved base URL is parsed strictly on every turn, so it must fail at the save instead.
+        var refused = assertThrows(SecurityException.class,
+                () -> SsrfGuard.assertProviderUrlSafe("http://localhost:11434/api?tags=a|b"));
+        assertTrue(refused.getMessage().startsWith("SSRF guard: unparseable URL"), refused.getMessage());
+    }
+
+    // ── JCLAW-778: relaxed provider/MCP guard (permits loopback/LAN) ──
+
+    @Test
+    void isBlockedForProviderBlocksLinkLocalAndMetadata() throws Exception {
+        // The cloud-metadata IP and the rest of the link-local range are the
+        // one escalation surface this relaxed guard must still close.
+        assertTrue(SsrfGuard.isBlockedForProvider(InetAddress.getByName("169.254.169.254")));
+        assertTrue(SsrfGuard.isBlockedForProvider(InetAddress.getByName("169.254.0.1")));
+        assertTrue(SsrfGuard.isBlockedForProvider(InetAddress.getByName("fe80::1")));
+    }
+
+    @Test
+    void isBlockedForProviderBlocksMulticastAndAnyLocal() throws Exception {
+        assertTrue(SsrfGuard.isBlockedForProvider(InetAddress.getByName("224.0.0.1")));
+        assertTrue(SsrfGuard.isBlockedForProvider(InetAddress.getByName("0.0.0.0")));
+    }
+
+    @Test
+    void isBlockedForProviderPermitsLoopbackAndPrivate() throws Exception {
+        // Local self-hosted inference (Ollama/LM Studio) and LAN hosts must NOT
+        // be blocked — this is the whole reason for the relaxed variant.
+        assertFalse(SsrfGuard.isBlockedForProvider(InetAddress.getByName("127.0.0.1")));
+        assertFalse(SsrfGuard.isBlockedForProvider(InetAddress.getByName("::1")));
+        assertFalse(SsrfGuard.isBlockedForProvider(InetAddress.getByName("10.0.0.5")));
+        assertFalse(SsrfGuard.isBlockedForProvider(InetAddress.getByName("192.168.1.1")));
+        assertFalse(SsrfGuard.isBlockedForProvider(InetAddress.getByName("172.16.0.1")));
+        // Public IPs stay allowed too.
+        assertFalse(SsrfGuard.isBlockedForProvider(InetAddress.getByName("8.8.8.8")));
+    }
+
+    @Test
+    void providerSafeDnsAllowsLoopbackHostname() throws Exception {
+        // Unlike the strict SAFE_DNS (which rejects localhost), the provider DNS
+        // resolves loopback names without throwing.
+        var addrs = SsrfGuard.PROVIDER_SAFE_DNS.lookup("localhost");
+        assertFalse(addrs.isEmpty(), "localhost must resolve through the provider DNS");
+    }
+
+    @Test
+    void assertProviderUrlSafeRejectsMetadataLiteral() {
+        // http://169.254.169.254/... is the credential-theft primitive — must be
+        // rejected before any connect on the agent-settable provider/MCP path.
+        var ex = assertThrows(SecurityException.class,
+                () -> SsrfGuard.assertProviderUrlSafe(
+                        "http://169.254.169.254/latest/meta-data/iam/security-credentials/"));
+        assertTrue(ex.getMessage().contains("SSRF guard"), "must identify the guard: " + ex.getMessage());
+    }
+
+    @Test
+    void assertProviderUrlSafeRejectsIpv6LinkLocalLiteral() {
+        assertThrows(SecurityException.class,
+                () -> SsrfGuard.assertProviderUrlSafe("http://[fe80::1]/mcp"));
+    }
+
+    @Test
+    void assertProviderUrlSafePermitsLoopbackAndPrivateLiterals() {
+        // These must NOT throw — local inference + LAN MCP servers depend on it.
+        SsrfGuard.assertProviderUrlSafe("http://127.0.0.1:11434/v1");
+        SsrfGuard.assertProviderUrlSafe("http://[::1]/mcp");
+        SsrfGuard.assertProviderUrlSafe("http://10.0.0.5:8080/v1");
+        SsrfGuard.assertProviderUrlSafe("http://192.168.1.50/mcp");
+    }
+
+    @Test
+    void assertProviderUrlSafePermitsHostnamesWithoutResolving() {
+        // Hostnames are screened at connect by PROVIDER_SAFE_DNS, not here, so a
+        // public host and even a not-yet-live host both pass validation offline.
+        SsrfGuard.assertProviderUrlSafe("https://openrouter.ai/api/v1");
+        SsrfGuard.assertProviderUrlSafe("http://not-a-real-host-xyz/mcp");
+    }
+
+    @Test
+    void assertProviderUrlSafeRejectsNonHttpSchemeAndHostless() {
+        assertThrows(SecurityException.class,
+                () -> SsrfGuard.assertProviderUrlSafe("file:///etc/passwd"));
+        assertThrows(SecurityException.class,
+                () -> SsrfGuard.assertProviderUrlSafe("gopher://evil/"));
+        assertThrows(SecurityException.class,
+                () -> SsrfGuard.assertProviderUrlSafe("http:///no-host"));
+    }
+
+    // --- permitOriginForTest (JCLAW-1277) ---
+
+    private static final String FIXTURE = "http://127.0.0.1:4711";
+
+    @Test
+    void anUnboundGuardRefusesTheFixtureOrigin() {
+        assertThrows(SecurityException.class, () -> SsrfGuard.assertUrlSafe(FIXTURE + "/"));
+        assertFalse(SsrfGuard.isUrlSafe(FIXTURE + "/"));
+        assertThrows(SecurityException.class, () -> SsrfGuard.hostResolverRule(FIXTURE + "/"));
+    }
+
+    @Test
+    void aPermittedOriginPassesEveryCheckOnlyOnTheBindingThread() {
+        var elsewhere = new AtomicBoolean(true);
+        SsrfGuard.permitOriginForTest(FIXTURE, () -> {
+            SsrfGuard.assertUrlSafe(FIXTURE + "/form?q=1#top");
+            assertTrue(SsrfGuard.isUrlSafe(FIXTURE + "/"));
+            assertTrue(SsrfGuard.isUrlSafe("HTTP://127.0.0.1:4711/"));
+            assertEquals(Optional.empty(), SsrfGuard.hostResolverRule(FIXTURE + "/order"));
+            assertEquals(FIXTURE + "/order", SsrfGuard.pinnedUrl(FIXTURE + "/order"));
+            var other = Thread.ofVirtual().start(() -> elsewhere.set(SsrfGuard.isUrlSafe(FIXTURE + "/")));
+            try {
+                other.join();
+            } catch (InterruptedException e) {
+                throw new AssertionError(e);
+            }
+            return null;
+        });
+        assertFalse(elsewhere.get(), "another thread does not see the binding");
+        assertFalse(SsrfGuard.isUrlSafe(FIXTURE + "/"), "the binding ends with its body");
+    }
+
+    /** A hostname would still hit the DNS pin, and any other scheme would skip the scheme check. */
+    @ParameterizedTest
+    @ValueSource(strings = {"http://localhost:4711", "http://example.com", "ftp://127.0.0.1:21", "file://127.0.0.1/", "127.0.0.1:4711"})
+    void onlyAnHttpIpLiteralOriginCanBePermitted(String origin) {
+        assertThrows(IllegalArgumentException.class, () -> SsrfGuard.permitOriginForTest(origin, () -> null), origin);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "http://127.0.0.1:4712/",
+            "http://127.0.0.2:4711/",
+            "https://127.0.0.1:4711/",
+            "http://127.0.0.1/",
+            "http://localhost:4711/",
+            "http://10.0.0.5:4711/",
+            "http://169.254.169.254/",
+            "http://user@127.0.0.1:4711/"
+    })
+    void aPermittedOriginAdmitsNoOther(String url) {
+        SsrfGuard.permitOriginForTest(FIXTURE, () -> {
+            assertThrows(SecurityException.class, () -> SsrfGuard.assertUrlSafe(url), url);
+            assertFalse(SsrfGuard.isUrlSafe(url), url);
+            return null;
+        });
+    }
+
+    @Test
+    void theGuardedLlmTiersActuallyCarryTheProviderResolver() {
+        // JCLAW-1229 moved the chat path onto these two. "Guarded" has to mean the
+        // rebinding screen is wired in, or the swap bought a name and nothing else.
+        assertSame(SsrfGuard.PROVIDER_SAFE_DNS, HttpFactories.llmSingleShotGuarded().dns());
+        assertSame(SsrfGuard.PROVIDER_SAFE_DNS, HttpFactories.llmStreamingGuarded().dns());
+        assertNotSame(SsrfGuard.PROVIDER_SAFE_DNS, HttpFactories.llmSingleShot().dns());
+        assertNotSame(SsrfGuard.PROVIDER_SAFE_DNS, HttpFactories.llmStreaming().dns());
+    }
+}

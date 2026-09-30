@@ -1,0 +1,280 @@
+package services;
+
+import com.github.kagkarlsson.scheduler.task.ExecutionComplete;
+import com.github.kagkarlsson.scheduler.task.ExecutionOperations;
+import com.github.kagkarlsson.scheduler.task.FailureHandler;
+import models.Task;
+import models.TaskRun;
+import org.jspecify.annotations.Nullable;
+import play.Logger;
+import utils.AppClock;
+import utils.TransientErrorClassifier;
+
+import java.time.Instant;
+
+/**
+ * db-scheduler {@link FailureHandler} for JClaw task fires.
+ * Implements the JCLAW-21 retry policy:
+ *
+ * <ul>
+ *   <li>Transient failures (per
+ *   {@link TransientErrorClassifier}) reschedule on the
+ *   {@link #BACKOFF_SECONDS backoff schedule} provided
+ *   {@code retryCount &lt; min(maxRetries, backoff schedule length)}.</li>
+ *   <li>Permanent failures, or transients with retries exhausted,
+ *   mark the Task {@link Task.Status#FAILED} and stop the
+ *   db-scheduler row — except on a recurring Task, where they end only
+ *   the occurrence: the row moves to the next one with a full retry
+ *   budget.</li>
+ * </ul>
+ *
+ * <h2>Why policy is in its own static method</h2>
+ * db-scheduler's {@link ExecutionOperations} is a concrete class
+ * with a non-trivial constructor ({@code TaskRepository},
+ * {@code SchedulerListeners}, {@code Execution}), so the integration
+ * surface is awkward to stub from a unit test. The retry-vs-fail
+ * decision lives in {@link #decide(Long, Throwable)} which takes
+ * primitives and returns a {@link Decision} record; the
+ * {@link #onFailure} method is then a thin shell that translates
+ * the decision into the right
+ * {@code executionOps.reschedule}/{@code stop} call. Tests target
+ * {@code decide} directly.
+ *
+ * <h2>Backoff schedule (spec)</h2>
+ * {@code 30s, 60s, 5m, 15m, 1h} at retry positions 0–4. Position 5
+ * and beyond → permanent. {@code Task.maxRetries} (default 3, per
+ * the column default) caps shorter than the backoff array when
+ * operators want a tighter ceiling. The min of the two governs.
+ *
+ * <p>Part of JCLAW-21's Tasks foundation. Wired into
+ * {@link TaskExecutionHandler}'s {@code Tasks.custom(...)}
+ * registration via {@code .onFailure(new JClawFailureHandler())}.
+ */
+public final class JClawFailureHandler implements FailureHandler<Void> {
+
+    /**
+     * Backoff schedule from the JCLAW-21 spec — seconds at retry
+     * positions 0..4. Position {@code i} is the delay applied
+     * <em>before</em> the {@code (i+1)}th attempt. Beyond position
+     * {@code length-1} the failure is permanent.
+     */
+    static final long[] BACKOFF_SECONDS = {30, 60, 5 * 60, 15 * 60, 60 * 60};
+
+    /**
+     * Outcome of {@link #decide}: retry at the carried instant (transient + retry budget
+     * remains), move a recurring Task on to its next occurrence, or stop the scheduler row
+     * and mark the Task FAILED.
+     */
+    public sealed interface Decision permits Decision.Reschedule, Decision.NextOccurrence, Decision.Fail {
+        /**
+         * Try again at {@code nextRunAt}; the Task returns from RUNNING to its
+         * alive state (PENDING one-shot / ACTIVE recurring) with bumped
+         * retryCount for the backoff window.
+         *
+         * @param nextRunAt      when db-scheduler should fire the next
+         *                       attempt
+         * @param newRetryCount  the bumped {@code Task.retryCount} value to
+         *                       persist
+         */
+        record Reschedule(Instant nextRunAt, int newRetryCount) implements Decision {}
+
+        /**
+         * This occurrence of a recurring Task has failed for good; fire again at the next one.
+         *
+         * @param nextRunAt the Task's next occurrence
+         * @param reason    as for {@link Fail#reason}
+         */
+        record NextOccurrence(Instant nextRunAt, String reason) implements Decision {}
+
+        /**
+         * Stop the row and mark Task FAILED.
+         *
+         * @param reason human-readable reason persisted to the Task's
+         *               {@code lastError} column and emitted in the
+         *               {@code TASK_FAILED} lifecycle event
+         */
+        record Fail(String reason) implements Decision {}
+    }
+
+    @Override
+    public void onFailure(ExecutionComplete executionComplete,
+                          ExecutionOperations<Void> executionOps) {
+        var throwable = executionComplete.getCause().orElse(null);
+        var instanceId = executionComplete.getExecution().taskInstance.getId();
+        Long jclawTaskId = parseTaskId(instanceId);
+        if (jclawTaskId == null) {
+            EventLogger.warn("task", null, null,
+                    "JClawFailureHandler: undecodable task_instance '%s'; stopping row"
+                            .formatted(instanceId));
+            executionOps.stop();
+            return;
+        }
+
+        // JCLAW-1144: every branch below writes to the database -- decide() mutates the Task
+        // row, and reschedule/stop rewrite the scheduled_tasks row. When db-scheduler
+        // interrupts its executor threads at shutdown, an interrupt inside H2 file I/O closes
+        // the store for every caller, so all of this fails and escapes as "Failed while
+        // completing execution". Contain it: the execution row is left untouched and
+        // db-scheduler's dead-execution detection re-fires it on the next boot.
+        try {
+            Decision decision = decide(jclawTaskId, throwable);
+            switch (decision) {
+                case Decision.Reschedule r ->
+                        executionOps.reschedule(executionComplete, r.nextRunAt());
+                case Decision.NextOccurrence n ->
+                        executionOps.reschedule(executionComplete, n.nextRunAt());
+                case Decision.Fail _ -> executionOps.stop();
+            }
+        } catch (RuntimeException e) {
+            if (!EventLogger.isShuttingDown()) throw e;
+            // play.Logger, not EventLogger: this path exists because the DB is unreachable.
+            Logger.warn("JClawFailureHandler: task %d outcome not recorded during shutdown (%s); "
+                    + "db-scheduler will re-fire the execution on the next boot",
+                    jclawTaskId, e.toString());
+        }
+    }
+
+    /**
+     * Pure-ish policy step: read the Task, classify the error, mutate
+     * the Task row (retryCount++ on retry, status=FAILED on permanent, or
+     * on to the next occurrence for a recurring Task),
+     * return the action db-scheduler should take. Lives in its own
+     * method so unit tests can drive it without an
+     * {@link ExecutionOperations} stub.
+     *
+     * <p>Side-effects: writes the Task row in its own short
+     * transaction. Returns silently with a Fail decision when the
+     * Task row can't be loaded (rare — implies someone deleted the
+     * Task between the fire start and the failure surface).
+     */
+    public static Decision decide(Long jclawTaskId, @Nullable Throwable throwable) {
+        boolean isTransient = TransientErrorClassifier.isTransient(throwable);
+        String errorMessage = describeError(throwable);
+
+        var outcome = Tx.run(() -> mutateAndDecide(jclawTaskId, isTransient, errorMessage));
+        if (outcome == null) {
+            EventLogger.warn("task", null, null,
+                    "JClawFailureHandler: Task id %d disappeared mid-fire; failing"
+                            .formatted(jclawTaskId));
+            return new Decision.Fail("Task row missing");
+        }
+
+        switch (outcome.decision()) {
+            case Decision.Reschedule r ->
+                    EventLogger.warn("task", outcome.agentName(), null,
+                            "Task '%s' transient failure %d/%d, retry in %ds: %s"
+                                    .formatted(outcome.taskName(), r.newRetryCount(),
+                                            outcome.budget(), outcome.backoffSecs(), errorMessage));
+            case Decision.NextOccurrence(Instant next, String reason) -> {
+                recordFailure(outcome, reason, errorMessage, "; next occurrence at " + next);
+                OperatorAlerts.onOccurrenceFailed(outcome.task(), outcome.agentName(), reason, errorMessage, next);
+            }
+            case Decision.Fail(String reason) -> recordFailure(outcome, reason, errorMessage, "");
+        }
+        return outcome.decision();
+    }
+
+    private static void recordFailure(DecideOutcome outcome, String reason, String errorMessage, String suffix) {
+        EventLogger.error("task", outcome.agentName(), null,
+                "Task '%s' failed (%s) after %d attempt(s): %s%s"
+                        .formatted(outcome.taskName(), reason, outcome.attempts(), errorMessage, suffix));
+        // JCLAW-21 lifecycle audit: TASK_FAILED, sibling to TASK_STARTED / TASK_COMPLETED
+        // in TaskExecutor. Both the classification (permanent vs exhausted) and the raw
+        // message go out so dashboards can group by class while still showing what happened.
+        TaskLifecycleEvents.recordFailed(outcome.task(), outcome.runForLifecycle(),
+                reason, errorMessage);
+    }
+
+    /**
+     * Logging/lifecycle data surfaced out of the single {@link #decide}
+     * transaction. The {@link Task} and {@link TaskRun} are loaded inside the
+     * transaction; logging and {@link TaskLifecycleEvents#recordFailed} run
+     * after it commits, off the detached entities. {@code budget},
+     * {@code backoffSecs}, and {@code attempts} carry the precomputed values
+     * the log lines need so the post-commit code doesn't re-read the row.
+     */
+    private record DecideOutcome(Decision decision, Task task, @Nullable TaskRun runForLifecycle,
+                                 String taskName, @Nullable String agentName,
+                                 int budget, long backoffSecs, int attempts) {}
+
+    /**
+     * Single read+write step run inside one transaction: load the Task,
+     * classify, mutate (retryCount bump on retry, status=FAILED on permanent,
+     * or on to the next occurrence for a recurring Task),
+     * and on the terminal path also load the latest TaskRun for the lifecycle
+     * event — all against the same persistence context. Returns {@code null}
+     * when the Task row is gone.
+     */
+    private static @Nullable DecideOutcome mutateAndDecide(Long jclawTaskId, boolean isTransient, String errorMessage) {
+        var task = (Task) Task.findById(jclawTaskId);
+        if (task == null) return null;
+
+        int currentRetry = task.retryCount;
+        int budget = Math.min(task.maxRetries, BACKOFF_SECONDS.length);
+        String agentName = task.agent != null ? task.agent.name : null;
+
+        if (isTransient && currentRetry < budget) {
+            long backoffSecs = BACKOFF_SECONDS[currentRetry];
+            Instant nextRunAt = AppClock.now().plusSeconds(backoffSecs);
+            int newRetryCount = currentRetry + 1;
+            task.retryCount = newRetryCount;
+            task.lastError = errorMessage;
+            task.nextRunAt = nextRunAt;
+            // Lifecycle: the fire ended (transiently). Return RUNNING → alive
+            // (PENDING one-shot / ACTIVE recurring) for the backoff window so the
+            // task isn't shown RUNNING while merely waiting to retry; the next
+            // attempt re-enters RUNNING via openRunningTaskRun. Guarded on
+            // still-RUNNING so a raced operator cancel (→ CANCELED) is preserved.
+            if (task.status == Task.Status.RUNNING) {
+                task.status = Task.initialStatusFor(task.type);
+            }
+            task.save();
+            return new DecideOutcome(new Decision.Reschedule(nextRunAt, newRetryCount),
+                    task, null, task.name, agentName, budget, backoffSecs, newRetryCount);
+        }
+
+        // Permanent OR transient-but-exhausted
+        String reason = isTransient ? "retries exhausted" : "permanent error";
+        var runForLifecycle =
+                (TaskRun) TaskRun.find("task.id = ?1 ORDER BY startedAt DESC", jclawTaskId).first();
+        Instant next = task.status == Task.Status.CANCELLED ? null : TaskSchedulingService.nextOccurrence(task);
+        if (next != null) {
+            task.retryCount = 0;
+            task.lastError = errorMessage;
+            task.nextRunAt = next;
+            if (task.status == Task.Status.RUNNING) task.status = Task.Status.ACTIVE;
+            task.save();
+            return new DecideOutcome(new Decision.NextOccurrence(next, reason), task, runForLifecycle,
+                    task.name, agentName, budget, 0L, currentRetry + 1);
+        }
+
+        task.status = Task.Status.FAILED;
+        task.lastError = errorMessage;
+        task.save();
+        return new DecideOutcome(new Decision.Fail(reason), task, runForLifecycle,
+                task.name, agentName, budget, 0L, currentRetry + 1);
+    }
+
+    private static String describeError(@Nullable Throwable throwable) {
+        if (throwable == null) return "Unknown error";
+        var msg = throwable.getMessage();
+        return msg != null ? msg : throwable.getClass().getSimpleName();
+    }
+
+    /**
+     * Decode {@code task_instance} → JClaw Task primary key. Returns
+     * null for any malformed value. Same shape
+     * {@link TaskExecutionHandler#parseTaskId} uses — duplicated
+     * rather than depended on because both classes are at the same
+     * layer (db-scheduler integration) and a shared helper would
+     * create coupling for a 4-line method.
+     */
+    private static @Nullable Long parseTaskId(String instanceId) {
+        if (instanceId == null || instanceId.isBlank()) return null;
+        try {
+            return Long.parseLong(instanceId.trim());
+        } catch (NumberFormatException _) {
+            return null;
+        }
+    }
+}

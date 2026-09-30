@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Slide Deck</title>
+  <style>
+    :root {
+      --primary-color: #3498db;
+      --secondary-color: #2ecc71;
+      --background-color: #ffffff;
+      --text-color: #333333;
+      --accent-color: #e74c3c;
+      --slide-bg: #ffffff;
+      --border-color: #e1e4e8;
+    }
+    
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --primary-color: #2980b9;
+        --secondary-color: #27ae60;
+        --background-color: #1a1a1a;
+        --text-color: #f0f0f0;
+        --accent-color: #c0392b;
+        --slide-bg: #2d2d2d;
+        --border-color: #444444;
+      }
+    }
+    
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;
+      margin: 0;
+      padding: 0;
+      background-color: var(--background-color);
+      color: var(--text-color);
+      line-height: 1.6;
+      overflow: hidden;
+    }
+    
+    .slide-container {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+    }
+    
+    .slide {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      align-items: center;
+      padding: 2rem;
+      background-color: var(--slide-bg);
+      transition: transform 0.5s ease;
+      transform: translateX(100%);
+      box-sizing: border-box;
+    }
+    
+    .slide.active {
+      transform: translateX(0);
+    }
+    
+    .slide.previous {
+      transform: translateX(-100%);
+    }
+    
+    .slide-content {
+      max-width: 900px;
+      width: 100%;
+      text-align: center;
+    }
+    
+    h1, h2, h3 {
+      font-weight: 600;
+    }
+    
+    h1 {
+      color: var(--primary-color);
+      margin-bottom: 1rem;
+    }
+    
+    .controls {
+      position: fixed;
+      bottom: 20px;
+      right: 20px;
+      display: flex;
+      gap: 10px;
+    }
+    
+    .controls button {
+      background-color: var(--primary-color);
+      color: white;
+      border: none;
+      border-radius: 50%;
+      width: 50px;
+      height: 50px;
+      font-size: 24px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      opacity: 0.7;
+      transition: opacity 0.2s;
+    }
+    
+    .controls button:hover {
+      opacity: 1;
+    }
+  </style>
+</head>
+<body>
+  <div class="slide-container">
+    <div class="slide active" id="slide1">
+      <div class="slide-content">
+        <h1>Slide Deck Title</h1>
+        <p>Subtitle or description goes here</p>
+      </div>
+    </div>
+    
+    <div class="slide" id="slide2">
+      <div class="slide-content">
+        <h2>Second Slide</h2>
+        <p>Content for the second slide goes here</p>
+      </div>
+    </div>
+    
+    <div class="slide" id="slide3">
+      <div class="slide-content">
+        <h2>Third Slide</h2>
+        <p>Content for the third slide goes here</p>
+      </div>
+    </div>
+  </div>
+  
+  <div class="controls">
+    <button id="prev">&lt;</button>
+    <button id="next">&gt;</button>
+  </div>
+  
+  <script>
+    document.addEventListener('DOMContentLoaded', function() {
+      const slides = document.querySelectorAll('.slide');
+      const prevBtn = document.getElementById('prev');
+      const nextBtn = document.getElementById('next');
+      let currentIndex = 0;
+      
+      // Function to update slides
+      function updateSlides() {
+        slides.forEach((slide, index) => {
+          if (index === currentIndex) {
+            slide.className = 'slide active';
+          } else if (index < currentIndex) {
+            slide.className = 'slide previous';
+          } else {
+            slide.className = 'slide';
+          }
+        });
+      }
+      
+      // Next slide
+      nextBtn.addEventListener('click', function() {
+        if (currentIndex < slides.length - 1) {
+          currentIndex++;
+          updateSlides();
+        }
+      });
+      
+      // Previous slide
+      prevBtn.addEventListener('click', function() {
+        if (currentIndex > 0) {
+          currentIndex--;
+          updateSlides();
+        }
+      });
+      
+      // Keyboard navigation
+      document.addEventListener('keydown', function(e) {
+        if (e.key === 'ArrowRight' || e.key === 'Space') {
+          if (currentIndex < slides.length - 1) {
+            currentIndex++;
+            updateSlides();
+          }
+        } else if (e.key === 'ArrowLeft') {
+          if (currentIndex > 0) {
+            currentIndex--;
+            updateSlides();
+          }
+        }
+      });
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,59 @@
+/**
+ * Filter predicate deciding whether a message should appear in the chat
+ * transcript for rendering.
+ *
+ * Rules (in order):
+ *   - Tool-role messages are always hidden (they're tool call records,
+ *     not user-facing).
+ *   - During streaming, the frontend-created placeholder (has `_key` but
+ *     no DB `id`) is suppressed ONLY until it has something renderable —
+ *     content or reasoning text. Pre-first-byte, this avoids a flash of
+ *     empty bubble; once reasoning streams in (JCLAW-70), the bubble
+ *     renders live so the user sees thinking progress.
+ *   - Otherwise, keep any message that has content, reasoning, or usage.
+ *
+ * Kept as a pure helper so the rule is directly unit-testable without
+ * mounting the chat page.
+ */
+
+export interface DisplayMessageCandidate {
+  role?: string
+  _key?: string | null
+  id?: number | null
+  content?: string | null
+  reasoning?: string | null
+  usage?: object | null
+  /** JCLAW-170: tool invocations on this assistant turn. A streaming
+   *  placeholder that has at least one tool call landed — even before the
+   *  first content/reasoning token — should render so the user sees
+   *  live tool activity instead of a blank gap. */
+  toolCalls?: { length?: number } | null
+  /** JCLAW-270: structured-card discriminator. Async-spawn completion
+   *  rows (system-role with messageKind="subagent_announce") must render
+   *  even though they have no LLM-shaped content. */
+  messageKind?: string | null
+}
+
+function hasToolCalls(m: DisplayMessageCandidate): boolean {
+  return !!(m.toolCalls && (m.toolCalls.length ?? 0) > 0)
+}
+
+/**
+ * An announce for a background spawn the agent never waited on: a system-role
+ * row the model does not read, for a run the chat page's subagent list shows.
+ */
+export function isBackgroundSubagentAnnounce(m: DisplayMessageCandidate): boolean {
+  return m.messageKind === 'subagent_announce' && m.role?.toLowerCase() === 'system'
+}
+
+export function shouldDisplayMessage(
+  m: DisplayMessageCandidate,
+  streaming: boolean,
+): boolean {
+  if (m.role === 'tool') return false
+  // JCLAW-270: structured-card rows render based on messageKind, not on
+  // content shape — their metadata payload carries the visual data.
+  if (m.messageKind) return true
+  if (m._key && !m.id && streaming && !m.content && !m.reasoning && !hasToolCalls(m)) return false
+  return !!(m.content || m.reasoning || m.usage || hasToolCalls(m))
+}

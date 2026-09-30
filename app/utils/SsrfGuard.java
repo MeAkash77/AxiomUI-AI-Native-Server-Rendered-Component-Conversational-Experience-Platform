@@ -1,0 +1,672 @@
+package utils;
+
+import okhttp3.Dns;
+import okhttp3.OkHttpClient;
+import org.jspecify.annotations.NonNull;
+import org.jspecify.annotations.Nullable;
+
+import java.net.Inet6Address;
+import java.net.InetAddress;
+import java.net.URI;
+import java.net.UnknownHostException;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
+
+/**
+ * SSRF-hardened HTTP client factory used by tools that fetch LLM-supplied URLs.
+ *
+ * <p>The JDK's {@code java.net.http.HttpClient} exposes no DNS hook, so a
+ * prompt-injected LLM can point {@code web_fetch} at loopback, RFC-1918,
+ * link-local (AWS/GCP metadata), or multicast ranges and hit internal
+ * services the platform operator never meant to expose. {@code SsrfGuard}
+ * wraps OkHttp's {@link Dns} interface so hostname resolution is the gate:
+ * any unsafe IP (on any branch of a multi-A-record answer) throws
+ * {@link UnknownHostException} before OkHttp ever opens a socket.
+ *
+ * <p>Scope is intentionally narrow — this is for LLM-emitted URLs only.
+ * Fixed admin-configured endpoints (LLM provider base URLs, channel APIs,
+ * malware scanners) continue to use {@link HttpFactories#general()} /
+ * {@link HttpFactories#llmStreaming()} without SSRF overhead.
+ *
+ * <p><strong>Why OkHttp's {@code Dns} interface is the right pin point:</strong>
+ * {@code RouteSelector.resetNextInetSocketAddress} calls
+ * {@code dns.lookup(host)}, then wraps each returned {@link InetAddress}
+ * into an {@code InetSocketAddress(inetAddress, port)} — the IP is bound
+ * into the socket-address object. The subsequent {@code Socket.connect()}
+ * uses that bound IP; OkHttp does <em>not</em> re-resolve the hostname
+ * during connect. So the classic DNS-rebinding TOCTOU window (resolve →
+ * attacker flips DNS → re-resolve) does not exist on this code path.
+ * Every call hits our filter afresh; an attacker that flips DNS between
+ * requests is still blocked on the next lookup.
+ *
+ * <p>Contrast with the JDK's {@code java.net.http.HttpClient} (which this
+ * tool replaced for exactly this reason): that stack has no pluggable DNS
+ * and re-resolves the hostname internally during connect, so no
+ * application-level filter can gate it without reaching for Netty's
+ * {@code AddressResolverGroup} or connecting by literal IP and forging
+ * the {@code Host} header.
+ *
+ * <p>Limits of this design:
+ * <ul>
+ *   <li>Callers must set {@code followRedirects(false)} and walk redirect
+ *       hops manually, re-checking each {@code Location} through
+ *       {@link #assertSafeScheme(URI)} — otherwise a 302 to
+ *       {@code file:///etc/passwd} would be followed automatically.</li>
+ *   <li>Literal-IP URLs ({@code http://10.0.0.1/}) bypass the {@code Dns}
+ *       callback because OkHttp treats them as already-resolved.
+ *       {@link #assertSafeScheme(URI)} covers this case by validating
+ *       literal-IP hosts directly before the request ever starts.</li>
+ *   <li>If a proxy is configured on the client, {@code dns.lookup} runs
+ *       per-proxy per-call, which is fine — every lookup re-enters our
+ *       filter. {@link #buildGuardedClient(int, int)} does not configure
+ *       a proxy, so this is moot unless a caller overrides it.</li>
+ * </ul>
+ */
+public final class SsrfGuard {
+
+    private SsrfGuard() {}
+
+    /** Schemes the guarded client will accept. Rejects {@code file://},
+     *  {@code ftp://}, {@code gopher://}, {@code data:}, etc. */
+    private static final Set<String> ALLOWED_SCHEMES = Set.of("http", "https");
+
+    /** {@link UnknownHostException} message when a hostname resolves to a blocked IP —
+     *  {@code .formatted(hostname, blockedIp)} at each SSRF-guard call site. */
+    private static final String BLOCKED_ADDRESS_MSG =
+            "SSRF guard: host %s resolves to blocked address %s";
+
+    /**
+     * A refusal because the host is, or resolves to, a blocked address (JCLAW-1280). Every other refusal —
+     * no host, an unparseable URL, a host that does not resolve, userinfo, a scheme — is a plain
+     * {@link SecurityException}.
+     */
+    public static final class BlockedAddressException extends SecurityException {
+        BlockedAddressException(String message) {
+            super(message);
+        }
+    }
+
+    /** The one origin {@link #permitOriginForTest} admits on the binding thread; never bound in production. */
+    private static final ScopedValue<String> PERMITTED_ORIGIN = ScopedValue.newInstance();
+
+    /**
+     * Test seam (JCLAW-1277): run {@code body} with {@link #assertUrlSafe} — and so {@link #isUrlSafe},
+     * {@link #hostResolverRule} and {@link #pinnedUrl} — accepting exactly {@code origin}, the scheme,
+     * host and port of a local fixture, on this thread only. {@code CapabilityRulesTest} fails the
+     * build if anything in {@code app/} calls it.
+     *
+     * @throws IllegalArgumentException unless {@code origin} is http(s) with an IP-literal host
+     */
+    public static <T> T permitOriginForTest(@NonNull String origin, @NonNull Supplier<T> body) {
+        var uri = URI.create(origin);
+        var exact = originOf(uri);
+        // An IP literal skips the DNS pin, and http(s) is all the guard ever admits.
+        if (exact == null || !ALLOWED_SCHEMES.contains(uri.getScheme().toLowerCase(Locale.ROOT))
+                || !isLikelyIpLiteral(uri.getHost())) {
+            throw new IllegalArgumentException("not an http(s) IP-literal origin: " + origin);
+        }
+        return ScopedValue.where(PERMITTED_ORIGIN, exact).call(body::get);
+    }
+
+    /**
+     * The origin permitted on this thread as {@code scheme://host:port}, lower-cased with the port
+     * explicit — empty in production, where nothing ever binds one. A caller that screens on another
+     * thread, such as the browser's SOCKS5 proxy, captures it here first: a {@code ScopedValue}
+     * binding reaches no thread it did not create.
+     */
+    public static Optional<String> permittedOrigin() {
+        return PERMITTED_ORIGIN.isBound() ? Optional.of(PERMITTED_ORIGIN.get()) : Optional.empty();
+    }
+
+    /** The addresses {@link #callWithHostsForTest} answers with on the binding thread; never bound in production. */
+    private static final ScopedValue<Map<String, InetAddress>> TEST_HOSTS = ScopedValue.newInstance();
+
+    /**
+     * Test seam: run {@code body} with each hostname in {@code hosts} resolving to its IP literal on
+     * this thread only, so a test of the public-host path needs no DNS. Unlisted names resolve as
+     * usual. {@code CapabilityRulesTest} fails the build if anything in {@code app/} calls it.
+     *
+     * @throws IllegalArgumentException if a value is not an IP literal
+     */
+    public static <T, X extends Throwable> T callWithHostsForTest(
+            @NonNull Map<String, String> hosts, ScopedValue.@NonNull CallableOp<T, X> body) throws X {
+        var table = new HashMap<String, InetAddress>();
+        hosts.forEach((host, literal) -> table.put(host.toLowerCase(Locale.ROOT), InetAddress.ofLiteral(literal)));
+        return ScopedValue.where(TEST_HOSTS, Map.copyOf(table)).call(body);
+    }
+
+    /** {@link InetAddress#getAllByName}, answered from {@link #callWithHostsForTest}'s table when one is bound. */
+    private static InetAddress[] allByName(String host) throws UnknownHostException {
+        if (TEST_HOSTS.isBound()) {
+            var pinned = TEST_HOSTS.get().get(host.toLowerCase(Locale.ROOT));
+            if (pinned != null) return new InetAddress[] {pinned};
+        }
+        return InetAddress.getAllByName(host);
+    }
+
+    /** {@code scheme://host:port}, lower-cased with the default port made explicit, or null without a scheme or host. */
+    private static @Nullable String originOf(URI uri) {
+        var scheme = uri.getScheme();
+        var host = uri.getHost();
+        if (scheme == null || host == null) return null;
+        var lower = scheme.toLowerCase(Locale.ROOT);
+        int port = uri.getPort() != -1 ? uri.getPort() : "https".equals(lower) ? 443 : 80;
+        return lower + "://" + host.toLowerCase(Locale.ROOT) + ":" + port;
+    }
+
+    /**
+     * An OkHttp {@link Dns} that rejects any hostname resolving to a
+     * non-routable range: loopback (127.0.0.0/8, ::1), link-local
+     * (169.254.0.0/16 — AWS/GCP/Azure metadata), site-local / RFC-1918
+     * (10/8, 172.16/12, 192.168/16), multicast, or the unspecified 0.0.0.0.
+     * Rejects even if only <em>one</em> A record is unsafe — prevents the
+     * attacker-controlled DNS from mixing a safe and an unsafe IP.
+     */
+    public static final Dns SAFE_DNS = hostname -> {
+        InetAddress[] addrs = allByName(hostname);
+        for (var addr : addrs) {
+            if (isUnsafe(addr)) {
+                throw new UnknownHostException(
+                        BLOCKED_ADDRESS_MSG
+                                .formatted(hostname, addr.getHostAddress()));
+            }
+        }
+        return List.of(addrs);
+    };
+
+    /**
+     * Visible for testing. Returns true if the address is in a range the
+     * guard forbids for LLM-supplied URLs.
+     */
+    public static boolean isUnsafe(@NonNull InetAddress addr) {
+        return addr.isLoopbackAddress()       // 127.0.0.0/8, ::1
+                || addr.isAnyLocalAddress()   // 0.0.0.0, ::
+                || addr.isLinkLocalAddress()  // 169.254.0.0/16, fe80::/10
+                || addr.isSiteLocalAddress()  // 10/8, 172.16/12, 192.168/16, fec0::/10
+                || addr.isMulticastAddress() // 224/4
+                || isUniqueLocalIpv6(addr)   // fc00::/7 (not caught by JDK predicates)
+                || isNonRoutableIpv4(addr)   // 240/4, 255.255.255.255, doc/bench/CGNAT
+                || isUnsafeNat64(addr);      // 64:ff9b::/96 wrapping a blocked v4
+    }
+
+    /**
+     * IPv4 ranges that are not routable on the public internet and that the JDK has no
+     * predicate for: {@code 240.0.0.0/4} (reserved), {@code 255.255.255.255}
+     * (broadcast), {@code 192.0.2.0/24}, {@code 198.51.100.0/24} and
+     * {@code 203.0.113.0/24} (documentation), {@code 198.18.0.0/15} (benchmarking) and
+     * {@code 100.64.0.0/10} (carrier-grade NAT, which reaches the ISP's own equipment).
+     */
+    private static boolean isNonRoutableIpv4(InetAddress addr) {
+        var b = addr.getAddress();
+        if (b.length != 4) return false;
+        int o1 = b[0] & 0xFF;
+        int o2 = b[1] & 0xFF;
+        int o3 = b[2] & 0xFF;
+        return o1 >= 240                                        // 240/4 incl. broadcast
+                || (o1 == 100 && o2 >= 64 && o2 <= 127)         // 100.64/10
+                || (o1 == 198 && (o2 == 18 || o2 == 19))        // 198.18/15
+                || (o1 == 192 && o2 == 0 && o3 == 2)            // 192.0.2/24
+                || (o1 == 198 && o2 == 51 && o3 == 100)         // 198.51.100/24
+                || (o1 == 203 && o2 == 0 && o3 == 113);         // 203.0.113/24
+    }
+
+    /**
+     * RFC 6052 NAT64: {@code 64:ff9b::/96} carries an IPv4 address in its low 32 bits,
+     * and a host with a NAT64 path translates the connection to it — so
+     * {@code 64:ff9b::7f00:1} reaches {@code 127.0.0.1} while every JDK predicate
+     * answers false, because the address itself is none of those things.
+     *
+     * <p>The embedded address decides: a NAT64 wrapper around a public destination is a
+     * legitimate way to reach it, so only a wrapped <em>blocked</em> address is refused.
+     */
+    private static boolean isUnsafeNat64(InetAddress addr) {
+        var b = addr.getAddress();
+        if (b.length != 16) return false;
+        // 0064:ff9b:0000:0000:0000:0000 — the /96 well-known prefix.
+        if ((b[0] & 0xFF) != 0x00 || (b[1] & 0xFF) != 0x64
+                || (b[2] & 0xFF) != 0xFF || (b[3] & 0xFF) != 0x9B) {
+            return false;
+        }
+        for (int i = 4; i < 12; i++) {
+            if (b[i] != 0) return false;
+        }
+        try {
+            return isUnsafe(InetAddress.getByAddress(
+                    new byte[] {b[12], b[13], b[14], b[15]}));
+        } catch (UnknownHostException _) {
+            return true; // a four-byte literal cannot fail to parse; refuse if it does
+        }
+    }
+
+    /**
+     * IPv6 Unique Local Address (RFC 4193): {@code fc00::/7}. The JDK exposes
+     * no predicate for this range — {@link InetAddress#isSiteLocalAddress()}
+     * only matches the deprecated {@code fec0::/10}. Without this check,
+     * {@code http://[fc00::1]/} would silently flow through {@link #isUnsafe},
+     * reaching internal ULA-assigned services on the host's network.
+     *
+     * <p>The /7 prefix means the upper 7 bits of the first byte are
+     * {@code 1111 110}, so the byte is {@code 0xFC} or {@code 0xFD}. The
+     * mask {@code 0xFE} leaves only that top 7-bit pattern.
+     */
+    private static boolean isUniqueLocalIpv6(InetAddress addr) {
+        byte[] bytes = addr.getAddress();
+        // Byte promotes to int via sign extension, so compare against the
+        // mask result as an int (0xFC, not (byte) 0xFC which sign-extends
+        // to 0xFFFFFFFC).
+        return bytes.length == 16 && (bytes[0] & 0xFE) == 0xFC;
+    }
+
+    /**
+     * Validate a URL's scheme and, if the host is a literal IP, validate the
+     * IP too. The caller must invoke this <em>before</em> handing the URL to
+     * {@link #buildGuardedClient(int, int)}, and again on every redirect target.
+     *
+     * <p>The literal-IP path is belt-and-suspenders: OkHttp's {@link Dns}
+     * interface is only consulted for hostnames that need resolving —
+     * literal {@code http://10.0.0.1/} or {@code http://169.254.169.254/}
+     * bypass the custom resolver because the host is "already resolved".
+     * Without this pre-check a prompt-injected LLM could reach RFC-1918 or
+     * cloud metadata endpoints directly by IP.
+     *
+     * @throws SecurityException if the scheme is not {@code http} or
+     *         {@code https}, the URI has no host, or the host parses as a
+     *         literal IP in an unsafe range.
+     */
+    public static void assertSafeScheme(@NonNull URI uri) {
+        var scheme = uri.getScheme();
+        if (scheme == null || !ALLOWED_SCHEMES.contains(scheme.toLowerCase())) {
+            throw new SecurityException(
+                    "SSRF guard: scheme not allowed: %s (only http/https)".formatted(scheme));
+        }
+        var host = uri.getHost();
+        if (host == null || host.isBlank()) {
+            throw new SecurityException("SSRF guard: URL has no host");
+        }
+        // If the host is a literal IP, validate it here because OkHttp's
+        // Dns callback won't fire for already-resolved addresses.
+        if (isLikelyIpLiteral(host)) {
+            try {
+                var addr = InetAddress.getByName(host);
+                if (isUnsafe(addr)) {
+                    throw new BlockedAddressException(
+                            "SSRF guard: host is a blocked IP literal: %s"
+                                    .formatted(addr.getHostAddress()));
+                }
+            } catch (UnknownHostException e) {
+                throw new SecurityException(
+                        "SSRF guard: cannot parse host as IP: " + host, e);
+            }
+        }
+    }
+
+    /**
+     * Full URL validation for callers that can't route through OkHttp + SAFE_DNS
+     * (JCLAW-116: the Playwright browser tool). Combines
+     * {@link #assertSafeScheme} (scheme + literal-IP checks) with a
+     * hostname-resolution pass that walks every resolved {@link InetAddress}
+     * through {@link #isUnsafe}. Throws on the first unsafe signal.
+     *
+     * <p>Callers that drive Chromium (or any other outbound path that bypasses
+     * the OkHttp custom resolver) must use this method because {@link #SAFE_DNS}
+     * only fires inside the OkHttp code path.
+     *
+     * <p><strong>Parser-differential hardening (JCLAW-731).</strong> Chromium
+     * re-parses the URL string with the WHATWG algorithm, independently of
+     * {@link URI}. A character the two parsers treat differently moves the
+     * authority boundary, so the host this method validates may not be the host
+     * the browser connects to. Rather than hope both parsers agree, the known
+     * divergence classes are rejected outright:
+     * <ul>
+     *   <li>raw control characters, spaces, and backslashes — browsers strip or
+     *       remap these ({@code \\} is treated as {@code /}) before re-parsing,
+     *       shifting where the authority ends;</li>
+     *   <li>embedded credentials (userinfo, {@code user:pass@host}) — never
+     *       belong in an LLM-emitted browse URL and blur which token is the
+     *       host across parsers.</li>
+     * </ul>
+     * For the strongest guarantee — that the byte-for-byte string validated is
+     * the string fetched, defeating both the residual parser gap and DNS
+     * rebinding between our resolver and Chromium's — callers should connect via
+     * {@link #pinnedUrl(String)} instead of the raw hostname URL.
+     *
+     * @throws SecurityException when the URL carries a parser-differential
+     *         character or embedded credentials, or fails scheme, literal-IP, or
+     *         any resolved-address check.
+     */
+    public static void assertUrlSafe(@NonNull String url) {
+        rejectParserDifferentialChars(url);
+        var uri = parse(url);
+        var authority = uri.getRawAuthority();
+        if (uri.getRawUserInfo() != null || (authority != null && authority.indexOf('@') >= 0)) {
+            throw new SecurityException(
+                    "SSRF guard: URL must not contain embedded credentials (userinfo)");
+        }
+        if (PERMITTED_ORIGIN.isBound() && PERMITTED_ORIGIN.get().equals(originOf(uri))) return;
+        assertSafeScheme(uri);
+        var host = uri.getHost();
+        if (host == null) return; // assertSafeScheme already threw for null host
+        if (isLikelyIpLiteral(host)) return; // literal IPs were checked in assertSafeScheme
+        try {
+            for (var addr : allByName(host)) {
+                if (isUnsafe(addr)) {
+                    throw new BlockedAddressException(
+                            BLOCKED_ADDRESS_MSG
+                                    .formatted(host, addr.getHostAddress()));
+                }
+            }
+        } catch (UnknownHostException e) {
+            throw new SecurityException(
+                    "SSRF guard: cannot resolve host: " + host, e);
+        }
+    }
+
+    /**
+     * Validate {@code url} and return it with the host swapped for the single
+     * literal IP the guard resolved and approved, for a caller that can only hand
+     * a URL to something which would otherwise re-parse and re-resolve it.
+     *
+     * <p>Why (JCLAW-731): {@link #assertUrlSafe} validates the host that
+     * <em>Java's</em> {@link URI} parser and resolver see, but a browser re-parses
+     * and re-resolves the same URL on its own. A residual parser divergence, or a
+     * DNS-rebinding flip between the two resolutions, could make it
+     * connect to an address the guard never validated. Pinning to the literal IP
+     * removes both gaps at once: there is no hostname left to re-parse or
+     * re-resolve, so the validated string is exactly what is fetched.
+     *
+     * <p><strong>Not the browser tool's path, and reintroducing it there would be a step back.</strong>
+     * Since JCLAW-1283 that Chromium connects through {@code tools.BrowserScreenProxy}, which screens
+     * every connection below the page and dials the address it checked — a URL rewrite reaches only
+     * the requests {@code context.route} can see, which is neither a WebSocket nor a worker's. Kept
+     * with no {@code app/} caller, and covered by {@code SsrfGuardTest}, as the pin form for a future
+     * caller with no connection of its own to place.
+     *
+     * <p>Literal-IP URLs are returned unchanged — {@link #assertUrlSafe} already
+     * validated the IP and there is nothing left to resolve.
+     *
+     * @return the URL with its host replaced by the validated literal IP (IPv6
+     *         bracketed); scheme, port, path, query and fragment preserved.
+     * @throws SecurityException on every condition {@link #assertUrlSafe} rejects.
+     */
+    public static @NonNull String pinnedUrl(@NonNull String url) {
+        assertUrlSafe(url);
+        var uri = parse(url);
+        var host = uri.getHost();
+        if (host == null || isLikelyIpLiteral(host)) {
+            return url; // already an approved literal IP — nothing to pin
+        }
+        var pinned = resolveSafePin(host);
+        var literal = pinned.getHostAddress();
+        var pinnedHost = pinned instanceof Inet6Address ? "[" + literal + "]" : literal;
+        var rebuilt = new StringBuilder()
+                .append(uri.getScheme()).append("://").append(pinnedHost);
+        if (uri.getPort() != -1) {
+            rebuilt.append(':').append(uri.getPort());
+        }
+        // The caller's own path, query and fragment, not parse()'s re-encoded copy of them.
+        int tail = Urls.tailStart(url);
+        // 0 means no authority — which assertUrlSafe already refused, so appending the whole URL
+        // after the pinned host is unreachable rather than impossible.
+        if (tail > 0) {
+            rebuilt.append(url, tail, url.length());
+        }
+        return rebuilt.toString();
+    }
+
+    /**
+     * A Chromium {@code --host-resolver-rules} clause (JCLAW-731) —
+     * {@code "MAP <host> <ip>"} — forcing the browser to connect only to the
+     * address this guard validated. Unlike {@link #pinnedUrl}, the hostname stays
+     * in the URL, so the {@code Host} header and TLS SNI are preserved and
+     * name-based virtual hosts keep working.
+     *
+     * <p>For a browser JClaw does not launch itself: the scrape fetchers pass this to the stealth
+     * sidecar, which owns the launch and so owns the flag. The browser tool does not — since
+     * JCLAW-1283 its Chromium connects through {@code tools.BrowserScreenProxy}, which pins every
+     * host at connect rather than only the ones a launch argument could name.
+     *
+     * <p>Empty for a literal-IP URL (already pinned) or a URL with no host.
+     * Throws every {@link SecurityException} {@link #assertUrlSafe} does.
+     */
+    public static @NonNull Optional<String> hostResolverRule(@NonNull String url) {
+        assertUrlSafe(url);
+        var host = parse(url).getHost();
+        if (host == null || isLikelyIpLiteral(host)) {
+            return Optional.empty(); // already a validated literal IP — nothing to pin
+        }
+        var pinned = resolveSafePin(host);
+        return Optional.of("MAP %s %s".formatted(host, pinned.getHostAddress()));
+    }
+
+    /**
+     * Resolve {@code host} once and return every address it gave, each screened, in the order the
+     * resolver returned them — what a caller that opens the connection itself dials, such as
+     * {@code tools.BrowserScreenProxy}. One lookup, so a host that rebinds has no second resolution
+     * to answer differently, and every address is checked, so the rest stay usable when the first
+     * has no route.
+     *
+     * @throws SecurityException if the host cannot resolve, or any address it gave is blocked
+     */
+    public static List<InetAddress> resolveSafeAddresses(@NonNull String host) {
+        InetAddress[] addresses;
+        try {
+            addresses = allByName(host);
+        } catch (UnknownHostException e) {
+            throw new SecurityException("SSRF guard: cannot resolve host: " + host, e);
+        }
+        for (var address : addresses) {
+            if (isUnsafe(address)) {
+                throw new BlockedAddressException(
+                        BLOCKED_ADDRESS_MSG.formatted(host, address.getHostAddress()));
+            }
+        }
+        return List.of(addresses);
+    }
+
+    /**
+     * The first address {@code host} resolves to, re-verified safe — the DNS pin shared by
+     * {@link #pinnedUrl(String)} and {@link #hostResolverRule(String)}, both of which can name only
+     * one. {@link #assertUrlSafe} has already walked every resolved address; this re-checks as
+     * defense in depth, so an unsafe pin can never be emitted.
+     *
+     * @throws SecurityException if the host cannot resolve, or the pinned
+     *         address is in a blocked range.
+     */
+    private static InetAddress resolveSafePin(@NonNull String host) {
+        return resolveSafeAddresses(host).getFirst();
+    }
+
+    /**
+     * {@link Urls#parse} of {@code url} — lenient about what {@code URI} rejects but browsers send raw
+     * after the authority (JCLAW-1285) — with its refusal reported as this guard's.
+     *
+     * @throws SecurityException when the URL still does not parse
+     */
+    private static URI parse(String url) {
+        try {
+            return Urls.parse(url);
+        } catch (IllegalArgumentException e) {
+            throw new SecurityException("SSRF guard: unparseable URL: " + url, e);
+        }
+    }
+
+    /**
+     * Reject characters that {@link URI} and a browser's WHATWG parser handle
+     * differently, so a hostile URL can't validate here yet connect elsewhere in
+     * Chromium: raw control characters and spaces (stripped/remapped before a
+     * browser re-parses) and backslashes (WHATWG treats {@code \\} as {@code /},
+     * which can end the authority early).
+     */
+    private static void rejectParserDifferentialChars(String url) {
+        for (int i = 0; i < url.length(); i++) {
+            char c = url.charAt(i);
+            if (c < 0x20 || c == 0x7f || c == ' ' || c == '\\') {
+                throw new SecurityException(
+                        "SSRF guard: URL contains a parser-differential character "
+                                + "(control, space, or backslash)");
+            }
+        }
+    }
+
+    /**
+     * Non-throwing variant of {@link #assertUrlSafe} — returns {@code false}
+     * when the URL is unsafe or unparseable, for a caller that needs only the
+     * verdict and not the reason.
+     */
+    public static boolean isUrlSafe(@NonNull String url) {
+        try {
+            assertUrlSafe(url);
+            return true;
+        } catch (SecurityException _) {
+            return false;
+        }
+    }
+
+    /**
+     * Cheap heuristic: treat the host as a literal IP if it's pure
+     * digits+dots (IPv4) or wrapped in brackets (IPv6 RFC 3986 form). False
+     * positives still flow into {@link InetAddress#getByName} which handles
+     * edge cases (octal, mixed notation) correctly.
+     *
+     * <p>Public because {@code tools.BrowserScreenProxy} asks it the same question: a permitted
+     * origin is honored without a guard check, so it must be an address and never a name.
+     */
+    public static boolean isLikelyIpLiteral(@NonNull String host) {
+        if (host.startsWith("[") && host.endsWith("]")) return true; // [::1]
+        for (int i = 0; i < host.length(); i++) {
+            char c = host.charAt(i);
+            if (!((c >= '0' && c <= '9') || c == '.')) return false;
+        }
+        return !host.isEmpty();
+    }
+
+    /**
+     * Build an OkHttp client wired to {@link #SAFE_DNS} with redirects
+     * disabled. The caller owns redirect handling so each hop can be
+     * re-validated through {@link #assertSafeScheme(URI)}.
+     *
+     * @param connectTimeoutSeconds connect timeout
+     * @param callTimeoutSeconds    end-to-end timeout
+     */
+    public static @NonNull OkHttpClient buildGuardedClient(int connectTimeoutSeconds,
+                                                  int callTimeoutSeconds) {
+        return new OkHttpClient.Builder()
+                .dns(SAFE_DNS)
+                .followRedirects(false)
+                .followSslRedirects(false)
+                // Transient failures are retried below the redirect walk, so each hop is
+                // retried on its own and the guard still sees every one (JCLAW-1099).
+                .addInterceptor(new TransientRetryInterceptor())
+                .connectTimeout(connectTimeoutSeconds, TimeUnit.SECONDS)
+                .callTimeout(callTimeoutSeconds, TimeUnit.SECONDS)
+                .build();
+    }
+
+    // ─── Provider / MCP relaxed guard (JCLAW-778) ────────────────────────
+    //
+    // Operator-settable LLM provider base URLs and MCP endpoint URLs are a
+    // different trust boundary from the LLM-emitted web_fetch URLs the strict
+    // {@link #isUnsafe} guard above screens. JCLAW-1022 closed the agent's own
+    // write path — POST /api/config refuses the agent principal — so these are
+    // the operator's to set; they still need screening, because the value
+    // outlives the write and a host can rebind after it (JCLAW-1229). But they
+    // legitimately point at loopback (Ollama 127.0.0.1:11434, LM Studio) and
+    // LAN hosts, which the strict guard blocks outright. This relaxed
+    // variant blocks only the ranges that are never a legitimate provider/MCP
+    // target yet are the real escalation surface: link-local (169.254.0.0/16 —
+    // the cloud-metadata endpoint 169.254.169.254 — plus fe80::/10), multicast,
+    // and the unspecified 0.0.0.0. Loopback and RFC-1918 / ULA private ranges
+    // are permitted.
+    //
+    // Tradeoff: permitting private ranges means an attacker who can set a
+    // provider/MCP URL could still reach other services on the operator's LAN.
+    // For a single-operator deployment where local self-hosted inference is a
+    // core use case, blocking loopback/LAN would break more than it protects,
+    // while the metadata endpoint — the one credential-theft primitive — stays
+    // blocked either way.
+
+    /**
+     * Relaxed provider/MCP unsafe check — see the section comment. Blocks
+     * link-local (incl. cloud metadata), multicast, and 0.0.0.0; permits
+     * loopback and private ranges. Visible for testing.
+     */
+    public static boolean isBlockedForProvider(@NonNull InetAddress addr) {
+        return addr.isAnyLocalAddress()        // 0.0.0.0, ::
+                || addr.isLinkLocalAddress()   // 169.254.0.0/16 (metadata), fe80::/10
+                || addr.isMulticastAddress();  // 224/4
+    }
+
+    /**
+     * {@link Dns} variant wired into the provider/MCP OkHttp clients (see
+     * {@link HttpFactories}). Rejects a hostname whose resolution includes any
+     * {@link #isBlockedForProvider} address, closing the DNS-rebinding window
+     * between a pre-flight {@link #assertProviderUrlSafe} check and OkHttp's own
+     * connect-time resolution.
+     */
+    public static final Dns PROVIDER_SAFE_DNS = hostname -> {
+        InetAddress[] addrs = allByName(hostname);
+        for (var addr : addrs) {
+            if (isBlockedForProvider(addr)) {
+                throw new UnknownHostException(
+                        BLOCKED_ADDRESS_MSG.formatted(hostname, addr.getHostAddress()));
+            }
+        }
+        return List.of(addrs);
+    };
+
+    /**
+     * Pre-connect screen for an agent-settable provider/MCP URL: validate the
+     * scheme and, if the host is a literal IP, that it is not in a
+     * {@link #isBlockedForProvider} range. Callers invoke this before opening
+     * the connection (model discovery, MCP validate, MCP transport send).
+     *
+     * <p>Mirrors the strict {@link #assertSafeScheme} split: literal-IP hosts
+     * are checked here because OkHttp's {@link #PROVIDER_SAFE_DNS} callback
+     * never fires for an already-resolved literal (so {@code
+     * http://169.254.169.254/} would otherwise slip through), while hostname
+     * resolution is screened at connect by {@link #PROVIDER_SAFE_DNS}. This
+     * method deliberately does <em>not</em> resolve hostnames — a not-yet-live
+     * provider host must still save/validate, and rebinding is covered at
+     * connect.
+     *
+     * @throws SecurityException if the scheme is not http/https, the URL has no
+     *         host, or the host is a blocked IP literal.
+     */
+    public static void assertProviderUrlSafe(@NonNull String url) {
+        // Strict on purpose: LlmProvider.buildUri parses the saved base URL with URI.create on every turn.
+        URI uri;
+        try {
+            uri = URI.create(url);
+        } catch (IllegalArgumentException e) {
+            throw new SecurityException("SSRF guard: unparseable URL: " + url, e);
+        }
+        var scheme = uri.getScheme();
+        if (scheme == null || !ALLOWED_SCHEMES.contains(scheme.toLowerCase())) {
+            throw new SecurityException(
+                    "SSRF guard: scheme not allowed: %s (only http/https)".formatted(scheme));
+        }
+        var host = uri.getHost();
+        if (host == null || host.isBlank()) {
+            throw new SecurityException("SSRF guard: URL has no host");
+        }
+        if (isLikelyIpLiteral(host)) {
+            try {
+                var addr = InetAddress.getByName(host);
+                if (isBlockedForProvider(addr)) {
+                    throw new BlockedAddressException(
+                            "SSRF guard: host is a blocked IP literal: %s"
+                                    .formatted(addr.getHostAddress()));
+                }
+            } catch (UnknownHostException e) {
+                throw new SecurityException(
+                        "SSRF guard: cannot parse host as IP: " + host, e);
+            }
+        }
+    }
+}

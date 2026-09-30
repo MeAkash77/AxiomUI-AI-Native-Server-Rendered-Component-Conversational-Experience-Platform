@@ -1,0 +1,830 @@
+<script setup lang="ts">
+import type { Agent, Conversation, Message } from '~/types/api'
+import type { Filter } from '~/components/FilterBar.vue'
+import { h } from 'vue'
+import type { SortingState } from '@tanstack/vue-table'
+import type { DataTableColumn } from '~/utils/data-table'
+import { ChatBubbleLeftRightIcon, PencilSquareIcon, StarIcon as StarOutlineIcon } from '@heroicons/vue/24/outline'
+import { StarIcon as StarSolidIcon } from '@heroicons/vue/24/solid'
+
+const { confirm } = useConfirm()
+
+const conversations = ref<Conversation[]>([])
+const total = ref(0)
+const page = ref(1)
+const pageSize = 20
+const loading = ref(false)
+// Why the list did not load, rendered above the table; null once a load succeeds.
+const listError = ref<ReturnType<typeof apiErrorDetails> | null>(null)
+
+// Pinned conversations live above the paginated list and never inside it — the
+// two loads ask the same endpoint for disjoint halves (pinned=true / false), so
+// "Showing X-Y of N" keeps describing exactly the rows in the table below it.
+// Mirrors ConversationService.MAX_PINNED, which is what the pin PUT enforces.
+const MAX_PINNED = 10
+const pinnedConversations = ref<Conversation[]>([])
+
+// Surfaces the pin cap's 409 (and any other failed row action) as a dismissible
+// line rather than a silent no-op.
+const actionNotice = ref<string | null>(null)
+const { mutate } = useApiMutation()
+
+// Id of the row whose Name cell is currently an input. Null = nothing is being
+// renamed; only one row at a time.
+const renamingId = ref<number | null>(null)
+
+// Active filters from FilterBar — maps filter keys to API params
+const activeFilters = ref<Filter[]>([])
+
+// Server-side sort state (JCLAW parity with Memory/Subagents). DataTable runs
+// in manualSorting mode and emits the new state on a header click; we map it to
+// the sort/dir query params in load(). Empty → the server's recency default.
+const sortState = ref<SortingState>([])
+
+const { data: agentList } = await useFetch<Agent[]>('/api/agents', { default: () => [] })
+
+const totalPages = computed(() => Math.max(1, Math.ceil(total.value / pageSize)))
+const rangeStart = computed(() => total.value === 0 ? 0 : (page.value - 1) * pageSize + 1)
+const rangeEnd = computed(() => Math.min(page.value * pageSize, total.value))
+
+// True when the user has never started a conversation (zero rows AND no
+// active filters). Drives the welcome-style empty state — table chrome,
+// FilterBar, and Delete buttons are all hidden so the page feels like a
+// first-time landing instead of a data view with no data. When filters
+// are active we keep the chrome so the user can adjust them — "no
+// matching conversations" is a different mental model from "no
+// conversations at all".
+const hasNoData = computed(() =>
+  !loading.value && !listError.value && total.value === 0 && !pinnedConversations.value.length
+  && activeFilters.value.length === 0,
+)
+
+function getFilterValue(key: string): string {
+  return activeFilters.value.find(f => f.key === key)?.value ?? ''
+}
+
+/**
+ * Read a boolean filter chip. FilterBar values are always strings, so
+ * `starred:false` would otherwise read as truthy and silently narrow to the
+ * opposite set. Undefined means the chip is absent — no constraint at all.
+ */
+function getFilterFlag(key: string): boolean | undefined {
+  const raw = getFilterValue(key)
+  if (!raw) return undefined
+  return ['true', '1', 'yes', 'on'].includes(raw.toLowerCase())
+}
+
+/**
+ * The filter + sort half of a list query, shared by the paginated list and the
+ * pinned section so a filter can never apply to one and not the other. Each
+ * caller adds its own paging and its own `pinned` half.
+ */
+function filterParams(): URLSearchParams {
+  const params = new URLSearchParams()
+  const name = getFilterValue('name')
+  const channel = getFilterValue('channel')
+  const agent = getFilterValue('agent')
+  const peer = getFilterValue('peer')
+  // JCLAW-304: q is the new FTS keyword key. Backend intersects the
+  // matching message conversation ids with the other equality filters.
+  const q = getFilterValue('q')
+  if (q) params.set('q', q)
+  if (name) params.set('name', name)
+  if (channel) params.set('channel', channel)
+  if (agent) {
+    // Resolve agent name to ID
+    const a = agentList.value?.find((ag: Agent) => ag.name.toLowerCase() === agent.toLowerCase())
+    if (a) params.set('agentId', String(a.id))
+  }
+  if (peer) params.set('peer', peer)
+  const starred = getFilterFlag('starred')
+  if (starred !== undefined) params.set('starred', String(starred))
+  if (sortState.value.length) {
+    params.set('sort', sortState.value[0]!.id)
+    params.set('dir', sortState.value[0]!.desc ? 'desc' : 'asc')
+  }
+  return params
+}
+
+const listLoads = useLatestRequest()
+async function load() {
+  const request = listLoads.begin()
+  loading.value = true
+  try {
+    const params = filterParams()
+    params.set('limit', String(pageSize))
+    params.set('offset', String((page.value - 1) * pageSize))
+    params.set('pinned', 'false')
+    const res = await $fetch.raw<Conversation[]>(`/api/conversations?${params.toString()}`)
+    if (!listLoads.isCurrent(request)) return
+    conversations.value = res._data ?? []
+    const headerTotal = res.headers.get('x-total-count')
+    total.value = headerTotal ? Number.parseInt(headerTotal, 10) : conversations.value.length
+    listError.value = null
+  }
+  catch (e) {
+    if (listLoads.isCurrent(request)) listError.value = apiErrorDetails(e)
+  }
+  finally {
+    if (listLoads.isCurrent(request)) loading.value = false
+  }
+}
+
+/**
+ * Fetch the pinned section. A pinned row that doesn't match the active filter
+ * isn't in the current result set, so showing it above one would misrepresent
+ * the filter — hence the shared {@link filterParams}.
+ */
+const pinnedLoads = useLatestRequest()
+async function loadPinned() {
+  const request = pinnedLoads.begin()
+  const params = filterParams()
+  params.set('pinned', 'true')
+  params.set('limit', String(MAX_PINNED))
+  try {
+    const rows = await $fetch<Conversation[]>(`/api/conversations?${params.toString()}`) ?? []
+    if (pinnedLoads.isCurrent(request)) pinnedConversations.value = rows
+  }
+  catch {
+    // A failed pinned fetch must not blank the page the operator came for.
+    if (pinnedLoads.isCurrent(request)) pinnedConversations.value = []
+  }
+}
+
+/** Refetch both halves — every mutation can move a row between them. */
+async function reload() {
+  await Promise.all([load(), loadPinned()])
+}
+
+await reload()
+
+function onFiltersChanged(filters: Filter[]) {
+  activeFilters.value = filters
+  page.value = 1
+  selectedIds.value = new Set()
+  reload()
+}
+
+// A header click emits the new sort state; refetch from page 1 with the
+// server-side sort applied (dropping any carried-over selection).
+function onSortChange(s: SortingState) {
+  sortState.value = s
+  page.value = 1
+  selectedIds.value = new Set()
+  reload()
+}
+
+function exportAllConversations() {
+  const csv = [
+    ['ID', 'Name', 'Channel', 'Agent', 'Peer', 'Messages', 'Created', 'Updated'].join(','),
+    ...[...pinnedConversations.value, ...conversations.value].map(c =>
+      [c.id, `"${(c.preview || '').replaceAll('"', '""')}"`, c.channelType, c.agentName, c.peerId || '', c.messageCount, c.createdAt, c.updatedAt].join(','),
+    ),
+  ].join('\n')
+  const blob = new Blob([csv], { type: 'text/csv' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = 'conversations.csv'
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  URL.revokeObjectURL(url)
+}
+
+function goto(p: number) {
+  if (p < 1 || p > totalPages.value || p === page.value) return
+  page.value = p
+  selectedIds.value = new Set()
+  load()
+}
+
+const selectedConvo = ref<Conversation | null>(null)
+const messages = ref<Message[]>([])
+
+const selectedIds = ref<Set<number>>(new Set())
+const deletingBulk = ref(false)
+
+const allSelected = computed(() => {
+  if (!conversations.value.length) return false
+  return conversations.value.every(c => selectedIds.value.has(c.id))
+})
+
+const someSelected = computed(() => selectedIds.value.size > 0 && !allSelected.value)
+
+function toggleSelection(id: number) {
+  const next = new Set(selectedIds.value)
+  if (next.has(id)) next.delete(id)
+  else next.add(id)
+  selectedIds.value = next
+}
+
+function toggleSelectAll() {
+  if (allSelected.value) {
+    selectedIds.value = new Set()
+  }
+  else {
+    selectedIds.value = new Set(conversations.value.map(c => c.id))
+  }
+}
+
+async function deleteSelected() {
+  if (!selectedIds.value.size) return
+  const count = selectedIds.value.size
+  const ok = await confirm({
+    title: 'Delete conversations',
+    message: `Delete ${count} conversation${count === 1 ? '' : 's'}? This cannot be undone.`,
+    confirmText: 'Delete',
+    variant: 'danger',
+  })
+  if (!ok) return
+  deletingBulk.value = true
+  const res = await mutate('/api/conversations', {
+    method: 'DELETE',
+    body: { ids: Array.from(selectedIds.value) },
+  })
+  if (res !== null) {
+    selectedIds.value = new Set()
+    await load()
+  }
+  deletingBulk.value = false
+}
+
+const deletingAll = ref(false)
+
+interface DeleteFilterPayload {
+  channel?: string
+  agentId?: number
+  name?: string
+  peer?: string
+  starred?: boolean
+  q?: string
+}
+
+/**
+ * Build the filter object the server understands. Mirrors the param-set logic
+ * in {@link load} but emits a JSON object suitable for the
+ * {@code DELETE /api/conversations} body. Returns the resolved agentId
+ * (number or undefined) so the description can echo a human-readable name
+ * separately.
+ */
+function activeFilterPayload(): DeleteFilterPayload {
+  const out: DeleteFilterPayload = {}
+  const name = getFilterValue('name')
+  const channel = getFilterValue('channel')
+  const agent = getFilterValue('agent')
+  const peer = getFilterValue('peer')
+  // q narrows the count the confirm dialog quotes, so it has to narrow the
+  // delete as well — omitting it would destroy every row the other filters
+  // match instead of the keyword-matched subset the operator was shown.
+  const q = getFilterValue('q')
+  if (q) out.q = q
+  if (name) out.name = name
+  if (channel) out.channel = channel
+  if (peer) out.peer = peer
+  const starred = getFilterFlag('starred')
+  if (starred !== undefined) out.starred = starred
+  if (agent) {
+    const a = agentList.value?.find((ag: Agent) => ag.name.toLowerCase() === agent.toLowerCase())
+    if (a) out.agentId = a.id
+  }
+  return out
+}
+
+/** Human-readable echo of the active filters for the confirm message. */
+function activeFilterDescription(): string {
+  const parts: string[] = []
+  for (const f of activeFilters.value) {
+    if (f.value) parts.push(`${f.key}:${f.value}`)
+  }
+  return parts.join(' ')
+}
+
+async function deleteAll() {
+  if (deletingAll.value || total.value <= 0) return
+  const filterDesc = activeFilterDescription()
+  const scope = filterDesc ? ` matching ${filterDesc}` : ''
+  const ok = await confirm({
+    title: 'Delete all conversations',
+    message: `Delete all ${total.value} conversation${total.value === 1 ? '' : 's'}${scope}? This cannot be undone.`,
+    confirmText: `Delete ${total.value}`,
+    variant: 'danger',
+    requireText: 'delete',
+  })
+  if (!ok) return
+  deletingAll.value = true
+  const res = await mutate('/api/conversations', {
+    method: 'DELETE',
+    body: { filter: activeFilterPayload() },
+  })
+  if (res !== null) {
+    selectedIds.value = new Set()
+    page.value = 1
+    await load()
+  }
+  deletingAll.value = false
+}
+
+/**
+ * Star, pin and rename all move a row between the pinned section, the current
+ * page and the filtered-out set, so each one refetches both halves rather than
+ * patching the row in place.
+ */
+async function toggleStar(convo: Conversation) {
+  actionNotice.value = null
+  const res = await mutate(`/api/conversations/${convo.id}/star`, { method: convo.starred ? 'DELETE' : 'PUT' })
+  if (res === null) {
+    actionNotice.value = 'Could not update the star on that conversation.'
+    return
+  }
+  await reload()
+}
+
+const { mutate: mutatePin, errorDetails: pinError } = useApiMutation()
+async function togglePin(convo: Conversation) {
+  actionNotice.value = null
+  const res = await mutatePin(`/api/conversations/${convo.id}/pin`, { method: convo.pinned ? 'DELETE' : 'PUT' })
+  if (res === null) {
+    // The pin PUT 409s at the cap; the server's message names the limit.
+    actionNotice.value = pinError.value?.message ?? 'Could not update the pin on that conversation.'
+    return
+  }
+  selectedIds.value = new Set()
+  await reload()
+}
+
+function startRename(convo: Conversation) {
+  actionNotice.value = null
+  renamingId.value = convo.id
+}
+
+function cancelRename() {
+  renamingId.value = null
+}
+
+/**
+ * Commit an inline rename. Called from both Enter and blur, and blur fires
+ * again as the input unmounts — the renamingId guard is what keeps that from
+ * sending the PUT twice.
+ */
+async function commitRename(convo: Conversation, value: string) {
+  if (renamingId.value !== convo.id) return
+  renamingId.value = null
+  const name = value.trim()
+  if (!name || name === (convo.preview ?? '')) return
+  const res = await mutate(`/api/conversations/${convo.id}/name`, { method: 'PUT', body: { name } })
+  if (res === null) {
+    actionNotice.value = 'Could not rename that conversation.'
+    return
+  }
+  await reload()
+}
+
+const peekOpen = ref(false)
+
+async function selectConversation(convo: Conversation) {
+  selectedConvo.value = convo
+  peekOpen.value = true
+  messages.value = await $fetch<Message[]>(`/api/conversations/${convo.id}/messages`) ?? []
+}
+
+function closePeek() {
+  peekOpen.value = false
+  // Keep selectedConvo so re-opening preserves last selection
+}
+
+// ── DataTable column definitions ────────────────────────────────────────────
+const columns: DataTableColumn<Conversation>[] = [
+  {
+    id: 'select',
+    header: () => h('input', {
+      'type': 'checkbox',
+      'checked': allSelected.value,
+      'indeterminate': someSelected.value,
+      'disabled': !conversations.value.length,
+      'class': 'accent-red-500 align-middle',
+      'aria-label': 'Select all conversations on this page',
+      'title': 'Select all on this page',
+      'onChange': () => toggleSelectAll(),
+    }),
+    cell: ({ row }) => h('input', {
+      'type': 'checkbox',
+      'checked': selectedIds.value.has(row.original.id),
+      'class': 'accent-red-500 align-middle',
+      'aria-label': 'Select this conversation',
+      'onClick': (e: Event) => e.stopPropagation(),
+      'onChange': () => toggleSelection(row.original.id),
+    }),
+    enableSorting: false,
+    size: 40,
+  },
+  {
+    accessorKey: 'preview',
+    header: 'Name',
+    cell: ({ row, getValue }) => {
+      const v = getValue() as string | null
+      const convo = row.original
+      // Renaming swaps the whole cell for an input. The draft is never bound
+      // back into a ref: reading it off the event at commit time keeps the cell
+      // from re-rendering on every keystroke, which would drop the caret.
+      if (renamingId.value === convo.id) {
+        return h('input', {
+          'type': 'text',
+          'value': v ?? '',
+          'maxlength': 100,
+          'aria-label': 'Conversation name',
+          'data-testid': 'rename-input',
+          'class': 'w-full max-w-56 bg-surface-elevated border border-ring px-1.5 py-0.5 text-sm text-fg-strong focus:outline-hidden',
+          'onVnodeMounted': ({ el }) => {
+            const input = el as HTMLInputElement
+            input.focus()
+            input.select()
+          },
+          'onClick': (e: Event) => e.stopPropagation(),
+          'onKeydown': (e: KeyboardEvent) => {
+            if (e.key === 'Enter') {
+              e.preventDefault()
+              commitRename(convo, (e.target as HTMLInputElement).value)
+            }
+            else if (e.key === 'Escape') {
+              e.preventDefault()
+              cancelRename()
+            }
+          },
+          'onBlur': (e: FocusEvent) => commitRename(convo, (e.target as HTMLInputElement).value),
+        })
+      }
+      const starred = convo.starred === true
+      // JCLAW-267: session-mode subagent conversations carry a
+      // parentConversationId — render an inline "subagent" pill alongside
+      // the preview so operators can distinguish delegated runs from
+      // user-initiated chats at a glance. Top-level rows have no badge.
+      const parentId = convo.parentConversationId
+      const children = [
+        h('button', {
+          'type': 'button',
+          'class': starred
+            ? 'shrink-0 text-amber-500 hover:text-amber-400 transition-colors'
+            : 'shrink-0 text-fg-muted hover:text-amber-500 transition-colors',
+          'title': starred ? 'Unstar' : 'Star',
+          'aria-label': starred ? 'Unstar this conversation' : 'Star this conversation',
+          'aria-pressed': starred,
+          'data-testid': 'star-toggle',
+          'onClick': (e: Event) => {
+            e.stopPropagation()
+            toggleStar(convo)
+          },
+        }, [h(starred ? StarSolidIcon : StarOutlineIcon, { class: 'w-4 h-4' })]),
+        v
+          ? h('span', { class: 'text-fg-primary truncate max-w-56 block', title: v }, v)
+          : h('span', { class: 'text-fg-muted' }, '—'),
+      ]
+      if (parentId != null) {
+        children.push(
+          h('span', {
+            class: 'inline-flex items-center px-1.5 py-0.5 text-[10px] font-mono uppercase tracking-wide rounded bg-blue-100 dark:bg-blue-900/40 text-blue-700 dark:text-blue-300',
+            title: `Subagent run spawned from conversation #${parentId}`,
+          }, 'subagent'),
+        )
+      }
+      return h('span', { class: 'inline-flex items-center gap-1.5' }, children)
+    },
+  },
+  {
+    accessorKey: 'channelType',
+    header: 'Channel',
+    cell: ({ getValue }) => h('span', { class: 'font-mono text-xs bg-muted px-1.5 py-0.5 text-fg-primary' }, getValue() as string),
+  },
+  {
+    accessorKey: 'agentName',
+    header: 'Agent',
+    cell: ({ getValue }) => h('span', { class: 'text-fg-primary' }, getValue() as string),
+  },
+  {
+    accessorKey: 'peerId',
+    header: 'Peer',
+    cell: ({ getValue }) => h('span', { class: 'text-fg-muted font-mono text-xs' }, (getValue() as string) || '—'),
+  },
+  {
+    accessorKey: 'messageCount',
+    header: 'Messages',
+    cell: ({ getValue }) => h('span', { class: 'text-fg-muted' }, String(getValue())),
+  },
+  {
+    accessorKey: 'updatedAt',
+    header: 'Last Activity',
+    cell: ({ getValue }) => h('span', { class: 'text-fg-muted text-xs' }, new Date(getValue() as string).toLocaleString()),
+  },
+  {
+    id: 'actions',
+    // Right-aligned to sit over the justify-end buttons below, as on the Subagents and Tasks lists.
+    header: () => h('div', { class: 'w-full text-right' }, 'Actions'),
+    enableSorting: false,
+    size: 148,
+    cell: ({ row }) => h('div', { class: 'flex items-center justify-end gap-0.5' }, [
+      h('button', {
+        'type': 'button',
+        'class': 'p-1 text-fg-muted hover:text-fg-strong transition-colors',
+        'title': 'Rename',
+        'aria-label': 'Rename this conversation',
+        'data-testid': 'rename-button',
+        'onClick': (e: Event) => {
+          e.stopPropagation()
+          startRename(row.original)
+        },
+      }, [h(PencilSquareIcon, { class: 'w-4 h-4' })]),
+      h('button', {
+        'type': 'button',
+        'class': row.original.pinned
+          ? 'p-1 text-emerald-600 dark:text-emerald-400 transition-colors'
+          : 'p-1 text-fg-muted hover:text-fg-strong transition-colors',
+        'title': row.original.pinned ? 'Unpin' : 'Pin to top',
+        'aria-label': row.original.pinned ? 'Unpin this conversation' : 'Pin this conversation',
+        'aria-pressed': row.original.pinned === true,
+        'data-testid': 'pin-toggle',
+        'onClick': (e: Event) => {
+          e.stopPropagation()
+          togglePin(row.original)
+        },
+      }, [
+        h('svg', {
+          class: 'w-4 h-4',
+          fill: row.original.pinned ? 'currentColor' : 'none',
+          stroke: 'currentColor',
+          viewBox: '0 0 24 24',
+        }, [
+          // Hand-rolled pushpin: Heroicons v2 ships no pin glyph, and MapPin
+          // reads as a location marker rather than "keep this at the top".
+          h('path', {
+            'stroke-linecap': 'round',
+            'stroke-linejoin': 'round',
+            'stroke-width': '1.5',
+            'd': 'M9 3h6v6l3 3v2h-5v5l-1 3-1-3v-5H6v-2l3-3V3Z',
+          }),
+        ]),
+      ]),
+      h('button', {
+        type: 'button',
+        class: 'p-1 text-fg-muted hover:text-fg-strong transition-colors',
+        title: 'View details',
+        onClick: (e: Event) => {
+          e.stopPropagation()
+          navigateTo(`/conversations/${row.original.id}`)
+        },
+      }, [
+        h('svg', {
+          class: 'w-4 h-4', fill: 'none', stroke: 'currentColor', viewBox: '0 0 24 24',
+        }, [
+          // Heroicons v2 "eye" outline — outer almond + inner pupil. Two
+          // paths because the row-click default (open in /chat) covers the
+          // chat affordance, so this slot is repurposed for "view this
+          // conversation's detail page" — the read-only deep view that
+          // doesn't load the agent runner.
+          h('path', {
+            'stroke-linecap': 'round',
+            'stroke-linejoin': 'round',
+            'stroke-width': '1.5',
+            'd': 'M2.036 12.322a1.012 1.012 0 010-.639C3.423 7.51 7.36 4.5 12 4.5c4.638 0 8.573 3.007 9.963 7.178.07.207.07.431 0 .639C20.577 16.49 16.64 19.5 12 19.5c-4.638 0-8.573-3.007-9.963-7.178z',
+          }),
+          h('path', {
+            'stroke-linecap': 'round',
+            'stroke-linejoin': 'round',
+            'stroke-width': '1.5',
+            'd': 'M15 12a3 3 0 11-6 0 3 3 0 016 0z',
+          }),
+        ]),
+      ]),
+      h('button', {
+        type: 'button',
+        class: 'p-1 text-fg-muted hover:text-fg-strong transition-colors',
+        title: 'Quick preview',
+        onClick: (e: Event) => {
+          e.stopPropagation()
+          selectConversation(row.original)
+        },
+      }, [
+        h('svg', {
+          class: 'w-4 h-4', fill: 'none', stroke: 'currentColor', viewBox: '0 0 24 24',
+        }, [
+          h('path', {
+            'stroke-linecap': 'round',
+            'stroke-linejoin': 'round',
+            'stroke-width': '1.5',
+            'd': 'M4 4h16v16H4z M14 4v16',
+          }),
+        ]),
+      ]),
+    ]),
+  },
+]
+
+// The pinned section is a second table, so it drops the select column: bulk
+// delete operates on the paginated list, and "Delete all matching" skips pinned
+// rows server-side. Unpinning a conversation returns it to the selectable list.
+const pinnedColumns = columns.filter(c => c.id !== 'select')
+</script>
+
+<template>
+  <div>
+    <div class="flex items-center justify-between mb-6">
+      <h1 class="text-lg font-semibold text-fg-strong">
+        Conversations
+      </h1>
+      <div
+        v-if="!hasNoData"
+        class="flex items-center gap-2"
+      >
+        <button
+          :disabled="!selectedIds.size || deletingBulk"
+          class="px-3 py-1.5 bg-red-700 text-white text-xs font-medium hover:bg-red-600 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+          @click="deleteSelected"
+        >
+          {{ deletingBulk ? 'Deleting...' : `Delete${selectedIds.size ? ' ' + selectedIds.size : ''}` }}
+        </button>
+        <!--
+          "Delete all" is a separate destructive surface from "Delete N"
+          (selection-driven). It only appears when the matching count is
+          greater than zero — there is nothing to delete in an empty list,
+          and showing a disabled button there would be visual noise. When
+          a filter is active, the button wipes only the matching subset;
+          the confirm dialog echoes the filter so the user knows the scope
+          before typing 'delete' to commit.
+        -->
+        <button
+          v-if="total > 0"
+          :disabled="deletingAll"
+          class="px-3 py-1.5 border border-red-700 text-red-700 dark:text-red-400 text-xs font-medium hover:bg-red-700 hover:text-white disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+          @click="deleteAll"
+        >
+          {{ deletingAll ? 'Deleting...' : `Delete all${activeFilters.length ? ' matching' : ''}` }}
+        </button>
+      </div>
+    </div>
+
+    <!-- Empty-state landing: zero conversations AND no active filters.
+         Hides the filter / table / pagination chrome to give a focused
+         first-run nudge toward starting a chat. The "no rows after a
+         filter" case continues to use the table's built-in empty message
+         (kept on the DataTable below) so the user can still see and edit
+         the filter that produced no results. -->
+    <section
+      v-if="hasNoData"
+      class="rounded-lg border border-dashed border-zinc-300 bg-zinc-50 px-6 py-12 text-center dark:border-zinc-700 dark:bg-zinc-900/30"
+    >
+      <ChatBubbleLeftRightIcon class="mx-auto h-10 w-10 text-zinc-400" />
+      <h2 class="mt-3 text-sm font-medium text-zinc-700 dark:text-zinc-300">
+        No conversations yet
+      </h2>
+      <p class="mt-1 text-sm text-zinc-500 dark:text-zinc-400">
+        <!-- Link text sits flush against the opening/closing tags (no
+             newline between `>` and "new chat" or between "new chat" and
+             `</NuxtLink>`) so Vue's "condense" whitespace mode doesn't
+             leak a trailing space into the rendered <a>, which would
+             otherwise show as a visible gap before the comma. -->
+        Start a <NuxtLink
+          to="/chat"
+          class="font-medium text-emerald-700 underline underline-offset-2 hover:decoration-2 dark:text-emerald-400"
+        >new chat</NuxtLink>,
+        send a message to one of your bound Telegram bots, or hook up another channel —
+        every back-and-forth shows up here.
+      </p>
+    </section>
+
+    <template v-else>
+      <!-- Filter bar -->
+      <div class="mb-3">
+        <FilterBar
+          storage-key="conversations"
+          placeholder="Filter... (e.g., q:morning agent:main starred:true)"
+          :filter-keys="['q', 'name', 'channel', 'agent', 'peer', 'starred']"
+          @update:filters="onFiltersChanged"
+          @export="exportAllConversations"
+        />
+      </div>
+
+      <ApiErrorAlert
+        :error="listError"
+        headline="Could not load conversations"
+        :retry="reload"
+        :retrying="loading"
+        class="mb-3"
+      />
+
+      <!-- Row-action failures (most often the pin cap's 409) surface here
+           rather than as a console-only error the operator never sees. -->
+      <div
+        v-if="actionNotice"
+        class="mb-3 flex items-center justify-between gap-3 border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-800 dark:text-amber-300"
+        role="status"
+      >
+        <span>{{ actionNotice }}</span>
+        <button
+          type="button"
+          class="text-amber-800 hover:text-amber-950 dark:text-amber-300/70 dark:hover:text-amber-300"
+          aria-label="Dismiss notice"
+          @click="actionNotice = null"
+        >
+          ×
+        </button>
+      </div>
+
+      <!-- Pinned section. Its own table rather than a leading group inside the
+           main one: the rows come from a separate request, so they're outside
+           the paginated set and must not affect its "Showing X-Y of N". -->
+      <section
+        v-if="pinnedConversations.length"
+        class="mb-4 bg-surface-elevated border border-border"
+      >
+        <div class="flex items-center justify-between px-4 py-2 border-b border-border">
+          <h2 class="text-xs font-medium uppercase tracking-wide text-fg-muted">
+            Pinned
+          </h2>
+          <span class="text-xs text-fg-muted">{{ pinnedConversations.length }} of {{ MAX_PINNED }}</span>
+        </div>
+        <DataTable
+          data-testid="pinned-conversations"
+          :columns="pinnedColumns"
+          :data="pinnedConversations"
+          @row-click="(c: Conversation) => navigateTo(`/chat?conversation=${c.id}`)"
+        />
+      </section>
+
+      <!-- List view -->
+      <div class="bg-surface-elevated border border-border">
+        <div
+          v-if="pinnedConversations.length"
+          class="px-4 py-2 border-b border-border"
+        >
+          <h2 class="text-xs font-medium uppercase tracking-wide text-fg-muted">
+            All conversations
+          </h2>
+        </div>
+        <DataTable
+          data-testid="conversation-list"
+          :columns="columns"
+          :data="conversations"
+          :loading="loading"
+          manual-sorting
+          empty-message="No matching conversations"
+          @row-click="(c: Conversation) => navigateTo(`/chat?conversation=${c.id}`)"
+          @sort-change="onSortChange"
+        />
+        <div
+          v-if="total > 0"
+          class="flex items-center justify-between px-4 py-2.5 border-t border-border text-xs text-fg-muted"
+        >
+          <span>Showing {{ rangeStart }}–{{ rangeEnd }} of {{ total }}</span>
+          <div class="flex items-center gap-1">
+            <button
+              :disabled="page <= 1 || loading"
+              class="px-2 py-1 border border-border rounded hover:text-fg-strong hover:border-ring disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+              @click="goto(page - 1)"
+            >
+              Prev
+            </button>
+            <span class="px-2">Page {{ page }} of {{ totalPages }}</span>
+            <button
+              :disabled="page >= totalPages || loading"
+              class="px-2 py-1 border border-border rounded hover:text-fg-strong hover:border-ring disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+              @click="goto(page + 1)"
+            >
+              Next
+            </button>
+          </div>
+        </div>
+      </div>
+    </template>
+
+    <!-- PeekPanel for conversation detail -->
+    <PeekPanel
+      :open="peekOpen"
+      :title="selectedConvo?.preview || 'Conversation'"
+      :description="`${selectedConvo?.agentName || ''} · ${selectedConvo?.channelType || ''}`"
+      @update:open="closePeek"
+    >
+      <template v-if="selectedConvo">
+        <div class="flex flex-wrap gap-x-6 gap-y-1 text-xs text-fg-muted mb-4">
+          <span>Channel: <strong class="text-fg-primary">{{ selectedConvo.channelType }}</strong></span>
+          <span>Agent: <strong class="text-fg-primary">{{ selectedConvo.agentName }}</strong></span>
+          <span>Peer: <strong class="text-fg-primary font-mono">{{ selectedConvo.peerId || '—' }}</strong></span>
+          <span>Messages: <strong class="text-fg-primary">{{ selectedConvo.messageCount }}</strong></span>
+        </div>
+        <div class="space-y-3">
+          <div
+            v-for="msg in messages"
+            :key="msg.id"
+            :class="msg.role === 'user' ? 'ml-12' : msg.role === 'tool' ? 'ml-6' : ''"
+          >
+            <div class="flex items-center gap-2 mb-0.5">
+              <span class="text-xs font-mono text-fg-muted">{{ msg.role }}</span>
+              <span class="text-xs text-fg-muted">{{ new Date(msg.createdAt).toLocaleTimeString() }}</span>
+            </div>
+            <div class="bg-muted border border-border px-3 py-2 text-sm text-fg-primary whitespace-pre-wrap">
+              {{ msg.content || '(tool call)' }}
+            </div>
+          </div>
+        </div>
+      </template>
+    </PeekPanel>
+  </div>
+</template>

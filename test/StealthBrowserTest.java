@@ -1,0 +1,368 @@
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+import okhttp3.MediaType;
+import okhttp3.Protocol;
+import okhttp3.Request;
+import okhttp3.Response;
+import okhttp3.ResponseBody;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Test;
+import play.Play;
+import play.test.UnitTest;
+import services.StealthSidecarManager;
+import services.scrape.BlockClassifier;
+import services.scrape.ScrapeReason;
+import services.scrape.ScrapeRung;
+import services.scrape.ScrapeSidecarException;
+import tools.PlaywrightBrowserTool;
+import tools.scrape.RenderedFetcher;
+import tools.scrape.WebScrapeSettings;
+import utils.SsrfGuard;
+
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.InputStreamReader;
+import java.net.InetAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.net.URI;
+import java.nio.charset.StandardCharsets;
+import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+
+/**
+ * Rung 3 — the stealth rendering sidecar (JCLAW-1088).
+ *
+ * <p>The load-bearing test here is the SSRF parity one. Moving the browser launch out of
+ * the JVM moved {@code --host-resolver-rules} with it, and the sidecar had to gain its
+ * own IP-range check for the hosts a page reaches on its own. That is a second
+ * implementation of a security check, so it is pinned against the first rather than
+ * trusted to stay in step.
+ */
+class StealthBrowserTest extends UnitTest {
+
+    /** Deliberately spans both families and every category the guard rejects. */
+    private static final List<String> ADDRESSES = List.of(
+            "8.8.8.8", "1.1.1.1", "93.184.215.14",       // public v4
+            "2606:4700:4700::1111",                       // public v6
+            "127.0.0.1", "::1",                           // loopback
+            "10.0.0.1", "172.16.0.1", "192.168.1.1",      // private v4
+            "fd00::1",                                    // private v6
+            "169.254.169.254", "fe80::1",                 // link-local (incl. cloud metadata)
+            "224.0.0.1", "ff02::1",                       // multicast
+            "0.0.0.0", "::",                              // unspecified
+            // Classes the two implementations once disagreed on. The table held none
+            // of them, so it passed while asserting an equality it could not have
+            // caught a drift in — and the divergences ran in both directions:
+            // ipaddress admitted fec0::/10 that Java blocked, while Java admitted the
+            // five below that ipaddress blocked.
+            "fec0::1",                                    // v6 site-local
+            "240.0.0.1", "192.0.2.1", "198.18.0.1",       // v4 reserved/doc/benchmark
+            "255.255.255.255",                            // broadcast
+            "64:ff9b::7f00:1",                            // NAT64 wrapping 127.0.0.1
+            "100.64.0.1");                                // CGNAT
+
+    private final ScrapeConfigGuard config = new ScrapeConfigGuard();
+
+    @AfterEach
+    void clearOverrides() {
+        config.restore();
+    }
+
+    // ==================== The duplicated guard ====================
+
+    @Test
+    void theSidecarsAddressCheckAgreesWithSsrfGuard() throws Exception {
+        // Both copies. The fetch sidecar gained one when rung 2 started validating pin
+        // targets, and two files that must agree are exactly what this test is for.
+        for (var relative : List.of("sidecar/stealth/ssrf.py", "sidecar/fetch/ssrf.py")) {
+            assertGuardIsNoMorePermissiveThanJava(new File(Play.applicationPath, relative));
+        }
+    }
+
+    @Test
+    void theSidecarsProxyCheckIsNoMorePermissiveThanTheProviderGuard() throws Exception {
+        // JCLAW-1271: the operator's proxy is judged on the provider rule, not the public one,
+        // so loopback and the LAN pass and only link-local, multicast and unspecified do not.
+        var table = new java.util.ArrayList<>(ADDRESSES);
+        // IPv4 written as IPv6: Java unwraps these to v4, so the Python side must block them too.
+        table.addAll(List.of("::ffff:169.254.169.254", "::ffff:224.0.0.1", "::ffff:0.0.0.0", "::ffff:10.0.0.1"));
+        for (var relative : List.of("sidecar/stealth/ssrf.py", "sidecar/fetch/ssrf.py")) {
+            var script = new File(Play.applicationPath, relative);
+            var cmd = new java.util.ArrayList<>(List.of("python3", "-c", """
+                    import sys, json
+                    sys.path.insert(0, sys.argv[1])
+                    from ssrf import is_allowed_proxy_ip
+                    print(json.dumps({a: is_allowed_proxy_ip(a) for a in sys.argv[2:]}))
+                    """, script.getParent()));
+            cmd.addAll(table);
+            var proc = new ProcessBuilder(cmd).redirectErrorStream(true).start();
+            assertTrue(proc.waitFor(60, TimeUnit.SECONDS), "python3 proxy probe timed out");
+            var stdout = new String(proc.getInputStream().readAllBytes(), StandardCharsets.UTF_8).strip();
+            assertEquals(0, proc.exitValue(), "python3 proxy probe failed: " + stdout);
+            var python = JsonParser.parseString(stdout).getAsJsonObject();
+
+            // Positive controls: a check that refused everything would pass every line below.
+            for (var allowed : List.of("127.0.0.1", "10.0.0.1", "8.8.8.8")) {
+                assertTrue(python.get(allowed).getAsBoolean(), relative + " refuses proxy address " + allowed);
+            }
+            for (var address : table) {
+                if (python.get(address).getAsBoolean()) {
+                    assertFalse(SsrfGuard.isBlockedForProvider(InetAddress.getByName(address)),
+                            relative + " admits " + address + " as a proxy, which the JVM blocks");
+                }
+            }
+            for (var mustBlock : List.of("169.254.169.254", "fe80::1", "224.0.0.1", "0.0.0.0", "::",
+                                         "::ffff:169.254.169.254")) {
+                assertFalse(python.get(mustBlock).getAsBoolean(), relative + " admits proxy " + mustBlock);
+            }
+        }
+    }
+
+    private static void assertGuardIsNoMorePermissiveThanJava(File script) throws Exception {
+        assertTrue(script.isFile(), script + " missing — a sidecar's guard has moved or gone");
+
+        var cmd = new java.util.ArrayList<>(List.of("python3", "-c", """
+                import sys, json
+                sys.path.insert(0, sys.argv[1])
+                from ssrf import is_public_ip
+                print(json.dumps({a: is_public_ip(a) for a in sys.argv[2:]}))
+                """, script.getParent()));
+        cmd.addAll(ADDRESSES);
+
+        var proc = new ProcessBuilder(cmd).redirectErrorStream(true).start();
+        assertTrue(proc.waitFor(60, TimeUnit.SECONDS), "python3 parity probe timed out");
+        var stdout = new String(proc.getInputStream().readAllBytes(), StandardCharsets.UTF_8).strip();
+        assertEquals(0, proc.exitValue(), "python3 parity probe failed: " + stdout);
+
+        var python = JsonParser.parseString(stdout).getAsJsonObject();
+
+        // Positive control. Without it a guard that answered false for everything —
+        // which would silently stop rung 3 loading any subresource — satisfies every
+        // assertion below and reads as a pass.
+        assertTrue(python.get("8.8.8.8").getAsBoolean(),
+                script + " rejects a public address — the guard is refusing everything");
+
+        // Both guards must reject these outright. The one-directional check below is
+        // the security invariant, but on its own it cannot see the JVM growing a hole:
+        // 64:ff9b::7f00:1 is NAT64-wrapped loopback, and SsrfGuard admitted it while
+        // this table sat here asserting nothing about it.
+        for (var mustBlock : List.of("127.0.0.1", "::1", "169.254.169.254", "10.0.0.1",
+                                     "fec0::1", "64:ff9b::7f00:1")) {
+            assertFalse(python.get(mustBlock).getAsBoolean(),
+                    script + " admits " + mustBlock);
+            assertTrue(SsrfGuard.isUnsafe(InetAddress.getByName(mustBlock)),
+                    "SsrfGuard admits " + mustBlock);
+        }
+
+        for (var address : ADDRESSES) {
+            boolean pythonSaysPublic = python.get(address).getAsBoolean();
+            boolean javaSaysPublic = !SsrfGuard.isUnsafe(InetAddress.getByName(address));
+            // Not equality. The security property is one-directional: the sidecar must
+            // never admit what the JVM would reject, and being stricter costs only
+            // reach. Asserting equality made the stricter-side differences look like
+            // failures, which is why the divergent addresses were absent from the table
+            // and the fail-open one went unnoticed.
+            if (pythonSaysPublic) {
+                assertTrue(javaSaysPublic, script + " admits " + address
+                        + " while SsrfGuard rejects it — the duplicated guard has drifted open");
+            }
+        }
+    }
+
+    // ==================== Containment that survives the move ====================
+
+    @Test
+    void anUnsafeEntryUrlNeverReachesTheBrowser() {
+        // The JVM stays authoritative for the entry URL: hostResolverRule throws
+        // everything assertUrlSafe does, so the sidecar is never even contacted.
+        for (var url : List.of("http://127.0.0.1:9000/api/status",
+                               "http://169.254.169.254/latest/meta-data/",
+                               "http://[::1]:9000/")) {
+            assertThrows(SecurityException.class, () -> RenderedFetcher.fetch(url),
+                    "expected an SsrfGuard refusal for " + url);
+        }
+    }
+
+    @Test
+    void aFinalUrlTheBrowserWroteRawIsRevalidatedAndNormalized() {
+        // X-Upstream-Url carries Chromium's own final URL, and rung 3 used to re-parse it with a
+        // strict URI.create before handing it to the guard — whose parse was already lenient — so a
+        // successful render of a page every browser loads was discarded as a failed attempt.
+        // What leaves is the parsed form: WebScrapeTool.pickVariant matches this against alternates
+        // that came from Urls.parse, and an un-normalized spelling records one page under two URLs.
+        // A literal IP so the guard needs no resolver.
+        var raw = "https://8.8.8.8/css?family=Roboto|Open+Sans";
+        assertThrows(IllegalArgumentException.class, () -> URI.create(raw),
+                "the removed wrapper is what refused this, so the case proves nothing without it");
+        assertEquals("https://8.8.8.8/css?family=Roboto%7COpen+Sans",
+                RenderedFetcher.finalUrl(rendered("X-Upstream-Url", raw), "https://8.8.8.8/"));
+    }
+
+    @Test
+    void aRenderWithNoFinalUrlHeaderFallsBackToWhatWasRequested() {
+        // Without the fallback the requested URL is the only thing that could be reported, and a
+        // sidecar that omits the header would otherwise yield a FetchResult with a null final URL.
+        assertEquals("https://8.8.8.8/p",
+                RenderedFetcher.finalUrl(rendered("X-Other", "x"), "https://8.8.8.8/p"));
+    }
+
+    @Test
+    void anUnsafeFinalUrlIsStillRefusedAfterTheRender() {
+        // The sidecar's own interceptor screens each hop, but a final URL it allowed is checked
+        // again here — the JVM stays authoritative for what rung 3 hands back.
+        assertThrows(SecurityException.class,
+                () -> RenderedFetcher.finalUrl(rendered("X-Upstream-Url", "http://127.0.0.1:9000/api/status"),
+                        "https://8.8.8.8/"));
+    }
+
+    /** A minimal sidecar response carrying one header, for the final-URL seam. */
+    private static Response rendered(String header, String value) {
+        return new Response.Builder()
+                .request(new Request.Builder().url("http://127.0.0.1:9532/render").build())
+                .protocol(Protocol.HTTP_1_1)
+                .code(200).message("OK")
+                .addHeader(header, value)
+                .body(ResponseBody.create("", MediaType.parse("text/html")))
+                .build();
+    }
+
+    // ==================== The render request (JCLAW-1306) ====================
+
+    private static final int SCREEN_PORT = 4711;
+
+    @Test
+    void theBrowserIsPointedAtTheScreenAndNeverSentTheOperatorsProxy() {
+        // JCLAW-1315: the screen forwards through the operator's proxy itself, so the sidecar holds none of it.
+        config.set(WebScrapeSettings.PROXY_URL, "http://proxy.example:3128");
+        config.set(WebScrapeSettings.PROXY_USERNAME, "scrape-user");
+        config.set(WebScrapeSettings.PROXY_PASSWORD, "scrape-pass");
+        var sent = RenderedFetcher.renderRequest("https://8.8.8.8/", "en", new JsonObject(), SCREEN_PORT);
+        assertEquals("{\"url\":\"socks5://127.0.0.1:" + SCREEN_PORT + "\"}", sent.get("proxy").toString());
+        var body = sent.toString();
+        for (var operatorValue : List.of("proxy.example", "scrape-user", "scrape-pass")) {
+            assertFalse(body.contains(operatorValue), "the render request carries " + operatorValue + ": " + body);
+        }
+    }
+
+    @Test
+    void aRendersScreenCarriesItsConnectionsThroughTheOperatorsProxy() throws Exception {
+        try (var stub = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
+            stub.setSoTimeout(10_000);
+            config.set(WebScrapeSettings.PROXY_URL, "http://127.0.0.1:" + stub.getLocalPort());
+            config.set(WebScrapeSettings.PROXY_ENABLED, "true");
+            try (var screen = RenderedFetcher.openScreen("https://8.8.8.8/");
+                 var client = new Socket(InetAddress.getLoopbackAddress(), screen.port())) {
+                var name = "1.1.1.1".getBytes(StandardCharsets.US_ASCII);
+                var out = client.getOutputStream();
+                out.write(new byte[] {5, 1, 0}); // greeting: no authentication
+                out.write(new byte[] {5, 1, 0, 3, (byte) name.length}); // CONNECT by name
+                out.write(name);
+                out.write(new byte[] {1, (byte) 0xBB}); // port 443
+                out.flush();
+                try (var upstream = stub.accept()) {
+                    upstream.setSoTimeout(10_000);
+                    var requestLine = new BufferedReader(new InputStreamReader(
+                            upstream.getInputStream(), StandardCharsets.ISO_8859_1)).readLine();
+                    assertEquals("CONNECT 1.1.1.1:443 HTTP/1.1", requestLine);
+                }
+            }
+        }
+    }
+
+    @Test
+    void aScreenThatCannotStartFailsTheRenderAsTheSidecarsErrorNotTheOrigins() {
+        // The request is built from the open screen's port, so a render with no screen has nothing to send.
+        var failure = PlaywrightBrowserTool.callWithFailingScreenForTest(() -> assertThrows(
+                ScrapeSidecarException.class, () -> RenderedFetcher.openScreen("https://8.8.8.8/")));
+        assertTrue(failure.getMessage().startsWith("the render's network screen could not start"),
+                failure.getMessage());
+    }
+
+    @Test
+    void everyRenderStatesItsBudgetsAndTheyFitInsideTheCallTimeout() {
+        var sent = RenderedFetcher.renderRequest("https://8.8.8.8/", "en", new JsonObject(), SCREEN_PORT);
+        long navigation = sent.get("timeoutMs").getAsLong();
+        long challenge = sent.get("challengeMs").getAsLong();
+        assertTrue(challenge > 0, "the sidecar reads a zero budget as its own default: " + sent);
+        // The rest of a render: the UA probe and the route gate's resolve budget, 15 s ceilings each.
+        assertTrue(navigation + challenge + 30_000 < RenderedFetcher.CALL_TIMEOUT.toMillis(),
+                "a render that uses every budget must still answer before the JVM gives up: " + sent);
+    }
+
+    @Test
+    void theTurnstileClickIsOnUntilTheOperatorTurnsItOff() {
+        config.delete(StealthSidecarManager.CFG_SOLVE_TURNSTILE);
+        assertTrue(solveTurnstileSent(), "an absent key means on");
+        config.set(StealthSidecarManager.CFG_SOLVE_TURNSTILE, "false");
+        assertFalse(solveTurnstileSent(), "read per render, so no restart is needed");
+        config.set(StealthSidecarManager.CFG_SOLVE_TURNSTILE, "true");
+        assertTrue(solveTurnstileSent());
+    }
+
+    private static boolean solveTurnstileSent() {
+        return RenderedFetcher.renderRequest("https://8.8.8.8/", "en", new JsonObject(), SCREEN_PORT)
+                .get("solveTurnstile").getAsBoolean();
+    }
+
+    @Test
+    void noMoreRendersReachTheSidecarThanItHasSlots() throws Exception {
+        // A render queued inside the sidecar spends CALL_TIMEOUT waiting behind challenge waits.
+        int callers = RenderedFetcher.RENDER_SLOTS * 2;
+        var inside = new AtomicInteger();
+        var peak = new AtomicInteger();
+        var slotsFull = new CountDownLatch(RenderedFetcher.RENDER_SLOTS);
+        var everyoneIn = new CountDownLatch(callers);
+        var release = new CountDownLatch(1);
+        try (var pool = Executors.newFixedThreadPool(callers)) {
+            for (int i = 0; i < callers; i++) {
+                pool.submit(() -> RenderedFetcher.inRenderSlot(() -> {
+                    peak.accumulateAndGet(inside.incrementAndGet(), Math::max);
+                    slotsFull.countDown();
+                    everyoneIn.countDown();
+                    try {
+                        release.await(30, TimeUnit.SECONDS);
+                    } catch (InterruptedException _) {
+                        Thread.currentThread().interrupt();
+                    }
+                    inside.decrementAndGet();
+                    return null;
+                }));
+            }
+            try {
+                assertTrue(slotsFull.await(10, TimeUnit.SECONDS), "the slots never filled");
+                assertFalse(everyoneIn.await(500, TimeUnit.MILLISECONDS),
+                        "a caller got past a full set of slots");
+            } finally {
+                release.countDown();
+            }
+        }
+        assertEquals(RenderedFetcher.RENDER_SLOTS, peak.get());
+        assertEquals(0, everyoneIn.getCount(), "every queued caller ran once a slot freed");
+    }
+
+    // ==================== Feature detection ====================
+
+    @Test
+    void disablingTheRungDegradesRatherThanErroring() {
+        config.set(StealthSidecarManager.CFG_ENABLED, "false");
+        assertFalse(StealthSidecarManager.available());
+        assertFalse(RenderedFetcher.available());
+    }
+
+    // ==================== Ladder position ====================
+
+    @Test
+    void thinContentEscalatesToTheBrowserWithoutABlockBeingDetected() {
+        // The rung must be reachable for a rendering failure, not only for a block:
+        // a client-rendered page at zero protection is THIN_CONTENT, and BROWSER is
+        // what fixes it.
+        assertEquals(ScrapeRung.BROWSER,
+                BlockClassifier.nextRung(ScrapeReason.THIN_CONTENT, ScrapeRung.PLAIN));
+        assertEquals(ScrapeRung.BROWSER,
+                BlockClassifier.nextRung(ScrapeReason.JS_CHALLENGE, ScrapeRung.PLAIN));
+    }
+}

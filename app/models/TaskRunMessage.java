@@ -1,0 +1,134 @@
+package models;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.EnumType;
+import jakarta.persistence.Enumerated;
+import jakarta.persistence.Index;
+import jakarta.persistence.JoinColumn;
+import jakarta.persistence.ManyToOne;
+import jakarta.persistence.PostPersist;
+import jakarta.persistence.PostRemove;
+import jakarta.persistence.PostUpdate;
+import jakarta.persistence.PrePersist;
+import jakarta.persistence.Table;
+import org.hibernate.annotations.OnDelete;
+import org.hibernate.annotations.OnDeleteAction;
+import play.db.jpa.Model;
+import services.search.LuceneIndexer;
+import utils.AppClock;
+
+import java.time.Instant;
+
+/**
+ * One turn within a {@link TaskRun}'s transcript. Plays the same role for
+ * task fires that {@link Message} plays for conversation messages.
+ *
+ * <p>Column shape deliberately matches {@code Message} (minus
+ * conversation-only fields like attachments, subagentRunId, messageKind,
+ * metadata): {@code content}, {@code tool_calls}, {@code tool_results},
+ * {@code tool_result_structured}, {@code usage_json}, {@code reasoning},
+ * {@code truncated}. Same data shape means JCLAW-22's PeekPanel can render
+ * both Message rows and TaskRunMessage rows through one component, and the
+ * existing pattern AgentRunner uses to write Message rows ports cleanly
+ * to TaskRunSink writing TaskRunMessage rows.
+ *
+ * <p>{@link MessageRole} is reused (USER, ASSISTANT, TOOL, SYSTEM) — a
+ * divergence in role vocabulary between conversations and task runs would
+ * create a translation layer with no business reason to exist.
+ *
+ * <p>The composite index on {@code (task_run_id, turn_index)} matches the
+ * PeekPanel's expected "load all messages for this TaskRun in order"
+ * query. {@code content} carries no JPA {@code @Index}: full-text search on
+ * it is served by the Lucene index the lifecycle hooks below maintain.
+ *
+ * <p>Part of JCLAW-21's Tasks foundation. Schema is managed by Hibernate
+ * auto-DDL ({@code jpa.ddl=update}); no separate migration file required.
+ */
+@Entity
+@Table(name = "task_run_message", indexes = {
+        @Index(name = "idx_task_run_message_run_turn", columnList = "task_run_id,turn_index")
+})
+public class TaskRunMessage extends Model {
+
+    @ManyToOne(optional = false)
+    @JoinColumn(name = "task_run_id", nullable = false)
+    @OnDelete(action = OnDeleteAction.CASCADE)
+    public TaskRun taskRun;
+
+    @Column(name = "turn_index", nullable = false)
+    public int turnIndex;
+
+    @Enumerated(EnumType.STRING)
+    @Column(nullable = false)
+    public MessageRole role;
+
+    @Column(columnDefinition = "TEXT")
+    public String content;
+
+    @Column(name = "tool_calls", columnDefinition = "TEXT")
+    public String toolCalls;
+
+    @Column(name = "tool_results", columnDefinition = "TEXT")
+    public String toolResults;
+
+    /**
+     * Optional structured JSON payload for tool-result rows (mirrors
+     * {@link Message#toolResultStructured}). Null for tools that don't
+     * produce structured output. The LLM never sees this column — it
+     * only rehydrates the plain-text {@link #content}.
+     */
+    @Column(name = "tool_result_structured", columnDefinition = "TEXT")
+    public String toolResultStructured;
+
+    /** JSON-serialized usage metrics (tokens, cost, duration) from the LLM response. */
+    @Column(name = "usage_json", columnDefinition = "TEXT")
+    public String usageJson;
+
+    /**
+     * Streamed reasoning / extended-thinking text for assistant turns that
+     * ran with thinking enabled. Null for user/tool rows and for assistant
+     * turns that emitted no reasoning.
+     */
+    @Column(columnDefinition = "TEXT")
+    public String reasoning;
+
+    /**
+     * Mirror of {@link Message#truncated} — true when the LLM hit
+     * {@code finish_reason=length}. Default false; only the assistant
+     * turn that hit the cap flips it.
+     */
+    @Column(name = "truncated", nullable = false, columnDefinition = "BOOLEAN DEFAULT FALSE")
+    public boolean truncated;
+
+    @Column(name = "created_at", nullable = false, updatable = false)
+    public Instant createdAt;
+
+    @PrePersist
+    void onCreate() {
+        if (createdAt == null) createdAt = AppClock.now();
+    }
+
+    /**
+     * Mirror this row into the Lucene full-text index. Fires after each
+     * persist or update of the JPA row; the indexer catches and logs
+     * failures internally so a transient FS issue never aborts the
+     * parent transaction.
+     */
+    @PostPersist
+    @PostUpdate
+    void onIndexUpsert() {
+        if (id != null) {
+            LuceneIndexer.upsert(
+                    LuceneIndexer.Scope.TASK_RUN_MESSAGE, id, content);
+        }
+    }
+
+    /** Drop this row from the Lucene index; same no-throw contract as the upsert hook. */
+    @PostRemove
+    void onIndexRemove() {
+        if (id != null) {
+            LuceneIndexer.remove(id);
+        }
+    }
+}

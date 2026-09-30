@@ -1,0 +1,135 @@
+package tools;
+
+import com.google.gson.JsonObject;
+import org.jspecify.annotations.Nullable;
+import utils.JsonArgs;
+
+import java.util.Locale;
+
+/**
+ * JCLAW-677: request parsing and schema-level validation of a single subagent
+ * spawn call, extracted from {@link SubagentSpawnTool}. The parsed bundle is
+ * the same shape the tool has always produced; {@code error} non-null
+ * short-circuits {@link SubagentSpawnTool#execute}.
+ */
+record SubagentSpawnArgs(
+        @Nullable String error,
+        @Nullable String task, @Nullable String label, @Nullable Long requestedAgentId,
+        @Nullable String modelProvider, @Nullable String modelId,
+        @Nullable String mode, @Nullable String context, int timeoutSeconds, boolean asyncRequested) {
+
+    private static final String FIELD_MODEL_PROVIDER = "modelProvider";
+    private static final String FIELD_MODEL_ID = "modelId";
+
+    static SubagentSpawnArgs fail(String msg) {
+        return new SubagentSpawnArgs(msg, null, null, null, null, null, null, null, 0, false);
+    }
+
+    /** Valid only once {@link #error()} has been checked null — {@code fail()} carries no request. */
+    String resolvedTask() { return require(task, "task"); }
+
+    /** Valid only once {@link #error()} has been checked null — {@code fail()} carries no request. */
+    String resolvedMode() { return require(mode, "mode"); }
+
+    /** Valid only once {@link #error()} has been checked null — {@code fail()} carries no request. */
+    String resolvedContext() { return require(context, "context"); }
+
+    private String require(@Nullable String v, String field) {
+        if (v == null) throw new IllegalStateException("spawn args rejected before '" + field + "': " + error);
+        return v;
+    }
+
+    static SubagentSpawnArgs parse(JsonObject args) {
+        var task = optString(args, "task");
+        if (task == null || task.isBlank()) {
+            return fail("Error: 'task' is required.");
+        }
+        var label = optString(args, SubagentSpawnTool.FIELD_LABEL);
+        var requestedAgentId = optLong(args, SubagentSpawnTool.ARG_AGENT_ID);
+        var modelProviderOverride = optString(args, FIELD_MODEL_PROVIDER);
+        var modelIdOverride = optString(args, FIELD_MODEL_ID);
+        var runDefault = SubagentSpawnTool.defaultRunTimeoutSeconds();
+        var timeoutSeconds = optInt(args, SubagentSpawnTool.ARG_RUN_TIMEOUT_SECONDS, runDefault);
+        if (timeoutSeconds <= 0) timeoutSeconds = runDefault;
+        // JCLAW-267: mode parameter — "session" (default) materializes a fresh
+        // child Conversation; "inline" runs the child in the parent's
+        // Conversation with messages tagged so the chat UI folds them.
+        var requestedMode = optString(args, "mode");
+        var mode = requestedMode == null || requestedMode.isBlank()
+                ? SubagentSpawnTool.DEFAULT_MODE
+                : requestedMode.toLowerCase(Locale.ROOT);
+        // JCLAW-809: single source of truth — SubagentSpawnTool.modeRejection is
+        // the same check the batch path (SubagentSpawnTool.executeBatch) applies,
+        // so the two paths can no longer diverge on an unknown mode.
+        var modeRejection = SubagentSpawnTool.modeRejection(requestedMode, mode);
+        if (modeRejection != null) {
+            return fail(modeRejection);
+        }
+        // JCLAW-268: context parameter — "fresh" (default) is the JCLAW-265
+        // behavior; "inherit" summarizes the parent's recent turns and unions
+        // tool grants. Validate strictly so an LLM typo produces a clear
+        // error rather than silently degrading.
+        var requestedContext = optString(args, SubagentSpawnTool.ARG_CONTEXT);
+        var context = requestedContext == null || requestedContext.isBlank()
+                ? SubagentSpawnTool.DEFAULT_CONTEXT
+                : requestedContext.toLowerCase(Locale.ROOT);
+        if (!SubagentSpawnTool.ALLOWED_CONTEXTS.contains(context)) {
+            return fail("Error: 'context' must be one of " + SubagentSpawnTool.ALLOWED_CONTEXTS
+                    + SubagentSpawnTool.GOT_LITERAL + requestedContext + "').");
+        }
+
+        // JCLAW-270: async parameter — false (default) preserves the synchronous
+        // JCLAW-265 flow; true dispatches the child run to a background VT and
+        // returns the run id immediately. Async + inline is rejected because
+        // inline mode embeds the child's messages directly into the parent
+        // transcript; returning control to the LLM before the child finishes
+        // would leave a half-written nested block dangling. The completion-card
+        // post-flow (announce Message into the parent conversation) is the
+        // async equivalent of inline's inline-rendering — they're alternatives
+        // for surfacing child output, not complements.
+        var asyncRequested = optBool(args, "async");
+        if (asyncRequested && SubagentSpawnTool.MODE_INLINE.equals(mode)) {
+            return fail("Error: 'async' is only compatible with mode=\"session\" (inline mode embeds child messages directly into the parent transcript, which has no meaningful semantics before the child finishes).");
+        }
+        // JCLAW-497: async subagents ARE supported in task fires (a block-await
+        // handoff collected by subagent_yield — see launchAsyncSpawnForTask),
+        // superseding JCLAW-494's interim rejection.
+
+        return new SubagentSpawnArgs(null, task, label, requestedAgentId,
+                modelProviderOverride, modelIdOverride,
+                mode, context, timeoutSeconds, asyncRequested);
+    }
+
+    /**
+     * One child of a batch fan-out: its own task/label/agentId over the batch-wide mode,
+     * context and timeout {@link SubagentSpawnTool#executeBatch} has already validated.
+     *
+     * <p>The model override comes from the top-level call, so a batch child honors it as a
+     * single spawn does (JCLAW-1231).
+     */
+    static SubagentSpawnArgs batchChild(JsonObject args, String task, @Nullable String label,
+                                        @Nullable Long agentId, String mode, String context,
+                                        int timeoutSeconds) {
+        return new SubagentSpawnArgs(null, task, label, agentId,
+                optString(args, FIELD_MODEL_PROVIDER), optString(args, FIELD_MODEL_ID),
+                mode, context, timeoutSeconds, true);
+    }
+
+    // Thin forwarders to the shared {@link JsonArgs} accessors (JCLAW-729). Kept
+    // package-visible because SubagentSpawnTool / SubagentAcpRunner call them.
+    static @Nullable String optString(JsonObject obj, String key) {
+        return JsonArgs.optString(obj, key);
+    }
+
+    static @Nullable Long optLong(JsonObject obj, String key) {
+        return JsonArgs.optLong(obj, key);
+    }
+
+    static int optInt(JsonObject obj, String key, int fallback) {
+        return JsonArgs.optInt(obj, key, fallback);
+    }
+
+    static boolean optBool(JsonObject obj, String key) {
+        return JsonArgs.optBool(obj, key);
+    }
+}

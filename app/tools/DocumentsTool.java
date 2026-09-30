@@ -1,0 +1,572 @@
+package tools;
+
+import agents.GeneratedAttachment;
+import agents.ToolAction;
+import agents.ToolRegistry;
+import com.google.gson.JsonParser;
+import models.Agent;
+import org.apache.tika.exception.TikaConfigException;
+import org.apache.tika.exception.TikaException;
+import org.apache.tika.io.TikaInputStream;
+import org.apache.tika.metadata.Metadata;
+import org.apache.tika.parser.AutoDetectParser;
+import org.apache.tika.parser.ParseContext;
+import org.apache.tika.parser.ocr.TesseractOCRConfig;
+import org.apache.tika.parser.pdf.OcrConfig;
+import org.apache.tika.parser.pdf.PDFParserConfig;
+import org.apache.tika.sax.BodyContentHandler;
+import org.jspecify.annotations.Nullable;
+import org.xml.sax.SAXException;
+import play.Logger;
+import play.Play;
+import services.AgentService;
+import services.ConfigService;
+import services.DocumentWriter;
+import services.OcrHealthProbe;
+import services.OcrInstallHint;
+import utils.JsonArgs;
+import utils.TikaHolder;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Objects;
+
+/**
+ * Tool for reading and writing rich document formats. Reading uses Apache
+ * Tika's {@link AutoDetectParser} to extract text from PDF, DOCX, DOC, XLSX,
+ * PPTX, RTF, ODT, HTML, EPUB and more. Writing currently supports HTML, PDF,
+ * and DOCX from markdown input via {@link services.DocumentWriter}; XLSX and
+ * PPTX are tracked for a later iteration that takes structured input.
+ */
+public class DocumentsTool implements ToolRegistry.Tool {
+
+    private static final long MAX_DOCUMENT_READ_BYTES = 25L * 1024 * 1024;
+    private static final int MAX_DOCUMENT_TEXT_CHARS = 2_000_000;
+    private static final int MAX_WRITE_MARKDOWN_CHARS = 500_000;
+    private static final List<String> WRITE_FORMATS = List.of("html", "pdf", "docx");
+
+    // Action names dispatched in execute()
+    private static final String ACTION_READ = "readDocument";
+    private static final String ACTION_WRITE = "writeDocument";
+    private static final String ACTION_APPEND = "appendDocument";
+    private static final String ACTION_RENDER = "renderDocument";
+
+    /**
+     * Every valid action, single-sourced so the schema enum and the unknown-action
+     * error cannot drift — the same shape as {@code WRITE_FORMATS} below. The enum
+     * is advisory: JCLAW-905 recorded a model sending action names outside it and
+     * burning nine calls guessing, so the error has to name the alternatives rather
+     * than only reject the input.
+     */
+    private static final List<String> ACTIONS =
+            List.of(ACTION_READ, ACTION_WRITE, ACTION_APPEND, ACTION_RENDER);
+
+    // JSON argument keys
+    private static final String ARG_ACTION = "action";
+    private static final String ARG_CONTENT = "content";
+    private static final String ARG_SOURCE_PATH = "sourcePath";
+    private static final String ARG_FORMAT = "format";
+
+    @Override
+    public String name() { return "documents"; }
+
+    @Override
+    public String category() { return "Files"; }
+
+    @Override
+    public String icon() { return "document"; }
+
+    @Override
+    public String shortDescription() {
+        return "Read and author rich formats — PDF, DOCX, HTML, XLSX, PPTX, EPUB — from markdown.";
+    }
+
+    @Override
+    public List<ToolAction> actions() {
+        return List.of(
+                new ToolAction(ACTION_READ,   "Extract text from PDF, DOCX, XLSX, PPTX, HTML, RTF, ODT, EPUB via Apache Tika"),
+                new ToolAction(ACTION_WRITE,  "Author a new HTML, PDF, or DOCX file from markdown input"),
+                new ToolAction(ACTION_APPEND, "Append markdown to a draft file for incremental large-document authoring"),
+                new ToolAction(ACTION_RENDER, "Convert an accumulated markdown draft into the target output format")
+        );
+    }
+
+    @Override
+    public String description() {
+        return """
+                Read and write rich document formats. \
+                'readDocument' extracts text from PDF, DOCX, DOC, XLSX, PPTX, RTF, ODT, HTML, EPUB and more via Apache Tika. \
+                'writeDocument' authors HTML, PDF, or DOCX from markdown 'content'. \
+                'appendDocument' appends markdown to a workspace draft — use it for documents too large for one call's output budget: append repeatedly to the SAME path (a .md extension, NOT .docx/.pdf — text cannot be appended to a binary format), then 'renderDocument' to convert the accumulated draft. \
+                'renderDocument' renders an existing workspace markdown file ('sourcePath') to HTML, PDF, or DOCX. \
+                Standard markdown is supported (headings, emphasis, code, lists, quotes, tables, rules); XLSX and PPTX authoring is not. \
+                Paths are workspace-relative. If the target exists, write and render append -1, -2 etc. before the extension and report the actual path in the response — reference that path when replying to the user.""";
+    }
+
+    @Override
+    public String summary() {
+        return "Read and write rich document formats (PDF, DOCX, HTML) via the 'action' parameter: readDocument, writeDocument, appendDocument, renderDocument.";
+    }
+
+    @Override
+    public Map<String, Object> parameters() {
+        return Map.of(
+                SchemaKeys.TYPE, SchemaKeys.OBJECT,
+                SchemaKeys.PROPERTIES, Map.of(
+                        ARG_ACTION, Map.of(SchemaKeys.TYPE, SchemaKeys.STRING,
+                                SchemaKeys.ENUM, ACTIONS,
+                                SchemaKeys.DESCRIPTION, "The document operation to perform"),
+                        "path", Map.of(SchemaKeys.TYPE, SchemaKeys.STRING,
+                                SchemaKeys.DESCRIPTION, "File path relative to the agent workspace (target for writeDocument/renderDocument, source for readDocument)"),
+                        ARG_SOURCE_PATH, Map.of(SchemaKeys.TYPE, SchemaKeys.STRING,
+                                SchemaKeys.DESCRIPTION, "For renderDocument only: workspace-relative path to an existing markdown file whose contents should be rendered to 'path'."),
+                        ARG_CONTENT, Map.of(SchemaKeys.TYPE, SchemaKeys.STRING,
+                                SchemaKeys.DESCRIPTION, "Markdown content (for writeDocument and appendDocument)"),
+                        ARG_FORMAT, Map.of(SchemaKeys.TYPE, SchemaKeys.STRING,
+                                SchemaKeys.ENUM, WRITE_FORMATS,
+                                SchemaKeys.DESCRIPTION, "Output format for writeDocument/renderDocument: html, pdf, or docx. If omitted, inferred from the target path extension.")
+                ),
+                SchemaKeys.REQUIRED, List.of(ARG_ACTION, "path")
+        );
+    }
+
+    @Override
+    public String execute(String argsJson, Agent agent) {
+        // execute() is the text-only fallback; the dispatcher uses executeRich(), which
+        // additionally carries a written PDF/DOCX/HTML back as a downloadable attachment
+        // (JCLAW-765). Delegating keeps one dispatch path — see GenerateImageTool.
+        return executeRich(argsJson, agent).text();
+    }
+
+    @Override
+    public ToolRegistry.ToolResult executeRich(String argsJson, Agent agent) {
+        var args = JsonParser.parseString(argsJson).getAsJsonObject();
+        var action = args.get(ARG_ACTION).getAsString();
+        var relativePath = args.get("path").getAsString();
+
+        Path target;
+        try {
+            target = AgentService.acquireWorkspacePath(agent.name, relativePath);
+        } catch (SecurityException _) {
+            return ToolRegistry.ToolResult.text(
+                    "Error: Path '%s' escapes the workspace directory.".formatted(relativePath));
+        }
+
+        return switch (action) {
+            case ACTION_READ -> ToolRegistry.ToolResult.text(readDocument(target));
+            case ACTION_APPEND, "appendFile" -> {
+                var content = JsonArgs.optString(args, ARG_CONTENT, "");
+                yield ToolRegistry.ToolResult.text(appendDocument(target, relativePath, content));
+            }
+            case ACTION_WRITE -> {
+                var content = JsonArgs.optString(args, ARG_CONTENT, "");
+                var format = JsonArgs.optString(args, ARG_FORMAT);
+                yield richResult(writeDocument(target, relativePath, content, format));
+            }
+            case ACTION_RENDER -> {
+                if (!args.has(ARG_SOURCE_PATH) || args.get(ARG_SOURCE_PATH).isJsonNull()) {
+                    yield ToolRegistry.ToolResult.text(
+                            "Error: renderDocument requires 'sourcePath' (workspace-relative markdown file to render).");
+                }
+                var sourceRelative = args.get(ARG_SOURCE_PATH).getAsString();
+                Path source;
+                try {
+                    source = AgentService.acquireWorkspacePath(agent.name, sourceRelative);
+                } catch (SecurityException _) {
+                    yield ToolRegistry.ToolResult.text(
+                            "Error: sourcePath '%s' escapes the workspace directory.".formatted(sourceRelative));
+                }
+                if (!Files.exists(source)) {
+                    yield ToolRegistry.ToolResult.text("Error: sourcePath not found: %s".formatted(sourceRelative));
+                }
+                String content;
+                try {
+                    content = Files.readString(source);
+                } catch (IOException e) {
+                    yield ToolRegistry.ToolResult.text("Error reading sourcePath: %s".formatted(e.getMessage()));
+                }
+                var format = JsonArgs.optString(args, ARG_FORMAT);
+                yield richResult(writeDocument(target, relativePath, content, format));
+            }
+            default -> ToolRegistry.ToolResult.text("Error: Unknown action '%s'. Valid actions: %s"
+                    .formatted(action, String.join(", ", ACTIONS)));
+        };
+    }
+
+    /** Outcome of a write/render: the text response, plus (on success) the produced
+     *  file and its resolved format so {@link #richResult} can carry the bytes as a
+     *  downloadable attachment. On any error path, {@code file} is null. */
+    private record Written(String text, @Nullable Path file, @Nullable String format) {
+        static Written error(String text) { return new Written(text, null, null); }
+    }
+
+    /**
+     * Wrap a write/render outcome. On success the produced document is carried as a
+     * {@link GeneratedAttachment} so the run pipeline persists it as a downloadable
+     * {@code MessageAttachment} (JCLAW-765) — the same structured path
+     * {@code generate_image} uses for images, and what lets an app fetch a rendered
+     * PDF back via {@code GET /api/apps/<slug>/files/<uuid>}. On error, or if the
+     * just-written file can't be re-read, it degrades to text (the file is still on
+     * disk and linked from the text response).
+     */
+    private static ToolRegistry.ToolResult richResult(Written w) {
+        if (w.file() == null) {
+            return ToolRegistry.ToolResult.text(w.text());
+        }
+        try {
+            var bytes = Files.readAllBytes(w.file());
+            var att = new GeneratedAttachment(
+                    bytes, mimeForFormat(w.format()), null, w.file().getFileName().toString());
+            return ToolRegistry.ToolResult.withAttachments(w.text(), null, List.of(att));
+        } catch (IOException _) {
+            return ToolRegistry.ToolResult.text(w.text());
+        }
+    }
+
+    private static String mimeForFormat(@Nullable String format) {
+        return switch (format) {
+            case "pdf" -> "application/pdf";
+            case "docx" -> "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+            case null, default -> "text/html";
+        };
+    }
+
+    private Written writeDocument(Path target, String relativePath, @Nullable String content, @Nullable String format) {
+        if (content == null || content.isEmpty()) {
+            return Written.error("Error: writeDocument requires 'content' (markdown).");
+        }
+        if (content.length() > MAX_WRITE_MARKDOWN_CHARS) {
+            return Written.error("Error: Markdown content exceeds write limit (%d chars). Content length: %d chars."
+                    .formatted(MAX_WRITE_MARKDOWN_CHARS, content.length()));
+        }
+
+        var resolved = resolveFormat(format, relativePath);
+        if (resolved == null) {
+            return Written.error(
+                    "Error: Could not determine output format. Provide 'format' (html, pdf, or docx) or use a matching path extension.");
+        }
+        if (!WRITE_FORMATS.contains(resolved)) {
+            return Written.error("Error: Unsupported format '%s'. Supported: %s."
+                    .formatted(resolved, String.join(", ", WRITE_FORMATS)));
+        }
+
+        // The resolved format is authoritative for the file's bytes, so the
+        // filename's extension must agree with it. The appendDocument ->
+        // renderDocument flow drafts into a .md file, then renders it with an
+        // explicit format; without this a PDF/DOCX would be written to a path
+        // still named ".md" — a file whose name misreports its contents.
+        if (!resolved.equals(resolveFormat(null, relativePath))) {
+            var corrected = withFormatExtension(target.getFileName().toString(), resolved);
+            relativePath = replaceFinalSegment(relativePath, corrected);
+            target = target.resolveSibling(corrected);
+        }
+
+        // Avoid clobbering existing files. If the target exists we pick the next
+        // free " (N).ext" slot in the same parent directory. Both the filesystem
+        // target and the relativePath string we report back must be updated so
+        // the markdown download link the LLM echoes into chat actually resolves
+        // to the file we just wrote.
+        var finalTarget = resolveNonConflicting(target);
+        if (!finalTarget.equals(target)) {
+            relativePath = replaceFinalSegment(relativePath, finalTarget.getFileName().toString());
+            target = finalTarget;
+        }
+
+        try {
+            switch (resolved) {
+                case "html" -> DocumentWriter.writeHtml(target, content);
+                case "pdf" -> DocumentWriter.writePdf(target, content);
+                case "docx" -> DocumentWriter.writeDocx(target, content);
+                default -> throw new IllegalStateException(
+                        "unreachable: resolved was validated against WRITE_FORMATS: " + resolved);
+            }
+            long size = Files.size(target);
+            var fileName = target.getFileName().toString();
+            var text = ("Document written: %s (%s, %d bytes). "
+                    + "IMPORTANT: in your reply to the user, include this exact markdown link so they can download the file: [%s](%s)")
+                    .formatted(relativePath, resolved, size, fileName, relativePath);
+            return new Written(text, target, resolved);
+        } catch (IOException e) {
+            return Written.error("Error writing document: %s".formatted(e.getMessage()));
+        } catch (RuntimeException e) {
+            return Written.error("Error rendering document: %s".formatted(e.getMessage()));
+        }
+    }
+
+    private static final List<String> BINARY_EXTENSIONS = List.of("docx", "pdf", "xlsx", "pptx");
+
+    private String appendDocument(Path target, String relativePath, @Nullable String content) {
+        if (content == null || content.isEmpty()) {
+            return "Error: appendDocument requires 'content' (markdown to append).";
+        }
+        // Reject binary-format targets. The LLM sometimes tries to append text
+        // directly to a .docx/.pdf path — that produces a corrupt binary. Point
+        // it at a .md draft file instead.
+        int dot = relativePath.lastIndexOf('.');
+        if (dot >= 0) {
+            var ext = relativePath.substring(dot + 1).toLowerCase(Locale.ROOT);
+            if (BINARY_EXTENSIONS.contains(ext)) {
+                var stem = relativePath.substring(0, dot);
+                return ("Error: Cannot append text to a binary format (.%s). "
+                        + "Use a .md draft file instead: appendDocument(path=\"%s.md\", content=...), "
+                        + "then renderDocument(sourcePath=\"%s.md\", path=\"%s\") to produce the final .%s.")
+                        .formatted(ext, stem, stem, relativePath, ext);
+            }
+        }
+        try {
+            Files.createDirectories(target.getParent());
+            if (Files.exists(target)) {
+                Files.writeString(target, content,
+                        StandardOpenOption.APPEND);
+                long size = Files.size(target);
+                return "Appended %d chars to %s (total %d bytes). Call renderDocument when all chunks are added."
+                        .formatted(content.length(), relativePath, size);
+            }
+            Files.writeString(target, content);
+            return "Draft created: %s (%d chars). Use appendDocument for more chunks, then renderDocument to produce the final document."
+                    .formatted(relativePath, content.length());
+        } catch (IOException e) {
+            return "Error appending to draft: %s".formatted(e.getMessage());
+        }
+    }
+
+    /**
+     * Return {@code desired} if no file sits at that path, otherwise the first
+     * " (N)" sibling that's free. Public so {@code DocumentsToolTest} in the
+     * default test package can exercise it against a tmp dir without going
+     * through Agent/workspace plumbing. The loop cap of 1000 is arbitrarily
+     * high — any legitimate workspace will land well before it, and an
+     * uncapped loop is a footgun if something else is racing writes into the
+     * same directory.
+     */
+    public static Path resolveNonConflicting(Path desired) {
+        if (!Files.exists(desired)) return desired;
+        // Callers resolve against the agent workspace, so the path always has a parent.
+        var parent = Objects.requireNonNull(desired.getParent(), "desired path has no parent");
+        var name = desired.getFileName().toString();
+        int dot = name.lastIndexOf('.');
+        var base = (dot <= 0) ? name : name.substring(0, dot);
+        var ext = (dot <= 0) ? "" : name.substring(dot);
+        for (int i = 1; i < 1000; i++) {
+            var candidate = parent.resolve(base + "-" + i + ext);
+            if (!Files.exists(candidate)) return candidate;
+        }
+        return desired;
+    }
+
+    /**
+     * Replace the final path segment of a relative path string (slash-separated,
+     * as produced by the LLM). Used to mirror the renamed target filename back
+     * into the relativePath reported to the model and echoed into the download
+     * link in chat. Workspaces are unix-style, so {@code /} is the canonical
+     * separator; no Windows backslash handling is needed.
+     */
+    public static String replaceFinalSegment(String relativePath, String newFileName) {
+        int slash = relativePath.lastIndexOf('/');
+        return slash < 0 ? newFileName : relativePath.substring(0, slash + 1) + newFileName;
+    }
+
+    /**
+     * Replace (or append) a filename's extension with {@code format}'s canonical
+     * extension — html/pdf/docx, each identical to its format name. Operates on
+     * a bare filename (no path separators); a leading-dot dotfile with no other
+     * dot gets the extension appended rather than being treated as all-suffix.
+     * Public + static so {@code DocumentsToolTest} can exercise the pure logic.
+     */
+    public static String withFormatExtension(String fileName, String format) {
+        int dot = fileName.lastIndexOf('.');
+        return dot > 0 ? fileName.substring(0, dot + 1) + format : fileName + "." + format;
+    }
+
+    private static @Nullable String resolveFormat(@Nullable String explicit, String path) {
+        if (explicit != null && !explicit.isBlank()) {
+            return explicit.toLowerCase(Locale.ROOT);
+        }
+        int dot = path.lastIndexOf('.');
+        if (dot < 0 || dot == path.length() - 1) return null;
+        var ext = path.substring(dot + 1).toLowerCase(Locale.ROOT);
+        return switch (ext) {
+            case "htm", "html" -> "html";
+            case "pdf" -> "pdf";
+            case "docx" -> "docx";
+            default -> null;
+        };
+    }
+
+    /**
+     * Extract text from a rich document. Returns partial text when the per-file
+     * character cap is reached, with a trailing truncation notice. Image-only
+     * inputs and image-only PDFs go through Tika's TesseractOCRParser; when
+     * that parser returns blank because tesseract isn't on PATH, the response
+     * names the missing dependency rather than silently saying "no text"
+     * (JCLAW-177). Public + static so {@code DocumentsToolTest} can drive the
+     * Tika path without going through Agent/workspace plumbing.
+     */
+    // Nested try/catch (S1141) intentional: the inner try-with-resources lets us
+    // distinguish Tika's WriteLimitReached (a SAXException subclass that signals
+    // successful truncation, not failure) from other SAX failures, while the outer
+    // catch handles the orthogonal TikaException + IOException paths.
+    @SuppressWarnings("java:S1141")
+    public static String readDocument(Path path) {
+        try {
+            if (!Files.exists(path)) return "Error: File not found: %s".formatted(path.getFileName());
+            var size = Files.size(path);
+            if (size > MAX_DOCUMENT_READ_BYTES) {
+                return "Error: Document exceeds read limit (%d bytes). File size: %d bytes."
+                        .formatted(MAX_DOCUMENT_READ_BYTES, size);
+            }
+
+            var parser = TikaHolder.PARSER;
+            var handler = new BodyContentHandler(MAX_DOCUMENT_TEXT_CHARS);
+            var metadata = new Metadata();
+            boolean ocrActive = ocrEnabled();
+            boolean truncated = false;
+            try (var in = TikaInputStream.get(path)) {
+                parser.parse(in, handler, metadata, buildParseContext(ocrActive));
+            } catch (SAXException e) {
+                if (!e.getClass().getSimpleName().contains("WriteLimitReached")) {
+                    return "Error parsing document: %s".formatted(e.getMessage());
+                }
+                truncated = true;
+            }
+            var text = handler.toString();
+            if (text.isBlank()) {
+                if (!ocrActive) {
+                    return "Error: OCR is disabled in Settings, so '"
+                            + path.getFileName() + "' (no extractable text layer) "
+                            + "could not be read. Re-enable OCR at Settings → OCR "
+                            + "to read scanned PDFs and image-only documents.";
+                }
+                var hint = ocrUnavailableHint();
+                return "(Document parsed but contained no extractable text: "
+                        + path.getFileName() + ")"
+                        + (hint == null ? "" : " " + hint);
+            }
+            if (truncated) {
+                text += "\n\n[... truncated at " + MAX_DOCUMENT_TEXT_CHARS + " characters ...]";
+            }
+            return text;
+        } catch (TikaException e) {
+            return "Error parsing document: %s".formatted(e.getMessage());
+        } catch (IOException e) {
+            return "Error reading document: %s".formatted(e.getMessage());
+        }
+    }
+
+    public static final String KEY_OCR_LANGUAGES = "ocr.tesseract.languages";
+    public static final String KEY_OCR_TIMEOUT = "ocr.tesseract.timeout";
+    public static final String KEY_OCR_PDF_STRATEGY = "ocr.pdf.strategy";
+
+    /**
+     * Build a {@link ParseContext} configured for the current OCR toggle.
+     * When {@code ocrActive} is true, pre-loads TesseractOCRConfig and
+     * PDFParserConfig so image inputs (and image-only PDFs) reach Tesseract,
+     * with tunables from Settings &gt; OCR. When false, explicitly opts out:
+     * Tika's AutoDetectParser would otherwise invoke TesseractOCRParser by
+     * default whenever the binary is on PATH, ignoring an empty ParseContext.
+     * Each parse rebuilds the context so live config + toggle edits apply on
+     * the next call.
+     */
+    private static ParseContext buildParseContext(boolean ocrActive) {
+        var ctx = new ParseContext();
+
+        var ocr = new TesseractOCRConfig();
+        if (ocrActive) {
+            ocr.setLanguage(configOrDefault(KEY_OCR_LANGUAGES, "eng"));
+            ocr.setTimeoutMillis(1000L * positiveIntOrDefault(KEY_OCR_TIMEOUT, 60));
+            applyTesseractPath(ocr);
+        }
+        ocr.setSkipOcr(!ocrActive);
+        ctx.set(TesseractOCRConfig.class, ocr);
+
+        var pdfOcr = new OcrConfig();
+        pdfOcr.setStrategy(ocrActive
+                ? parsePdfStrategy(configOrDefault(KEY_OCR_PDF_STRATEGY, "auto"))
+                : OcrConfig.Strategy.NO_OCR);
+        var pdf = new PDFParserConfig();
+        pdf.setOcr(pdfOcr);
+        pdf.setExtractInlineImages(ocrActive);
+        ctx.set(PDFParserConfig.class, pdf);
+
+        return ctx;
+    }
+
+    private static String stringOrDefault(String key, String fallback) {
+        var raw = Play.configuration != null
+                ? Play.configuration.getProperty(key) : null;
+        return (raw == null || raw.isBlank()) ? fallback : raw.trim();
+    }
+
+    private static String configOrDefault(String key, String fallback) {
+        var raw = ConfigService.get(key);
+        return (raw == null || raw.isBlank()) ? fallback : raw.trim();
+    }
+
+    private static int positiveIntOrDefault(String key, int fallback) {
+        var raw = ConfigService.get(key);
+        if (raw == null || raw.isBlank()) return fallback;
+        try {
+            int n = Integer.parseInt(raw.trim());
+            return n > 0 ? n : fallback;
+        } catch (NumberFormatException _) {
+            return fallback;
+        }
+    }
+
+    private static OcrConfig.Strategy parsePdfStrategy(String s) {
+        return switch (s.toLowerCase(Locale.ROOT)) {
+            case "no_ocr" -> OcrConfig.Strategy.NO_OCR;
+            case "ocr_only" -> OcrConfig.Strategy.OCR_ONLY;
+            case "ocr_and_text_extraction" -> OcrConfig.Strategy.OCR_AND_TEXT_EXTRACTION;
+            default -> OcrConfig.Strategy.AUTO;
+        };
+    }
+
+    /**
+     * JCLAW-1107: honor {@code ocr.tesseract.path} so OCR works when tesseract is installed
+     * somewhere other than PATH — the default on Windows, whose installer does not add itself.
+     * setTesseractPath normalizes the value and rejects a non-directory, so a typo degrades to
+     * a PATH lookup with a WARN rather than silently disabling OCR.
+     */
+    private static void applyTesseractPath(TesseractOCRConfig ocr) {
+        var dir = stringOrDefault(TikaHolder.OCR_PATH_KEY, "");
+        if (dir.isEmpty()) return;
+        try {
+            ocr.setTesseractPath(dir);
+        } catch (TikaConfigException e) {
+            Logger.warn("OCR: %s=%s could not be applied (%s); falling back to a PATH lookup",
+                    TikaHolder.OCR_PATH_KEY, dir, e.getMessage());
+        }
+    }
+
+    /**
+     * The user-facing kill switch for the Tesseract OCR backend, surfaced as
+     * the toggle in Settings → OCR. Reads the Config DB on every parse so a
+     * UI-driven flip applies on the next call without a restart. Defaults to
+     * true so a fresh install with no row seeded is still functional.
+     */
+    private static boolean ocrEnabled() {
+        return "true".equalsIgnoreCase(
+                ConfigService.get("ocr.tesseract.enabled", "true"));
+    }
+
+    /**
+     * Build an actionable error fragment when Tika returns empty text and the
+     * tesseract binary probe came back unavailable. Returns {@code null} when
+     * the probe says tesseract is fine — in that case an empty extraction is
+     * a real "no text in this document" result and shouldn't be muddied with
+     * a misleading install hint.
+     */
+    private static @Nullable String ocrUnavailableHint() {
+        var probe = OcrHealthProbe.lastResult();
+        if (probe.available()) return null;
+        return "Note: tesseract is unavailable (" + probe.reason() + "). "
+                + "OCR-dependent inputs (image-only PDFs, plain images, scanned documents) "
+                + "require tesseract. Install: " + OcrInstallHint.current();
+    }
+}

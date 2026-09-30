@@ -1,0 +1,123 @@
+package tools;
+
+import agents.ToolAction;
+import agents.ToolRegistry;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonParser;
+import models.Agent;
+import org.jspecify.annotations.Nullable;
+import utils.JsonArgs;
+
+import java.util.List;
+import java.util.Map;
+
+public class CheckListTool implements ToolRegistry.Tool {
+
+    private static final String FIELD_CONTENT = "content";
+    private static final String FIELD_STATUS = "status";
+    private static final String FIELD_ACTIVE_FORM = "activeForm";
+
+    @Override
+    public String name() { return "checklist"; }
+
+    @Override
+    public String category() { return "Utilities"; }
+
+    @Override
+    public String icon() { return "check"; }
+
+    @Override
+    public String shortDescription() {
+        return "Create and manage structured checklists to track multi-step work in progress.";
+    }
+
+    @Override
+    public List<ToolAction> actions() {
+        return List.of(
+                new ToolAction("update", "Submit a checklist with items and statuses; at most one item may be in_progress at a time")
+        );
+    }
+
+    @Override
+    public String description() {
+        return """
+                Create and manage a structured checklist for tracking multi-step work. \
+                Submit a list of items; each item requires three fields: \
+                `content` (imperative form, e.g. "Run tests"), \
+                `status` (one of pending, in_progress, completed), and \
+                `activeForm` (present-progressive form, e.g. "Running tests"). \
+                At most one item may be in_progress at a time (zero is also valid, e.g. before starting or after finishing).""";
+    }
+
+    @Override
+    public Map<String, Object> parameters() {
+        return Map.of(
+                SchemaKeys.TYPE, SchemaKeys.OBJECT,
+                SchemaKeys.PROPERTIES, Map.of(
+                        SchemaKeys.ITEMS, Map.of(
+                                SchemaKeys.TYPE, SchemaKeys.ARRAY,
+                                SchemaKeys.ITEMS, Map.of(
+                                        SchemaKeys.TYPE, SchemaKeys.OBJECT,
+                                        SchemaKeys.PROPERTIES, Map.of(
+                                                FIELD_CONTENT, Map.of(SchemaKeys.TYPE, SchemaKeys.STRING),
+                                                FIELD_STATUS, Map.of(SchemaKeys.TYPE, SchemaKeys.STRING,
+                                                        SchemaKeys.ENUM, List.of("pending", "in_progress", "completed")),
+                                                FIELD_ACTIVE_FORM, Map.of(SchemaKeys.TYPE, SchemaKeys.STRING)
+                                        ),
+                                        SchemaKeys.REQUIRED, List.of(FIELD_CONTENT, FIELD_STATUS, FIELD_ACTIVE_FORM)
+                                )
+                        )
+                ),
+                SchemaKeys.REQUIRED, List.of(SchemaKeys.ITEMS)
+        );
+    }
+
+    /** Pure validation — returns a string, mutates no state. Safe for any
+     *  number of parallel invocations. */
+    @Override public boolean parallelSafe() { return true; }
+
+    @Override
+    public String execute(String argsJson, Agent agent) {
+        var args = JsonParser.parseString(argsJson).getAsJsonObject();
+        if (!args.has(SchemaKeys.ITEMS) || !args.get(SchemaKeys.ITEMS).isJsonArray()) {
+            return "Error: `items` is required and must be an array.";
+        }
+        var itemsArray = args.getAsJsonArray(SchemaKeys.ITEMS);
+
+        int inProgressCount = 0;
+        for (int i = 0; i < itemsArray.size(); i++) {
+            var validation = validateItem(itemsArray.get(i), i);
+            if (validation.error() != null) return validation.error();
+            if (validation.inProgress()) inProgressCount++;
+        }
+
+        if (inProgressCount > 1) {
+            return "Error: At most one item may be in_progress. Found %d.".formatted(inProgressCount);
+        }
+
+        return "Checklist updated successfully (%d items).".formatted(itemsArray.size());
+    }
+
+    /** Per-item validation result. {@code error} non-null short-circuits the loop. */
+    private record ItemValidation(@Nullable String error, boolean inProgress) {
+        static ItemValidation fail(String msg) { return new ItemValidation(msg, false); }
+        static ItemValidation ok(boolean inProgress) { return new ItemValidation(null, inProgress); }
+    }
+
+    private static ItemValidation validateItem(JsonElement el, int i) {
+        if (!el.isJsonObject()) {
+            return ItemValidation.fail("Error: Item %d must be an object.".formatted(i));
+        }
+        var item = el.getAsJsonObject();
+        String content = JsonArgs.optString(item, FIELD_CONTENT);
+        if (content == null) return ItemValidation.fail("Error: Item %d is missing required field `content`.".formatted(i));
+        String status = JsonArgs.optString(item, FIELD_STATUS);
+        if (status == null) return ItemValidation.fail("Error: Item %d is missing required field `status`.".formatted(i));
+        String activeForm = JsonArgs.optString(item, FIELD_ACTIVE_FORM);
+        if (activeForm == null) return ItemValidation.fail("Error: Item %d is missing required field `activeForm`.".formatted(i));
+
+        if (content.isBlank()) return ItemValidation.fail("Error: All items must have non-blank content.");
+        if (activeForm.isBlank()) return ItemValidation.fail("Error: All items must have non-blank activeForm.");
+        return ItemValidation.ok("in_progress".equals(status));
+    }
+}

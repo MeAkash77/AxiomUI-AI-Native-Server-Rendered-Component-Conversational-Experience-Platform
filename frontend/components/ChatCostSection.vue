@@ -1,0 +1,1854 @@
+<script setup lang="ts">
+/**
+ * Fleet-level cost dashboard section (JCLAW-28). Renders above the Chat
+ * Performance section on the home dashboard. Aggregates persisted token
+ * usage and cost across all conversations matching the operator's filter
+ * combination of agent + channel + time window.
+ *
+ * <p>Two visual contrasts with Chat Performance kept deliberately:
+ * <ul>
+ *   <li>No reset button. Cost is durable persisted data; mixing the
+ *       reset affordance from the latency section would mislead.</li>
+ *   <li>Time window selector (7d/30d/all-time). Latency is in-memory
+ *       and trivially "current"; cost spans whatever history exists.</li>
+ * </ul>
+ *
+ * <p>Single fetch per window change; agent + channel filter changes are
+ * client-side over the loaded rows. Keeps filter switches instant and
+ * the network surface small.
+ */
+import {
+  ArrowDownTrayIcon, ChartBarIcon, ChevronDownIcon, ChevronUpIcon,
+  InformationCircleIcon, TableCellsIcon,
+} from '@heroicons/vue/24/outline'
+import type { Agent } from '~/types/api'
+import {
+  computeFleetCost,
+  formatCostUsd,
+  formatStatCurrency,
+  listChannelsInRows,
+  type FleetCostBreakdown,
+  type FleetCostFilter,
+  type FleetCostPerModel,
+  type FleetCostRow,
+  type MessageUsage,
+} from '~/utils/usage-cost'
+
+interface CostResponse {
+  since: string
+  rows: FleetCostRow[]
+}
+
+const props = defineProps<{
+  agents: Agent[] | null | undefined
+}>()
+
+type WindowKey = '7d' | '30d' | 'all'
+type CostView = 'table' | 'chart'
+
+const WINDOW_LABELS: Record<WindowKey, string> = {
+  '7d': 'Last 7 days',
+  '30d': 'Last 30 days',
+  'all': 'All time',
+}
+
+// Short labels for the segmented window selector (mirrors Chat Compression's 7d/30d/All control).
+const WINDOWS: { key: WindowKey, label: string }[] = [
+  { key: '7d', label: '7d' },
+  { key: '30d', label: '30d' },
+  { key: 'all', label: 'All' },
+]
+
+const STORAGE_KEY = 'jclaw:chat-cost:settings'
+
+const selectedWindow = ref<WindowKey>('30d')
+const selectedAgentId = ref<number | null>(null)
+const selectedChannel = ref<string | null>(null)
+const view = ref<CostView>('table')
+
+// Cost-column tooltip state. Teleport-to-body so the popover escapes
+// the table wrapper's overflow-x-auto clip (which implicitly clips Y
+// too, masking an in-flow absolute-positioned tooltip — see the
+// JCLAW-292-era cost-table polish for the original repro). Coords are
+// expressed as right/bottom offsets from the viewport edges so the
+// tooltip lands above the icon, right-aligned, without needing to
+// know its own height up front.
+const costTooltipVisible = ref(false)
+const costTooltipBottom = ref(0)
+const costTooltipRight = ref(0)
+function showCostTooltip(event: MouseEvent | FocusEvent) {
+  const el = event.currentTarget as HTMLElement | null
+  if (!el) return
+  const r = el.getBoundingClientRect()
+  costTooltipBottom.value = globalThis.innerHeight - r.top + 4
+  costTooltipRight.value = globalThis.innerWidth - r.right
+  keepCostTooltip()
+  costTooltipVisible.value = true
+  globalThis.addEventListener('keydown', hideCostTooltipOnEscape)
+}
+let costTooltipHideTimer: ReturnType<typeof setTimeout> | null = null
+// The delay lets the pointer cross the 4px gap onto the tooltip, which stays open while hovered (WCAG 1.4.13).
+function scheduleHideCostTooltip() {
+  keepCostTooltip()
+  costTooltipHideTimer = setTimeout(hideCostTooltip, 150)
+}
+function keepCostTooltip() {
+  if (costTooltipHideTimer) clearTimeout(costTooltipHideTimer)
+  costTooltipHideTimer = null
+}
+function hideCostTooltip() {
+  keepCostTooltip()
+  costTooltipVisible.value = false
+  globalThis.removeEventListener('keydown', hideCostTooltipOnEscape)
+}
+function hideCostTooltipOnEscape(e: KeyboardEvent) {
+  if (e.key === 'Escape') hideCostTooltip()
+}
+onBeforeUnmount(hideCostTooltip)
+// Provider-chip filter for the Subscription subsection. When set, the
+// subscription per-model table + tfoot Total + Combined Total all narrow
+// to that provider's models and prorated bill. Click the same chip again
+// to clear. Persisted alongside the other filter dropdowns.
+const selectedSubscriptionProvider = ref<string | null>(null)
+
+// Per-token chip filter — same toggle semantics as the subscription chip,
+// scoping the per-token table / chart / totals to one provider. Persisted
+// alongside the rest.
+const selectedPerTokenProvider = ref<string | null>(null)
+
+// Persist filter choices across page reloads — same convention as Chat
+// Performance's channel selector. Failure-tolerant for SSR / privacy-mode.
+onMounted(() => {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY)
+    if (!raw) return
+    const parsed = JSON.parse(raw) as Partial<{
+      window: WindowKey
+      agentId: number | null
+      channel: string | null
+      view: CostView
+      subscriptionProvider: string | null
+      perTokenProvider: string | null
+    }>
+    if (parsed.window && (parsed.window in WINDOW_LABELS)) selectedWindow.value = parsed.window
+    if (parsed.agentId !== undefined) selectedAgentId.value = parsed.agentId
+    if (parsed.channel !== undefined) selectedChannel.value = parsed.channel
+    if (parsed.view === 'chart' || parsed.view === 'table') view.value = parsed.view
+    if (parsed.subscriptionProvider !== undefined) selectedSubscriptionProvider.value = parsed.subscriptionProvider
+    if (parsed.perTokenProvider !== undefined) selectedPerTokenProvider.value = parsed.perTokenProvider
+  }
+  catch { /* ignore */ }
+})
+
+function persistSettings() {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({
+      window: selectedWindow.value,
+      agentId: selectedAgentId.value,
+      channel: selectedChannel.value,
+      view: view.value,
+      subscriptionProvider: selectedSubscriptionProvider.value,
+      perTokenProvider: selectedPerTokenProvider.value,
+    }))
+  }
+  catch { /* ignore */ }
+}
+
+watch(
+  [selectedWindow, selectedAgentId, selectedChannel, view, selectedSubscriptionProvider, selectedPerTokenProvider],
+  persistSettings,
+)
+
+// Compute the ISO `since` param for the current window. "all" sends a
+// far-past date so the server returns everything; cleaner than special-
+// casing a missing param on both sides.
+const sinceParam = computed(() => {
+  if (selectedWindow.value === 'all') {
+    return new Date(0).toISOString()
+  }
+  const days = selectedWindow.value === '7d' ? 7 : 30
+  const ms = Date.now() - days * 24 * 60 * 60 * 1000
+  return new Date(ms).toISOString()
+})
+
+const { data: costData, refresh, pending } = useFetch<CostResponse>('/api/metrics/cost', {
+  query: { since: sinceParam },
+  default: () => ({ since: '', rows: [] }),
+  watch: [sinceParam],
+})
+
+// Track whether the first fetch has resolved so we can suppress the
+// "Loading cost data…" skeleton on subsequent refreshes. useFetch keeps
+// the prior `data` populated during a refresh, but `pending` still flips
+// true → false each tick — naively binding the skeleton to `pending`
+// causes the panel to flash on every parent poll.
+const hasLoadedOnce = ref(false)
+watch(pending, (p) => {
+  if (!p) hasLoadedOnce.value = true
+})
+
+// JCLAW-289 update: the parent dashboard (pages/index.vue) owns the single
+// 5 s tick and drives our refresh() via a template ref, so this component
+// no longer keeps its own setInterval. Centralising the timer aligns all
+// three panels' refreshes on the same tick and eliminates the per-panel
+// pending flicker that staggered timers caused. defineExpose at the
+// bottom keeps refresh() callable from outside.
+
+const rows = computed<FleetCostRow[]>(() => costData.value?.rows ?? [])
+
+// JCLAW-280: provider modality + monthly subscription price. Drives the
+// per-token vs subscription partition of the Chat Cost dashboard. Defaults
+// (empty maps) are safe: every row is treated as PER_TOKEN and the
+// subscription subsection collapses to nothing until /api/providers loads.
+interface ProviderInfo {
+  name: string
+  paymentModality: 'PER_TOKEN' | 'SUBSCRIPTION'
+  subscriptionMonthlyUsd: number
+  supportedModalities: ('PER_TOKEN' | 'SUBSCRIPTION')[]
+}
+const { data: providersInfo } = useFetch<ProviderInfo[]>('/api/providers', {
+  default: () => [],
+})
+
+const modalityByProvider = computed(() => {
+  const m = new Map<string, 'PER_TOKEN' | 'SUBSCRIPTION'>()
+  for (const p of providersInfo.value ?? []) m.set(p.name, p.paymentModality)
+  return m
+})
+
+/**
+ * Resolve a row's billing provider — the one that actually served the
+ * turn, not the conversation's owning provider. Sources from
+ * usageJson.modelProvider (snapshotted at emission time per JCLAW-107)
+ * because that's what reflects per-turn billing reality when an agent
+ * swaps providers mid-conversation. Falls back to the conversation-level
+ * r.modelProvider only when the snapshot is missing (very old rows from
+ * before JCLAW-107 captured the field).
+ */
+function rowBillingProvider(r: FleetCostRow): string | undefined {
+  try {
+    const u = JSON.parse(r.usageJson) as MessageUsage
+    if (u.modelProvider) return u.modelProvider
+  }
+  catch { /* fall through to conversation-level */ }
+  return r.modelProvider
+}
+
+// Partition raw rows by modality. Rows whose provider doesn't match a
+// known SUBSCRIPTION provider fall into the per-token bucket — that covers
+// rows from registry-removed providers and any pre-JCLAW-280 rows where
+// the modality wasn't yet a concept.
+const perTokenRows = computed<FleetCostRow[]>(() =>
+  rows.value.filter(r => modalityByProvider.value.get(rowBillingProvider(r) ?? '') !== 'SUBSCRIPTION'),
+)
+const subscriptionRows = computed<FleetCostRow[]>(() =>
+  rows.value.filter(r => modalityByProvider.value.get(rowBillingProvider(r) ?? '') === 'SUBSCRIPTION'),
+)
+
+// Configured subscription providers. Drives the fee accrual — the
+// operator is paying the monthly regardless of in-window activity, so a
+// quiet week still shows the fee. Distinct from
+// `subscriptionRows`-derived stats, which reflect only activity that
+// actually happened.
+const configuredSubscriptionProviders = computed(() => {
+  const out: ProviderInfo[] = []
+  for (const p of providersInfo.value ?? []) {
+    if (p.paymentModality === 'SUBSCRIPTION') out.push(p)
+  }
+  return out
+})
+
+// Display names for the configured-provider tooltip. Mirrors the
+// PROVIDER_LABELS map in settings.vue (small enough that duplicating is
+// cheaper than threading a shared util through). Unknown providers fall
+// back to their raw registry name.
+const PROVIDER_DISPLAY_NAMES: Record<string, string> = {
+  'ollama-cloud': 'Ollama Cloud',
+  'openrouter': 'OpenRouter',
+  'openai': 'OpenAI',
+  'together': 'TogetherAI',
+  'ollama-local': 'Ollama Local',
+  'lm-studio': 'LM Studio',
+}
+// JCLAW-280: per-provider subscription breakdown rows. Each row appears
+// in the Subscription tfoot just above the Total row, with the
+// pro-rated monthly fee in the Cost cell. The Total fee is the literal
+// sum of these rows, so the operator can see exactly which providers
+// are contributing how much. Computed lazily off windowDays so the
+// pro-rating updates when the operator switches the time window.
+const subscriptionProviderBreakdown = computed(() =>
+  configuredSubscriptionProviders.value.map(p => ({
+    name: p.name,
+    displayName: PROVIDER_DISPLAY_NAMES[p.name] ?? p.name,
+    proRatedFee: (Number(p.subscriptionMonthlyUsd) || 0) * (windowDays.value / 30),
+  })),
+)
+
+// Channel options: only channel kinds that have data in the loaded window.
+// Operator filtering by a channel that has no data would be confusing;
+// surfacing only-with-data matches Chat Performance's behavior.
+const availableChannels = computed(() => listChannelsInRows(rows.value))
+
+// Reset filters that no longer make sense as the data set changes.
+watchEffect(() => {
+  if (selectedChannel.value !== null
+    && !availableChannels.value.includes(selectedChannel.value)) {
+    selectedChannel.value = null
+  }
+})
+// Clear the subscription-chip filter if the operator removes that
+// provider from configuration (e.g., toggles modality on Settings).
+// Mirror the channel reset above so the chip can't get stuck pointing
+// at a provider that no longer renders.
+watchEffect(() => {
+  if (selectedSubscriptionProvider.value !== null
+    && !configuredSubscriptionProviders.value.some(p => p.name === selectedSubscriptionProvider.value)) {
+    selectedSubscriptionProvider.value = null
+  }
+})
+
+const filter = computed<FleetCostFilter>(() => ({
+  agentId: selectedAgentId.value,
+  channelType: selectedChannel.value,
+}))
+
+const breakdown = computed<FleetCostBreakdown>(() =>
+  computeFleetCost(rows.value, filter.value),
+)
+
+// Subscription rows narrowed by the chip filter. When no chip is
+// selected this just re-exports subscriptionRows. The unfiltered version
+// (subscriptionRows) is still needed for has-usage checks on the chips
+// themselves — otherwise selecting one chip would make every other chip
+// look like "no usage" and become un-clickable, trapping the operator
+// in the current selection.
+const filteredSubscriptionRows = computed<FleetCostRow[]>(() => {
+  const sel = selectedSubscriptionProvider.value
+  if (sel === null) return subscriptionRows.value
+  return subscriptionRows.value.filter(r => rowBillingProvider(r) === sel)
+})
+
+// JCLAW-280: per-modality breakdowns. The original `breakdown` stays as the
+// whole-fleet aggregate (still used by the agent/channel filter availability
+// logic and as the source of `hasData`); the partitioned breakdowns drive
+// the rendered subsections.
+// Per-token rows narrowed by the chip filter. When no chip is selected
+// this re-exports perTokenRows. Mirrors filteredSubscriptionRows.
+const filteredPerTokenRows = computed<FleetCostRow[]>(() => {
+  const sel = selectedPerTokenProvider.value
+  if (sel === null) return perTokenRows.value
+  return perTokenRows.value.filter(r => rowBillingProvider(r) === sel)
+})
+const perTokenBreakdown = computed<FleetCostBreakdown>(() =>
+  computeFleetCost(filteredPerTokenRows.value, filter.value),
+)
+// Unfiltered per-token breakdown — drives the provider cards, which must
+// list every provider regardless of the active chip. Mirrors
+// unfilteredSubscriptionBreakdown.
+const unfilteredPerTokenBreakdown = computed<FleetCostBreakdown>(() =>
+  computeFleetCost(perTokenRows.value, filter.value),
+)
+
+// Per-token provider rollup cards — total spend and average $/1M per
+// provider, the per-token analogue of a subscription card's effective
+// rate. avg $/1M = total cost ÷ (prompt + completion + reasoning) × 1M —
+// the same cached-excluded token key the rate math uses elsewhere (cached
+// ⊂ prompt). Built off the unfiltered breakdown so every provider shows
+// regardless of the active chip; only providers with paid activity get a
+// card, matching the per-model table's free-tier exclusion. Sorted by
+// spend descending so the priciest provider leads.
+const perTokenProviderBreakdown = computed(() => {
+  const byProvider = new Map<string, { cost: number, tokens: number }>()
+  for (const m of unfilteredPerTokenBreakdown.value.perModel) {
+    const provider = m.modelProvider
+    if (!provider) continue
+    const entry = byProvider.get(provider) ?? { cost: 0, tokens: 0 }
+    entry.cost += m.total
+    entry.tokens += m.prompt + m.completion + m.reasoning
+    byProvider.set(provider, entry)
+  }
+  return [...byProvider.entries()]
+    .filter(([, v]) => v.cost > 0)
+    .map(([name, v]) => ({
+      name,
+      displayName: PROVIDER_DISPLAY_NAMES[name] ?? name,
+      totalCost: v.cost,
+      avgPerMillion: v.tokens > 0 ? (v.cost / v.tokens) * 1_000_000 : null,
+    }))
+    .sort((a, b) => b.totalCost - a.totalCost)
+})
+
+// Clear the per-token chip if its provider drops out of the window (e.g.,
+// the operator changes the agent/channel filter so that provider no longer
+// has paid activity). Mirrors the subscription-chip reset. Placed after
+// perTokenProviderBreakdown so its immediate run doesn't hit the TDZ.
+watchEffect(() => {
+  if (selectedPerTokenProvider.value !== null
+    && !perTokenProviderBreakdown.value.some(p => p.name === selectedPerTokenProvider.value)) {
+    selectedPerTokenProvider.value = null
+  }
+})
+const subscriptionBreakdown = computed<FleetCostBreakdown>(() =>
+  computeFleetCost(filteredSubscriptionRows.value, filter.value),
+)
+// Unfiltered subscription breakdown — drives the chip-disabled state.
+// A chip is clickable only if its provider had at least one turn in the
+// window under the active agent/channel filters; the chip's "has usage"
+// check has to consult this, not the chip-filtered version above.
+const unfilteredSubscriptionBreakdown = computed<FleetCostBreakdown>(() =>
+  computeFleetCost(subscriptionRows.value, filter.value),
+)
+const subscriptionProvidersWithUsage = computed<Set<string>>(() => {
+  const set = new Set<string>()
+  for (const m of unfilteredSubscriptionBreakdown.value.perModel) {
+    if (m.turnCount > 0 && m.modelProvider) set.add(m.modelProvider)
+  }
+  return set
+})
+
+// Window length in days — used to pro-rate the subscription monthly fee.
+// For the "all time" window we fall back to the full row set's earliest
+// timestamp (not just subscription rows): the operator is asking "how
+// much did I spend over all my recorded activity?" and answering that
+// in terms of subscription-only data would understate the window when
+// the operator has months of per-token activity but only recently
+// started a subscription.
+const windowDays = computed(() => {
+  if (selectedWindow.value === '7d') return 7
+  if (selectedWindow.value === '30d') return 30
+  const allRows = rows.value
+  if (allRows.length === 0) return 30
+  let earliest = Date.now()
+  for (const r of allRows) {
+    const t = Date.parse(r.timestamp)
+    if (!Number.isNaN(t) && t < earliest) earliest = t
+  }
+  const spanMs = Math.max(0, Date.now() - earliest)
+  return Math.max(1, spanMs / (24 * 60 * 60 * 1000))
+})
+
+// Pro-rated subscription accrual = sum of monthly fees across every
+// configured subscription provider × (window_days / 30). Independent of
+// in-window activity — the operator is paying the monthly fee whether
+// they used the provider this week or not. When a chip filter is
+// active, this narrows to the selected provider's bill only, so the
+// Subscription tfoot Total and the Combined Total flow naturally to
+// that provider's number (e.g., $100 for Ollama Cloud rather than
+// $120 for the full configured stack).
+const subscriptionFee = computed(() => {
+  const sel = selectedSubscriptionProvider.value
+  if (sel !== null) {
+    const p = configuredSubscriptionProviders.value.find(p => p.name === sel)
+    return p ? (Number(p.subscriptionMonthlyUsd) || 0) * (windowDays.value / 30) : 0
+  }
+  let sumMonthly = 0
+  for (const p of configuredSubscriptionProviders.value) {
+    sumMonthly += Number(p.subscriptionMonthlyUsd) || 0
+  }
+  return sumMonthly * (windowDays.value / 30)
+})
+
+/**
+ * Toggle the subscription chip filter — click a chip to scope the
+ * subscription table to that provider; click the same chip again to
+ * clear back to the all-providers view. Routed through a helper so the
+ * disabled-chip case (non-selected + no-usage) can short-circuit
+ * without trying to set state.
+ */
+function onSubscriptionChipClick(name: string) {
+  if (selectedSubscriptionProvider.value === name) {
+    selectedSubscriptionProvider.value = null
+    return
+  }
+  if (!subscriptionProvidersWithUsage.value.has(name)) return
+  selectedSubscriptionProvider.value = name
+}
+
+/**
+ * Toggle the per-token chip filter. No disabled-state guard like the
+ * subscription chip needs — every per-token card represents a provider
+ * with paid activity this window, so all of them are always selectable.
+ */
+function onPerTokenChipClick(name: string) {
+  selectedPerTokenProvider.value = selectedPerTokenProvider.value === name ? null : name
+}
+
+// Subscription subsection visibility — render whenever the operator has
+// at least one subscription provider configured, so the standing fee
+// accrual is always surfaced even on weeks with no subscription-modality
+// activity. Per-token visibility is governed by the pre-existing
+// `hasPaidData` (defined below) which also gates the per-model table —
+// keeping a single source of truth means the strip and the table can't
+// disagree about whether to render.
+const hasSubscriptionSection = computed(() => configuredSubscriptionProviders.value.length > 0)
+
+// Combined total = per-token actuals + pro-rated subscription accrual.
+const combinedTotal = computed(() => perTokenBreakdown.value.total + subscriptionFee.value)
+
+// JCLAW-280: combined activity stats — sum the per-token and subscription
+// breakdowns so the footer can mirror the per-subsection strip layout
+// with grand totals across both modalities.
+const combinedTurns = computed(() => perTokenBreakdown.value.turnCount + subscriptionBreakdown.value.turnCount)
+const combinedPrompt = computed(() => perTokenBreakdown.value.prompt + subscriptionBreakdown.value.prompt)
+const combinedCompletion = computed(() => perTokenBreakdown.value.completion + subscriptionBreakdown.value.completion)
+const combinedReasoning = computed(() => perTokenBreakdown.value.reasoning + subscriptionBreakdown.value.reasoning)
+const combinedCached = computed(() => perTokenBreakdown.value.cached + subscriptionBreakdown.value.cached)
+
+const hasData = computed(() => breakdown.value.turnCount > 0)
+
+// Resolve agent display names — operator sees "main" not "agent #7" in the
+// per-agent table. Falls back to the id when the agent has been deleted
+// since the rows were emitted.
+const agentNameById = computed(() => {
+  const map = new Map<number, string>()
+  for (const a of props.agents ?? []) map.set(a.id, a.name)
+  return map
+})
+
+function agentLabel(id: number): string {
+  return agentNameById.value.get(id) ?? `agent #${id}`
+}
+
+// ── Per-model table sort state ────────────────────────────────────────────
+// Operator clicks a column header to sort. Numeric columns default to
+// descending (biggest spend first feels more useful at a glance); the
+// Model column defaults to ascending (alphabetical reads naturally).
+// Click the same column again to flip direction; click a different column
+// to switch and reset to that column's natural default direction.
+type SortColumn = 'model' | 'turnCount' | 'total' | 'prompt' | 'completion' | 'reasoning' | 'cached'
+type SortDir = 'asc' | 'desc'
+
+const sortBy = ref<SortColumn>('total')
+const sortDir = ref<SortDir>('desc')
+
+function defaultDirFor(col: SortColumn): SortDir {
+  return col === 'model' ? 'asc' : 'desc'
+}
+
+function toggleSort(col: SortColumn) {
+  if (sortBy.value === col) {
+    sortDir.value = sortDir.value === 'asc' ? 'desc' : 'asc'
+  }
+  else {
+    sortBy.value = col
+    sortDir.value = defaultDirFor(col)
+  }
+}
+
+function modelLabel(m: FleetCostPerModel): string {
+  return m.modelProvider ? `${m.modelProvider}/${m.modelId}` : m.modelId
+}
+
+// Restrict the per-model breakdown to models that actually contributed
+// to per-token cost — operator's question is "which models cost what,"
+// not "what activity happened on free tiers." Subscription-provider rows
+// are excluded by sourcing from perTokenBreakdown rather than the whole
+// breakdown: their per-row "cost" is bundled into the monthly fee and
+// double-counting it here would inflate the totals.
+const paidPerModel = computed<FleetCostPerModel[]>(() =>
+  perTokenBreakdown.value.perModel.filter(m => m.total > 0),
+)
+
+// Distinguishes "no data at all in this window" from "all per-token data
+// was free-tier" — the second case needs its own empty-state message so
+// the operator isn't confused about why the table looks empty when the
+// summary row shows positive turn counts.
+const hasPaidData = computed(() => paidPerModel.value.length > 0)
+
+// Effective $/1M rate for a subscription card — fee re-expressed as a
+// per-token price so it lines up with how per-token providers quote. Two
+// decimals in the single-to-double-digit range where these rates usually
+// land, whole dollars above $100, three decimals below $1 so a genuinely
+// cheap effective rate doesn't collapse to "$0.00".
+function formatRatePerMillion(rate: number): string {
+  if (rate >= 100) return `$${rate.toFixed(0)}`
+  if (rate >= 1) return `$${rate.toFixed(2)}`
+  return `$${rate.toFixed(3)}`
+}
+
+// Compact token count for the break-even line — 8_900_000 → "8.9M",
+// 200_000_000 → "200M", 1_200_000_000 → "1.2B". Break-even volumes span
+// orders of magnitude (a $20 fee against a $0.50/1M rate breaks even near
+// 40M tokens; a cheaper rate pushes it into the billions), so a fixed unit
+// would be unreadable.
+function formatTokensCompact(tokens: number): string {
+  if (tokens >= 1_000_000_000) return `${(tokens / 1_000_000_000).toFixed(1)}B`
+  if (tokens >= 1_000_000) return `${(tokens / 1_000_000).toFixed(1)}M`
+  if (tokens >= 1_000) return `${(tokens / 1_000).toFixed(0)}K`
+  return `${Math.round(tokens)}`
+}
+
+const sortedPerModel = computed<FleetCostPerModel[]>(() => {
+  const rows = [...paidPerModel.value]
+  const dir = sortDir.value === 'asc' ? 1 : -1
+  rows.sort((a, b) => {
+    let cmp = 0
+    if (sortBy.value === 'model') {
+      cmp = modelLabel(a).localeCompare(modelLabel(b))
+    }
+    else if (sortBy.value === 'turnCount') {
+      cmp = a.turnCount - b.turnCount
+    }
+    else {
+      // total / prompt / completion / reasoning / cached are all numeric
+      // members of FleetCostPerModel with the same name as the column.
+      cmp = (a[sortBy.value] as number) - (b[sortBy.value] as number)
+    }
+    if (cmp !== 0) return cmp * dir
+    // Tie-breaker: alphabetical by model so the order is deterministic
+    // when (e.g.) two free-tier models both report $0.00 cost.
+    return modelLabel(a).localeCompare(modelLabel(b))
+  })
+  return rows
+})
+
+// JCLAW-280: subscription per-model breakdown. Distinct from `paidPerModel`
+// because subscription rows have no per-row cost attribution (their cost
+// is the flat monthly fee surfaced in the strip above), so the table
+// drops the Cost column and shows only activity stats. Filters out
+// zero-turn entries — they shouldn't exist in `subscriptionBreakdown.perModel`
+// by construction but the filter guards against future edge cases.
+// Fixed sort: turn count descending, model name tie-break. The per-token
+// table's interactive sort is overkill here — subscription is a small set
+// (usually 1–2 models per provider) and the operator's question is
+// "what's running against my subscription," not "which is most expensive."
+const subscriptionPerModel = computed<FleetCostPerModel[]>(() => {
+  const items = subscriptionBreakdown.value.perModel
+    .filter(m => m.turnCount > 0)
+  items.sort((a, b) => {
+    if (a.turnCount !== b.turnCount) return b.turnCount - a.turnCount
+    return modelLabel(a).localeCompare(modelLabel(b))
+  })
+  return items
+})
+
+// Per-provider total tokens within the window — denominator for the
+// allocation key. Sums prompt + completion + reasoning. cached is
+// deliberately NOT added: `prompt` is the *total* input count and
+// cache-read tokens are a subset of it (cached ⊂ prompt — see the
+// MessageUsage contract in utils/usage-cost.ts, where uncachedInput =
+// prompt − cached − cacheCreation). Adding cached again would
+// double-count cache reads — harmless for allocation while subscription
+// rows report cached = 0, but it skews any absolute per-token rate built
+// on the same key. A provider with zero usage this window has no entry;
+// the lookup in `subscriptionPerModelAllocated` defaults to 0 and
+// short-circuits the division to avoid NaN.
+const subscriptionProviderTokenTotals = computed(() => {
+  const totals = new Map<string, number>()
+  for (const m of subscriptionPerModel.value) {
+    const provider = m.modelProvider
+    if (!provider) continue
+    const tokens = m.prompt + m.completion + m.reasoning
+    totals.set(provider, (totals.get(provider) ?? 0) + tokens)
+  }
+  return totals
+})
+
+// Per-model rows with an `allocatedCost` field — provider's pro-rated
+// monthly fee × (this model's tokens / this provider's total tokens this
+// window). Subscription bills are flat-rate at the provider level, so any
+// per-model attribution is a proxy; we expose it as "allocated cost" with
+// a footnote on the section so operators understand it's a derived
+// share-of-tokens figure, not actual per-call billing. Picking the
+// allocation key (total tokens) is the most defensible default because it
+// tracks "work the model did for the operator", which is what the flat
+// fee buys.
+const subscriptionPerModelAllocated = computed<(FleetCostPerModel & { allocatedCost: number })[]>(() => {
+  const feeByProvider = new Map(subscriptionProviderBreakdown.value.map(p => [p.name, p.proRatedFee]))
+  return subscriptionPerModel.value.map((m) => {
+    const provider = m.modelProvider ?? ''
+    const providerTokens = subscriptionProviderTokenTotals.value.get(provider) ?? 0
+    const providerFee = feeByProvider.get(provider) ?? 0
+    // Same key as subscriptionProviderTokenTotals — cached omitted because
+    // it's already counted within prompt.
+    const modelTokens = m.prompt + m.completion + m.reasoning
+    const allocatedCost = providerTokens > 0
+      ? providerFee * (modelTokens / providerTokens)
+      : 0
+    return { ...m, allocatedCost }
+  })
+})
+
+// Providers with a configured subscription bill but zero usage this
+// window. Their fee is real money the operator is paying, so we surface
+// it in a footnote rather than silently dropping it — accounting honesty
+// beats spreadsheet neatness. The Total row in the table sums only the
+// allocated cost, so `unallocatedSubscriptions` is what makes up the gap
+// between the table Total and the bill subtotal.
+const unallocatedSubscriptions = computed(() => {
+  // When a chip filter is active, every other provider's bill is hidden
+  // by design, not unallocated — surfacing them in the footnote would
+  // misrepresent the view. The footnote re-appears once the filter is
+  // cleared.
+  if (selectedSubscriptionProvider.value !== null) return []
+  const usedProviders = new Set(
+    subscriptionPerModel.value.map(m => m.modelProvider).filter(Boolean),
+  )
+  return subscriptionProviderBreakdown.value
+    .filter(p => !usedProviders.has(p.name))
+    .filter(p => p.proRatedFee > 0)
+})
+
+// Sum of allocations across all subscription model rows. Equals the
+// total bill when every configured subscription provider had usage this
+// window; less than the bill when one or more are unallocated (see
+// `unallocatedSubscriptions`).
+const subscriptionAllocatedTotal = computed(() =>
+  subscriptionPerModelAllocated.value.reduce((sum, m) => sum + m.allocatedCost, 0),
+)
+
+// ── Subscription effective rate & break-even (scope C) ─────────────────────
+// Re-express each subscription as a per-token rate so it can be compared
+// against per-token providers, and surface the monthly volume at which the
+// flat fee starts beating per-token pricing.
+
+// Per-provider total tokens across the whole window, INDEPENDENT of the
+// agent/channel/chip filters. The flat fee buys every turn the provider
+// served, so the effective-rate denominator has to be the provider's full
+// token throughput — narrowing it to a filtered slice while the full fee
+// stays in the numerator would overstate the rate. Distinct from
+// `subscriptionProviderTokenTotals`, which is chip-filtered for the
+// allocation table.
+const subscriptionFleetTokensByProvider = computed(() => {
+  const totals = new Map<string, number>()
+  const fleet = computeFleetCost(subscriptionRows.value, { agentId: null, channelType: null })
+  for (const m of fleet.perModel) {
+    if (!m.modelProvider) continue
+    // prompt + completion + reasoning only — cached ⊂ prompt (see
+    // subscriptionProviderTokenTotals); adding it would double-count cache
+    // reads and understate the effective $/1M.
+    const tokens = m.prompt + m.completion + m.reasoning
+    totals.set(m.modelProvider, (totals.get(m.modelProvider) ?? 0) + tokens)
+  }
+  return totals
+})
+
+// Effective $/1M per subscription provider = pro-rated window fee ÷ tokens
+// served this window × 1M. Null when the provider had no usage this window
+// (can't divide) — the card then shows the bare fee. Both numerator and
+// denominator span the same window, so the rate is stable across the 7d /
+// 30d / all-time toggle.
+const subscriptionEffectiveByProvider = computed(() => {
+  const feeByProvider = new Map(subscriptionProviderBreakdown.value.map(p => [p.name, p.proRatedFee]))
+  const out = new Map<string, number>()
+  for (const [name, tokens] of subscriptionFleetTokensByProvider.value) {
+    const fee = feeByProvider.get(name) ?? 0
+    if (tokens > 0 && fee > 0) out.set(name, (fee / tokens) * 1_000_000)
+  }
+  return out
+})
+
+// The operator's realized per-token rate this window — total per-token
+// spend ÷ total per-token tokens, as $/1M. This is the break-even
+// reference: "what I actually pay per token elsewhere." Fleet-wide (no
+// agent/channel filter) to match the effective-rate denominator. Null when
+// there's no paid per-token activity to derive a rate from, in which case
+// the break-even line is omitted rather than compared against nothing.
+const fleetPerTokenRatePerMillion = computed<number | null>(() => {
+  const fleet = computeFleetCost(perTokenRows.value, { agentId: null, channelType: null })
+  // prompt + completion + reasoning — cached ⊂ prompt, so adding it would
+  // double-count cache reads. This bites here (per-token traffic is often
+  // cache-heavy): the double-count understated the rate and overstated the
+  // break-even volume.
+  const tokens = fleet.prompt + fleet.completion + fleet.reasoning
+  if (tokens <= 0 || fleet.total <= 0) return null
+  return (fleet.total / tokens) * 1_000_000
+})
+
+// Monthly token volume at which each subscription's flat fee equals what
+// the same tokens would cost at the operator's per-token rate — push more
+// than this through the subscription and it's the cheaper option. Uses the
+// un-prorated monthly fee so the figure is a stable "per month" capacity
+// regardless of the selected window. Null when there's no reference rate.
+const subscriptionBreakEvenByProvider = computed(() => {
+  const out = new Map<string, number>()
+  const rate = fleetPerTokenRatePerMillion.value
+  if (rate === null || rate <= 0) return out
+  for (const p of configuredSubscriptionProviders.value) {
+    const monthly = Number(p.subscriptionMonthlyUsd) || 0
+    if (monthly > 0) out.set(p.name, (monthly / rate) * 1_000_000)
+  }
+  return out
+})
+
+// View model for the subscription strip cards — each provider's pro-rated
+// fee plus the two derived figures. Bundled into one list so the template
+// iterates a single source instead of cross-referencing three maps by name
+// inside the v-for.
+const subscriptionCards = computed(() =>
+  subscriptionProviderBreakdown.value.map((p) => {
+    const effectivePerMillion = subscriptionEffectiveByProvider.value.get(p.name) ?? null
+    const breakEven = subscriptionBreakEvenByProvider.value.get(p.name) ?? null
+    return {
+      ...p,
+      effectivePerMillion,
+      // Only surface break-even alongside an effective rate — a break-even
+      // volume next to a fee with zero usage this window reads as noise.
+      breakEvenTokensPerMonth: effectivePerMillion !== null ? breakEven : null,
+      fleetTokens: subscriptionFleetTokensByProvider.value.get(p.name) ?? 0,
+    }
+  }),
+)
+
+// Chart geometry. Horizontal bars: one per agent (or per model in chart
+// view). Width is proportional to cost share. Inline SVG, no library.
+// Same paid-only filter as the table — chart visualizes cost contribution,
+// so zero-bars for free-tier rows would be visual noise.
+const chartRows = computed(() => {
+  // Scoped to per-token activity for the same reason paidPerModel is —
+  // subscription costs aren't attributable to individual models or agents.
+  const paidModels = perTokenBreakdown.value.perModel.filter(m => m.total > 0)
+  const paidAgents = perTokenBreakdown.value.perAgent.filter(a => a.total > 0)
+  // Pick the dimension with more entries — usually agent for fleet view,
+  // model when filtered to one agent.
+  const useModel = paidModels.length >= paidAgents.length
+  return useModel
+    ? paidModels.map(m => ({
+        label: m.modelProvider ? `${m.modelProvider}/${m.modelId}` : m.modelId,
+        cost: m.total,
+        turnCount: m.turnCount,
+      }))
+    : paidAgents.map(a => ({
+        label: agentLabel(a.agentId),
+        cost: a.total,
+        turnCount: a.turnCount,
+      }))
+})
+
+const chartMaxCost = computed(() => {
+  const max = chartRows.value.reduce((m, r) => Math.max(m, r.cost), 0)
+  // Floor a tiny minimum so a fully-free fleet still renders proportional
+  // bars based on turn counts (not actually wired here, but prevents NaN).
+  return max === 0 ? 1 : max
+})
+
+// Subscription chart counterpart of chartRows. Always per-model — flat
+// monthly bills don't decompose meaningfully by agent (the same agent
+// might use multiple subscription providers), so a per-model view is the
+// only attribution that holds up. Honors the chip filter via
+// subscriptionPerModelAllocated, so clicking Ollama Cloud collapses the
+// chart to that provider's models with their share of $100. Keeps
+// modelProvider on each row so the swatch helper can color-key the bar.
+const subscriptionChartRows = computed(() =>
+  subscriptionPerModelAllocated.value
+    .filter(m => m.turnCount > 0)
+    .map(m => ({
+      label: m.modelProvider ? `${m.modelProvider}/${m.modelId}` : m.modelId,
+      cost: m.allocatedCost,
+      turnCount: m.turnCount,
+      modelProvider: m.modelProvider,
+    })),
+)
+
+const subscriptionChartMaxCost = computed(() => {
+  const max = subscriptionChartRows.value.reduce((m, r) => Math.max(m, r.cost), 0)
+  return max === 0 ? 1 : max
+})
+
+// Palette for per-provider color identity. Each slot pairs a bg utility
+// (for the swatch fill) with the matching border utility (for the
+// selected-chip outline) so the two stay coupled — adding/reordering a
+// slot can't accidentally desync swatch and border colors. Listed as
+// literal class strings so Tailwind's JIT can find every possible
+// value; concatenating from a color stem (e.g., `bg-${color}-500`)
+// would silently render as transparent. Kept off-emerald (and
+// off-lime/teal) so the colors can never be mistaken for the emerald
+// cost fill on the bar — "emerald = cost" stays a global convention.
+const PROVIDER_PALETTE = [
+  { swatch: 'bg-sky-500', border: 'border-sky-500' },
+  { swatch: 'bg-amber-500', border: 'border-amber-500' },
+  { swatch: 'bg-fuchsia-500', border: 'border-fuchsia-500' },
+  { swatch: 'bg-rose-500', border: 'border-rose-500' },
+  { swatch: 'bg-indigo-500', border: 'border-indigo-500' },
+  { swatch: 'bg-orange-500', border: 'border-orange-500' },
+] as const
+
+/**
+ * Map a subscription provider name to a stable palette slot.
+ * Indexed by alphabetical position within configuredSubscriptionProviders
+ * rather than by name-hash — the user-facing guarantee is that any two
+ * distinct providers in *the operator's actual setup* get different
+ * colors (which a hash can't guarantee: real-world strings like
+ * "ollama-cloud" and "openai" collide on small palettes). Alphabetical
+ * sort makes the assignment deterministic regardless of /api/providers
+ * response order. Adding a new provider can shift colors of providers
+ * alphabetically after it; acceptable for a setup that changes rarely.
+ */
+const providerPaletteByName = computed<Map<string, typeof PROVIDER_PALETTE[number]>>(() => {
+  const map = new Map<string, typeof PROVIDER_PALETTE[number]>()
+  // Union of subscription providers and per-token providers with paid
+  // activity — both kinds render colored chips/rows, so both need a stable
+  // slot. Alphabetical so the assignment is deterministic; adding a
+  // provider can shift the color of providers alphabetically after it
+  // (acceptable for a rarely-changing setup).
+  const names = new Set<string>()
+  for (const p of configuredSubscriptionProviders.value) names.add(p.name)
+  for (const c of perTokenProviderBreakdown.value) names.add(c.name)
+  const sorted = [...names].sort((a, b) => a.localeCompare(b))
+  sorted.forEach((name, i) => {
+    map.set(name, PROVIDER_PALETTE[i % PROVIDER_PALETTE.length]!)
+  })
+  return map
+})
+
+function providerSwatchColor(provider: string | undefined): string {
+  if (!provider) return 'bg-fg-muted'
+  return providerPaletteByName.value.get(provider)?.swatch ?? 'bg-fg-muted'
+}
+
+function providerBorderColor(provider: string | undefined): string {
+  if (!provider) return 'border-border'
+  return providerPaletteByName.value.get(provider)?.border ?? 'border-border'
+}
+
+// CSV export. Generates per-model breakdown (one row per model with cost
+// and token totals) since that's the most actionable view; the operator
+// can pivot externally if they need agent or channel cuts. Honors the
+// active table sort so the export matches what the operator is looking
+// at — useful when they're viewing "sort by reasoning tokens desc" and
+// want that ordering preserved in the spreadsheet.
+function exportCsv() {
+  const header = [
+    'modality', 'provider', 'modelId', 'turnCount', 'cost',
+    'promptTokens', 'completionTokens', 'reasoningTokens', 'cachedTokens',
+  ].join(',')
+
+  const lines: string[] = []
+
+  // Subscription per-model rows: cost cell carries the proportional
+  // allocation (provider's pro-rated bill × this model's token share
+  // for the provider). A spreadsheet column summing these reproduces
+  // the dashboard's Total — minus any unallocated amount, which is
+  // exported as its own row below.
+  for (const m of subscriptionPerModelAllocated.value) {
+    lines.push([
+      'subscription',
+      csvCell(m.modelProvider ?? ''),
+      csvCell(m.modelId),
+      m.turnCount.toString(),
+      m.allocatedCost.toFixed(6),
+      m.prompt.toString(),
+      m.completion.toString(),
+      m.reasoning.toString(),
+      m.cached.toString(),
+    ].join(','))
+  }
+
+  // Subscription bills that couldn't be allocated this window — the
+  // provider was configured (and billed) but had no usage. Exported as
+  // a separate row per provider so accounting math reconciles: sum of
+  // allocated rows + sum of these = total bill.
+  for (const p of unallocatedSubscriptions.value) {
+    lines.push([
+      'subscription-unallocated',
+      csvCell(p.name),
+      '',
+      '',
+      p.proRatedFee.toFixed(6),
+      '', '', '', '',
+    ].join(','))
+  }
+
+  // Per-token per-model rows in current sort order so the export
+  // matches what the operator is looking at on screen.
+  for (const m of sortedPerModel.value) {
+    lines.push([
+      'per-token',
+      csvCell(m.modelProvider ?? ''),
+      csvCell(m.modelId),
+      m.turnCount.toString(),
+      m.total.toFixed(6),
+      m.prompt.toString(),
+      m.completion.toString(),
+      m.reasoning.toString(),
+      m.cached.toString(),
+    ].join(','))
+  }
+
+  const csv = [header, ...lines].join('\n')
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  const filterTag = [
+    selectedAgentId.value === null ? 'all-agents' : `agent-${selectedAgentId.value}`,
+    selectedChannel.value ?? 'all-channels',
+    selectedWindow.value,
+  ].join('_')
+  a.download = `chat-cost_${filterTag}_${new Date().toISOString().slice(0, 10)}.csv`
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  URL.revokeObjectURL(url)
+}
+
+/**
+ * Quote a CSV cell when it contains a comma, quote, or newline. Doubles
+ * embedded quotes per RFC 4180. Cheap defensive escape so an odd model id
+ * never produces a malformed export.
+ */
+function csvCell(value: string): string {
+  if (!/[",\n]/.test(value)) return value
+  return '"' + value.replaceAll('"', '""') + '"'
+}
+
+// Reserve the height this panel had last visit so the tables landing don't move
+// the page. 1243px is the measured natural body height on a populated install.
+const { reservedHeight: bodyHeight, el: bodyEl }
+  = useStableHeight('cost', 1243, hasLoadedOnce)
+
+defineExpose({ refresh })
+</script>
+
+<template>
+  <div class="bg-surface-elevated border border-border mb-8">
+    <!--
+      Three-column header matching the Chat Performance pattern: title +
+      view toggle on the left, filter cluster centered, CSV button right.
+    -->
+    <!-- min-h matches the height this header takes once its data-gated view toggle
+         renders, so the toggle appearing does not nudge the panel. -->
+    <div class="px-4 py-3 border-b border-border grid grid-cols-[auto_1fr_auto] max-sm:flex max-sm:flex-wrap items-center gap-3 min-h-[55px]">
+      <div class="flex items-center gap-3 min-w-0">
+        <h2 class="text-sm font-medium text-fg-primary shrink-0">
+          Chat Cost
+        </h2>
+        <div
+          v-if="hasPaidData || subscriptionChartRows.length > 0"
+          class="inline-flex items-center border border-border overflow-hidden"
+          role="tablist"
+          aria-label="Chat cost view"
+        >
+          <button
+            type="button"
+            role="tab"
+            :aria-selected="view === 'table'"
+            class="p-1.5 transition-colors"
+            :class="view === 'table'
+              ? 'bg-muted text-fg-strong'
+              : 'text-fg-muted hover:text-fg-strong'"
+            title="Table view"
+            @click="view = 'table'"
+          >
+            <TableCellsIcon
+              class="w-4 h-4"
+              aria-hidden="true"
+            />
+          </button>
+          <button
+            type="button"
+            role="tab"
+            :aria-selected="view === 'chart'"
+            class="p-1.5 transition-colors"
+            :class="view === 'chart'
+              ? 'bg-muted text-fg-strong'
+              : 'text-fg-muted hover:text-fg-strong'"
+            title="Bar chart view"
+            @click="view = 'chart'"
+          >
+            <ChartBarIcon
+              class="w-4 h-4"
+              aria-hidden="true"
+            />
+          </button>
+        </div>
+      </div>
+
+      <!-- Filters: window segmented control + agent/channel dropdowns, centered — mirrors Chat Compression. -->
+      <div class="flex items-center justify-center gap-3 flex-wrap">
+        <div class="inline-flex items-center border border-border overflow-hidden">
+          <button
+            v-for="w in WINDOWS"
+            :key="w.key"
+            type="button"
+            class="px-2.5 py-1 text-xs"
+            :class="selectedWindow === w.key ? 'bg-muted text-fg-strong' : 'text-fg-muted hover:text-fg-strong'"
+            @click="selectedWindow = w.key"
+          >
+            {{ w.label }}
+          </button>
+        </div>
+        <select
+          v-model="selectedAgentId"
+          aria-label="Filter by agent"
+          class="px-2 py-1 text-xs bg-muted border border-input text-fg-strong"
+        >
+          <option :value="null">
+            All agents
+          </option>
+          <option
+            v-for="a in (agents ?? [])"
+            :key="a.id"
+            :value="a.id"
+          >
+            {{ a.name }}
+          </option>
+        </select>
+        <select
+          v-model="selectedChannel"
+          aria-label="Filter by channel"
+          class="px-2 py-1 text-xs bg-muted border border-input text-fg-strong"
+        >
+          <option :value="null">
+            All channels
+          </option>
+          <option
+            v-for="ch in availableChannels"
+            :key="ch"
+            :value="ch"
+          >
+            {{ ch }}
+          </option>
+        </select>
+      </div>
+
+      <div class="flex items-center gap-3 text-xs shrink-0">
+        <button
+          type="button"
+          class="inline-flex items-center gap-1 text-fg-muted hover:text-fg-strong transition-colors p-1 disabled:opacity-40 disabled:cursor-not-allowed"
+          :disabled="!hasPaidData && !hasSubscriptionSection"
+          title="Export per-model breakdown to CSV"
+          @click="exportCsv"
+        >
+          <ArrowDownTrayIcon
+            class="w-4 h-4"
+            aria-hidden="true"
+          />
+          <span>CSV</span>
+        </button>
+      </div>
+    </div>
+
+    <!-- Body reserves its last-known height: this panel grew 137px -> 1349px on
+         load, shoving every panel below it down the page. See useStableHeight. -->
+    <div
+      ref="bodyEl"
+      :style="{ minHeight: bodyHeight }"
+    >
+      <!-- Body: pending / empty / table / chart -->
+      <div
+        v-if="pending && !hasLoadedOnce"
+        class="px-4 py-8 text-center text-sm text-fg-muted"
+      >
+        Loading cost data…
+      </div>
+
+      <div
+        v-else-if="!hasData && !hasSubscriptionSection"
+        class="px-4 py-8 text-center text-sm text-fg-muted"
+      >
+        No conversations match the current filter.
+      </div>
+
+      <template v-else>
+        <!-- JCLAW-280: subscription subsection (rendered first because it
+             reflects an already-committed monthly spend, while per-token is
+             accruing-as-you-go — operators read the standing commitment
+             before the variable line, matching how P&L statements are
+             ordered). Shows turns + tokens for subscription-provider
+             activity plus the pro-rated monthly fee. Subscription has no
+             per-row cost attribution so this subsection never feeds the
+             per-model table or chart below. -->
+        <!-- border-b is only meaningful as a separator from the per-model
+             table / Combined Total below. With both gated on actual usage,
+             leaving the border in unconditionally drew a stray line under
+             the chip strip on zero-usage weeks. Same predicate as the
+             Combined Total wrapper below. -->
+        <div
+          v-if="hasSubscriptionSection"
+          class="mt-6 mb-6"
+          :class="hasPaidData || subscriptionPerModelAllocated.length > 0
+            ? 'border-b border-border'
+            : ''"
+        >
+          <div class="px-4 pt-3 pb-3">
+            <div class="text-xs font-medium text-fg-muted uppercase tracking-wide">
+              Subscription
+            </div>
+            <!-- Per-provider bill breakdown for the active window. Rendered
+                 as a flex-wrap grid of clickable chips: clicking a chip
+                 scopes the table below to that provider's models with the
+                 tfoot Total summing to that provider's bill; clicking the
+                 same chip again clears the filter. The aggregate of all
+                 chips already shows up in the table's tfoot Total row, so
+                 we deliberately omit a "Total" chip — it would duplicate
+                 information that the table footer already carries. Chips
+                 for providers with zero usage this window are visually
+                 muted and not clickable (selecting one would render an
+                 empty table). -->
+            <div
+              v-if="subscriptionCards.length > 0"
+              class="mt-3 flex flex-wrap gap-2"
+            >
+              <button
+                v-for="p in subscriptionCards"
+                :key="p.name"
+                type="button"
+                :aria-pressed="selectedSubscriptionProvider === p.name"
+                :disabled="selectedSubscriptionProvider !== p.name
+                  && !subscriptionProvidersWithUsage.has(p.name)"
+                class="border min-w-[9rem] text-left transition-colors flex items-stretch"
+                :class="selectedSubscriptionProvider === p.name
+                  ? `${providerBorderColor(p.name)} bg-muted/40`
+                  : subscriptionProvidersWithUsage.has(p.name)
+                    ? 'border-border bg-muted/20 hover:bg-muted/30 cursor-pointer'
+                    : 'border-border bg-muted/10 opacity-50 cursor-not-allowed'"
+                @click="onSubscriptionChipClick(p.name)"
+              >
+                <!-- Same per-provider swatch as the chart bar below — the
+                     chip and the bar share a single color per provider so
+                     the operator can match chip ↔ bar at a glance. Sits
+                     on the chip's leading edge as a 6px band, stretched
+                     to the chip's full height via items-stretch. -->
+                <div
+                  class="w-1.5 shrink-0"
+                  :class="providerSwatchColor(p.name)"
+                />
+                <div class="px-3 py-2 flex-1">
+                  <div class="text-[10px] text-fg-muted uppercase tracking-wide">
+                    {{ p.displayName }}
+                  </div>
+                  <div class="mt-0.5 font-mono text-sm text-fg-primary">
+                    {{ formatStatCurrency(p.proRatedFee) }}
+                  </div>
+                  <!-- Scope-C derived figures: the flat fee re-expressed as a
+                       per-token rate, and the monthly volume at which the
+                       subscription overtakes the operator's per-token rate.
+                       Both omitted when the provider had no usage this window
+                       (effective rate undefined) or there's no per-token
+                       activity to compare against (break-even reference
+                       undefined) — the card falls back to the bare fee. -->
+                  <div
+                    v-if="p.effectivePerMillion !== null"
+                    class="mt-1 font-mono text-[11px] text-fg-muted"
+                    :title="`Effective rate — ${p.displayName}'s window fee ÷ all ${formatTokensCompact(p.fleetTokens)} tokens it served this window. Compare against a per-token provider's published $/1M.`"
+                  >
+                    ≈ {{ formatRatePerMillion(p.effectivePerMillion) }}/1M
+                  </div>
+                  <div
+                    v-if="p.breakEvenTokensPerMonth !== null"
+                    class="text-[10px] text-fg-muted"
+                    :title="`Break-even — at your ${formatRatePerMillion(fleetPerTokenRatePerMillion ?? 0)}/1M per-token rate, this subscription is the cheaper option above ~${formatTokensCompact(p.breakEvenTokensPerMonth)} tokens/month.`"
+                  >
+                    break-even {{ formatTokensCompact(p.breakEvenTokensPerMonth) }}/mo
+                  </div>
+                </div>
+              </button>
+            </div>
+          </div>
+
+          <!-- Per-model breakdown for subscription activity. Each row's
+               Cost is the provider's pro-rated bill × (this model's
+               tokens / this provider's total tokens this window) — the
+               flat fee allocated proportionally to work done. Fixed sort
+               by turn count descending; interactive sort would be overkill
+               on what's usually a 1-2 model set per subscription provider.
+               Hidden when there is no subscription usage in the window so
+               the section stays consistent with the per-token block (which
+               gates on hasPaidData). The provider chip strip above and the
+               COMBINED TOTAL row below carry the bill on zero-usage weeks. -->
+          <div
+            v-if="view === 'table' && subscriptionPerModelAllocated.length > 0"
+            class="overflow-x-auto border-t border-border"
+          >
+            <table class="w-full min-w-[42rem] text-xs table-fixed">
+              <thead class="text-fg-muted bg-muted/20">
+                <tr>
+                  <!-- Model column gets a fixed 1/4 share so the 6 stat columns
+                       auto-distribute the remaining 75% (12.5% each) under
+                       table-fixed. Same width on both per-model tables means
+                       their stat columns line up vertically. -->
+                  <th
+                    scope="col"
+                    class="text-left px-4 py-2 font-medium w-1/4"
+                  >
+                    Model
+                  </th>
+                  <th
+                    scope="col"
+                    class="text-right px-3 py-2 font-medium"
+                  >
+                    Turns
+                  </th>
+                  <th
+                    scope="col"
+                    class="text-right px-3 py-2 font-medium"
+                  >
+                    Prompt
+                  </th>
+                  <th
+                    scope="col"
+                    class="text-right px-3 py-2 font-medium"
+                  >
+                    Completion
+                  </th>
+                  <th
+                    scope="col"
+                    class="text-right px-3 py-2 font-medium"
+                  >
+                    Reasoning
+                  </th>
+                  <th
+                    scope="col"
+                    class="text-right px-3 py-2 font-medium"
+                  >
+                    Cached
+                  </th>
+                  <!-- Cost cell carries the per-model allocation =
+                       provider's pro-rated bill × (this model's tokens /
+                       this provider's total tokens this window). It's a
+                       derived share, not actual per-call billing — the
+                       info-icon tooltip next to the column header carries
+                       the methodology disclaimer. -->
+                  <th
+                    scope="col"
+                    class="text-right px-3 py-2 font-medium"
+                  >
+                    <span class="inline-flex items-center justify-end gap-1">
+                      <span>Cost</span>
+                      <!-- Tooltip rendered via a teleport to body below
+                           so it escapes the table wrapper's overflow-x-auto
+                           clip, which implicitly clips Y too in CSS.
+                           The native title-attribute fallback is unreliable
+                           on SVG in Chrome; the project's group plus tip
+                           popover pattern works for non-clipped contexts
+                           but not here. mouseenter computes coords from the
+                           icon's bounding rect; mouseleave hides. -->
+                      <!-- A button (not a span) so keyboard users can
+                           focus + read the tooltip via Tab; the focus/blur
+                           handlers mirror the mouseenter/leave pair. The
+                           button-styled-as-icon trick keeps the visual the
+                           same as a bare InformationCircleIcon. -->
+                      <button
+                        type="button"
+                        class="inline-flex items-center justify-center min-h-6 min-w-6 -my-1 p-0 m-0 bg-transparent border-0 cursor-help"
+                        aria-label="Cost column information"
+                        @mouseenter="showCostTooltip"
+                        @mouseleave="scheduleHideCostTooltip"
+                        @focus="showCostTooltip"
+                        @blur="hideCostTooltip"
+                      >
+                        <InformationCircleIcon
+                          class="w-3.5 h-3.5 text-fg-muted"
+                          aria-hidden="true"
+                          data-testid="cost-info-icon"
+                        />
+                      </button>
+                    </span>
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr
+                  v-for="m in subscriptionPerModelAllocated"
+                  :key="m.modelId"
+                  class="border-t border-border"
+                >
+                  <td class="px-4 py-2 font-mono text-fg-primary">
+                    <!-- Same per-provider swatch as the chart view's
+                         label tag — kept here so the table and chart
+                         share one visual identity per provider; the
+                         operator's color memory carries over between
+                         the two views. -->
+                    <span class="inline-flex items-center gap-2 align-middle">
+                      <span
+                        class="inline-block w-2 h-2 shrink-0 rounded-sm"
+                        :class="providerSwatchColor(m.modelProvider)"
+                        :title="m.modelProvider ?? ''"
+                      />
+                      <span>
+                        <span
+                          v-if="m.modelProvider"
+                          class="text-fg-muted"
+                        >{{ m.modelProvider }}/</span>{{ m.modelId }}
+                      </span>
+                    </span>
+                  </td>
+                  <td class="px-3 py-2 text-right font-mono text-fg-primary">
+                    {{ m.turnCount.toLocaleString() }}
+                  </td>
+                  <td class="px-3 py-2 text-right font-mono text-fg-muted">
+                    {{ m.prompt.toLocaleString() }}
+                  </td>
+                  <td class="px-3 py-2 text-right font-mono text-fg-muted">
+                    {{ m.completion.toLocaleString() }}
+                  </td>
+                  <td class="px-3 py-2 text-right font-mono text-fg-muted">
+                    {{ m.reasoning.toLocaleString() }}
+                  </td>
+                  <td class="px-3 py-2 text-right font-mono text-yellow-700 dark:text-yellow-400">
+                    {{ m.cached.toLocaleString() }}
+                  </td>
+                  <td class="px-3 py-2 text-right font-mono text-emerald-700 dark:text-emerald-400">
+                    {{ formatStatCurrency(m.allocatedCost) }}
+                  </td>
+                </tr>
+              </tbody>
+              <!-- Section total. Stat cells are the column sums of the
+                   bodies above; the Cost cell is the sum of allocated
+                   per-model costs and equals the bill total iff every
+                   configured subscription provider had at least some
+                   usage this window. When one or more providers had
+                   zero usage, this Total falls short of the bill by
+                   exactly the unallocated amount — surfaced in the
+                   footnote below. -->
+              <tfoot>
+                <tr class="bg-muted/30 border-t border-border">
+                  <td class="px-4 py-2 text-xs font-medium text-fg-muted uppercase tracking-wide">
+                    Total
+                  </td>
+                  <td class="px-3 py-2 text-right font-mono text-fg-primary">
+                    {{ subscriptionBreakdown.turnCount.toLocaleString() }}
+                  </td>
+                  <td class="px-3 py-2 text-right font-mono text-fg-muted">
+                    {{ subscriptionBreakdown.prompt.toLocaleString() }}
+                  </td>
+                  <td class="px-3 py-2 text-right font-mono text-fg-muted">
+                    {{ subscriptionBreakdown.completion.toLocaleString() }}
+                  </td>
+                  <td class="px-3 py-2 text-right font-mono text-fg-muted">
+                    {{ subscriptionBreakdown.reasoning.toLocaleString() }}
+                  </td>
+                  <td class="px-3 py-2 text-right font-mono text-yellow-700 dark:text-yellow-400">
+                    {{ subscriptionBreakdown.cached.toLocaleString() }}
+                  </td>
+                  <td
+                    class="px-3 py-2 text-right font-mono text-emerald-700 dark:text-emerald-400"
+                    :title="`Sum of per-model allocations. Bill total this window: ${formatStatCurrency(subscriptionFee)}`"
+                  >
+                    {{ formatStatCurrency(subscriptionAllocatedTotal) }}
+                  </td>
+                </tr>
+              </tfoot>
+            </table>
+          </div>
+
+          <!-- Subscription chart view: horizontal bars of allocated cost,
+               one bar per model that contributed usage this window. Bar
+               widths are relative to the largest allocated cost in the
+               current view (so a chip filter to one provider re-scales
+               the bars to that provider's range). Suppressed when there
+               are no usage rows — the empty-state info lives in the
+               unallocated footnote below. -->
+          <!-- One grid container for all chart rows (not one grid per row)
+               so the auto cost column resolves to a single width across
+               rows and every bar's left edge sits at the same x. The
+               minmax(0,_1fr) / minmax(0,_3fr) widths override the default
+               min-width:auto behavior — without them, the 1fr label
+               column would expand to fit the longest label even though
+               `truncate` is set, leaving bars at inconsistent positions. -->
+          <div
+            v-else-if="subscriptionChartRows.length > 0"
+            class="px-4 py-3 border-t border-border grid items-center gap-x-3 gap-y-1.5 text-xs grid-cols-[minmax(0,1fr)_minmax(0,3fr)_auto]"
+          >
+            <template
+              v-for="(r, i) in subscriptionChartRows"
+              :key="i"
+            >
+              <!-- Provider color swatch sits as a small legend-style square
+                   immediately before the model name, so the bar stays a
+                   pure emerald cost signal and the per-provider identity
+                   lives in the label column. min-w-0 lets the truncated
+                   model name shrink within the flex container without
+                   pushing past its grid column. -->
+              <div class="flex items-center gap-2 min-w-0">
+                <div
+                  class="w-2 h-2 shrink-0 rounded-sm"
+                  :class="providerSwatchColor(r.modelProvider)"
+                  :title="r.modelProvider ?? ''"
+                />
+                <span
+                  class="font-mono text-fg-primary truncate"
+                  :title="r.label"
+                >
+                  {{ r.label }}
+                </span>
+              </div>
+              <div class="relative h-5 bg-muted/30 border border-border overflow-hidden">
+                <div
+                  class="h-full bg-emerald-500/30"
+                  :style="{ width: ((r.cost / subscriptionChartMaxCost) * 100).toFixed(2) + '%' }"
+                />
+              </div>
+              <div class="font-mono text-emerald-700 dark:text-emerald-400 tabular-nums shrink-0">
+                {{ formatCostUsd(r.cost) }}
+                <span class="text-fg-muted">· {{ r.turnCount }}t</span>
+              </div>
+            </template>
+          </div>
+        </div>
+
+        <!-- JCLAW-280: per-token subsection. Header + (table OR chart based
+             on the view toggle). Rendered only when paid per-token activity
+             exists in the window. Subscription-provider turns are excluded
+             by sourcing from perTokenBreakdown. -->
+        <div
+          v-if="hasPaidData"
+          class="border-b border-border"
+        >
+          <div class="px-4 pt-3 pb-2 text-xs font-medium text-fg-muted uppercase tracking-wide">
+            Per-token
+          </div>
+
+          <!-- Per-provider rollup chips — total per-token spend and average
+               $/1M for each provider (the per-token analogue of the
+               subscription cards' effective rate). Click to scope the table /
+               chart / totals below to that provider; click again to clear.
+               Built from the unfiltered breakdown so every provider stays
+               visible regardless of the active chip. Renders in both table
+               and chart views, like the subscription strip. -->
+          <div
+            v-if="perTokenProviderBreakdown.length > 0"
+            class="px-4 pb-3 flex flex-wrap gap-2"
+          >
+            <button
+              v-for="p in perTokenProviderBreakdown"
+              :key="p.name"
+              type="button"
+              :aria-pressed="selectedPerTokenProvider === p.name"
+              class="border min-w-[9rem] text-left transition-colors flex items-stretch"
+              :class="selectedPerTokenProvider === p.name
+                ? `${providerBorderColor(p.name)} bg-muted/40`
+                : 'border-border bg-muted/20 hover:bg-muted/30 cursor-pointer'"
+              @click="onPerTokenChipClick(p.name)"
+            >
+              <div
+                class="w-1.5 shrink-0"
+                :class="providerSwatchColor(p.name)"
+              />
+              <div class="px-3 py-2 flex-1">
+                <div class="text-[10px] text-fg-muted uppercase tracking-wide">
+                  {{ p.displayName }}
+                </div>
+                <div class="mt-0.5 font-mono text-sm text-fg-primary">
+                  {{ formatStatCurrency(p.totalCost) }}
+                </div>
+                <div
+                  v-if="p.avgPerMillion !== null"
+                  class="mt-1 font-mono text-[11px] text-fg-muted"
+                  :title="`Average rate — ${p.displayName}'s total per-token spend ÷ its prompt + completion + reasoning tokens this window.`"
+                >
+                  ≈ {{ formatRatePerMillion(p.avgPerMillion) }}/1M
+                </div>
+              </div>
+            </button>
+          </div>
+
+          <!--
+            Per-model breakdown table. Click any header cell to sort by that
+            column; click again to flip direction. Active column shows a
+            chevron in its sort direction. Default: Cost descending. Free-tier
+            models (total === 0) are filtered out to keep the table focused
+            on cost contributors. tfoot Total row carries the column sums and
+            the cost grand total for this modality.
+          -->
+          <div
+            v-if="view === 'table'"
+            class="overflow-x-auto border-t border-border"
+          >
+            <table class="w-full min-w-[42rem] text-xs table-fixed">
+              <thead class="text-fg-muted bg-muted/20">
+                <tr>
+                  <th
+                    scope="col"
+                    class="text-left px-4 py-2 font-medium w-1/4"
+                    :aria-sort="sortBy === 'model' ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'"
+                  >
+                    <button
+                      type="button"
+                      class="inline-flex items-center gap-1 hover:text-fg-strong transition-colors"
+                      :class="sortBy === 'model' ? 'text-fg-strong' : ''"
+                      @click="toggleSort('model')"
+                    >
+                      Model
+                      <ChevronUpIcon
+                        v-if="sortBy === 'model' && sortDir === 'asc'"
+                        class="w-3 h-3"
+                        aria-hidden="true"
+                      />
+                      <ChevronDownIcon
+                        v-else-if="sortBy === 'model' && sortDir === 'desc'"
+                        class="w-3 h-3"
+                        aria-hidden="true"
+                      />
+                    </button>
+                  </th>
+                  <th
+                    v-for="col in [
+                      { key: 'turnCount', label: 'Turns' },
+                      { key: 'prompt', label: 'Prompt' },
+                      { key: 'completion', label: 'Completion' },
+                      { key: 'reasoning', label: 'Reasoning' },
+                      { key: 'cached', label: 'Cached' },
+                      { key: 'total', label: 'Cost' },
+                    ] as { key: SortColumn, label: string }[]"
+                    :key="col.key"
+                    scope="col"
+                    class="text-right px-3 py-2 font-medium"
+                    :aria-sort="sortBy === col.key ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'"
+                  >
+                    <button
+                      type="button"
+                      class="inline-flex items-center gap-1 hover:text-fg-strong transition-colors"
+                      :class="sortBy === col.key ? 'text-fg-strong' : ''"
+                      @click="toggleSort(col.key)"
+                    >
+                      {{ col.label }}
+                      <ChevronUpIcon
+                        v-if="sortBy === col.key && sortDir === 'asc'"
+                        class="w-3 h-3"
+                        aria-hidden="true"
+                      />
+                      <ChevronDownIcon
+                        v-else-if="sortBy === col.key && sortDir === 'desc'"
+                        class="w-3 h-3"
+                        aria-hidden="true"
+                      />
+                    </button>
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr
+                  v-for="m in sortedPerModel"
+                  :key="m.modelId"
+                  class="border-t border-border"
+                >
+                  <td class="px-4 py-2 font-mono text-fg-primary">
+                    <span
+                      v-if="m.modelProvider"
+                      class="text-fg-muted"
+                    >{{ m.modelProvider }}/</span>{{ m.modelId }}
+                  </td>
+                  <td class="px-3 py-2 text-right font-mono text-fg-primary">
+                    {{ m.turnCount.toLocaleString() }}
+                  </td>
+                  <td class="px-3 py-2 text-right font-mono text-fg-muted">
+                    {{ m.prompt.toLocaleString() }}
+                  </td>
+                  <td class="px-3 py-2 text-right font-mono text-fg-muted">
+                    {{ m.completion.toLocaleString() }}
+                  </td>
+                  <td class="px-3 py-2 text-right font-mono text-fg-muted">
+                    {{ m.reasoning.toLocaleString() }}
+                  </td>
+                  <td class="px-3 py-2 text-right font-mono text-yellow-700 dark:text-yellow-400">
+                    {{ m.cached.toLocaleString() }}
+                  </td>
+                  <td class="px-3 py-2 text-right font-mono text-emerald-700 dark:text-emerald-400">
+                    {{ formatCostUsd(m.total) }}
+                  </td>
+                </tr>
+              </tbody>
+              <!-- Section total. Column sums of the body; Cost cell carries
+                 the per-token grand total via formatStatCurrency for the
+                 same two-decimal convention used in the Combined Total
+                 below. -->
+              <tfoot>
+                <tr class="bg-muted/30 border-t border-border">
+                  <td class="px-4 py-2 text-xs font-medium text-fg-muted uppercase tracking-wide">
+                    Total
+                  </td>
+                  <td class="px-3 py-2 text-right font-mono text-fg-primary">
+                    {{ perTokenBreakdown.turnCount.toLocaleString() }}
+                  </td>
+                  <td class="px-3 py-2 text-right font-mono text-fg-muted">
+                    {{ perTokenBreakdown.prompt.toLocaleString() }}
+                  </td>
+                  <td class="px-3 py-2 text-right font-mono text-fg-muted">
+                    {{ perTokenBreakdown.completion.toLocaleString() }}
+                  </td>
+                  <td class="px-3 py-2 text-right font-mono text-fg-muted">
+                    {{ perTokenBreakdown.reasoning.toLocaleString() }}
+                  </td>
+                  <td class="px-3 py-2 text-right font-mono text-yellow-700 dark:text-yellow-400">
+                    {{ perTokenBreakdown.cached.toLocaleString() }}
+                  </td>
+                  <td class="px-3 py-2 text-right font-mono text-emerald-700 dark:text-emerald-400">
+                    {{ formatStatCurrency(perTokenBreakdown.total) }}
+                  </td>
+                </tr>
+              </tfoot>
+            </table>
+          </div>
+
+          <!--
+            Chart view: horizontal bars sorted by cost. Picks per-model when
+            the breakdown has more model entries than agent entries (typical
+            fleet view); switches to per-agent when an agent filter narrows
+            the scope. Inline SVG with relative widths.
+          -->
+          <!-- Unified grid for all rows so the auto cost column resolves
+               to a single width and bars left-align across rows. Same
+               pattern as the Subscription chart above. -->
+          <div
+            v-else
+            class="px-4 py-3 border-t border-border grid items-center gap-x-3 gap-y-1.5 text-xs grid-cols-[minmax(0,1fr)_minmax(0,3fr)_auto]"
+          >
+            <template
+              v-for="(r, i) in chartRows"
+              :key="i"
+            >
+              <div
+                class="font-mono text-fg-primary truncate"
+                :title="r.label"
+              >
+                {{ r.label }}
+              </div>
+              <div class="relative h-5 bg-muted/30 border border-border overflow-hidden">
+                <div
+                  class="h-full bg-emerald-500/30"
+                  :style="{ width: ((r.cost / chartMaxCost) * 100).toFixed(2) + '%' }"
+                />
+              </div>
+              <div class="font-mono text-emerald-700 dark:text-emerald-400 tabular-nums shrink-0">
+                {{ formatCostUsd(r.cost) }}
+                <span class="text-fg-muted">· {{ r.turnCount }}t</span>
+              </div>
+            </template>
+          </div>
+        </div>
+
+        <!-- All-free-tier empty state. Only rendered when no paid per-token
+             activity AND no subscription activity exist — both subsections
+             are suppressed because their aggregates would all be free-tier
+             counts under a cost-attribution section. -->
+        <div
+          v-if="!hasPaidData && !hasSubscriptionSection"
+          class="px-4 py-6 text-center text-sm text-fg-muted"
+        >
+          All turns in this window were on free-tier models — no cost to attribute.
+        </div>
+
+        <!-- JCLAW-280: combined total — rendered at the very bottom as a
+             single table row sharing the per-model tables' column widths
+             (table-fixed + w-1/4 Model column via the explicit colgroup
+             below). The "Combined total" label lives in the first cell
+             rather than a separate header strip above, so the grand total
+             reads as one row that lines up vertically with the section
+             Total rows above. Visually demarcated as a *zone* (tinted bg
+             + pt-6 breathing room) rather than a bordered row — the wrapper's
+             bg flood-fills the gap above the row plus the row itself, so the
+             operator reads "everything below the per-token table is the
+             combined-total summary" without a hard line stitched between
+             the gap and the row.
+             Suppressed entirely when no usage exists in the window — even
+             when a subscription is configured. The (dimmed) provider chips
+             up top already convey the bill on zero-usage weeks; rendering
+             a Combined Total of $bill / 0 turns / 0 tokens / 0 cost-per-row
+             was visual noise the operator had to mentally subtract from. -->
+        <div
+          v-if="hasPaidData || subscriptionPerModelAllocated.length > 0"
+          class="overflow-x-auto pt-6 bg-muted/50"
+        >
+          <table class="w-full min-w-[42rem] text-xs table-fixed">
+            <!-- Explicit colgroup so table-fixed has a column-width source
+                 independent of any row. The sr-only thead below applies
+                 position:absolute (Tailwind's sr-only is width:1px height:1px
+                 position:absolute), which yanks its cells out of the table
+                 box tree. Without colgroup, table-fixed loses the w-1/4
+                 Model-column cue from the absent thead and distributes 7
+                 equal columns ≈ 14.3% each, leaving the Model column too
+                 narrow and shifting every stat column left of the per-token
+                 table's columns above. Colgroup widths sit above row-based
+                 inference in the table-fixed algorithm, so they apply
+                 regardless of thead positioning — and they mirror the
+                 implicit 25% / 12.5%×6 widths the per-modality tables
+                 above get from their visible thead row. -->
+            <colgroup>
+              <col class="w-1/4">
+              <col>
+              <col>
+              <col>
+              <col>
+              <col>
+              <col>
+            </colgroup>
+            <!-- Visually-hidden header so screen readers can announce each
+                 cell's column. The per-modality tables above already render
+                 their column headers visibly, and this footer mirrors their
+                 column layout — no need for a second visible header row,
+                 but WCAG 2 A requires the structural markup regardless. -->
+            <thead class="sr-only">
+              <tr>
+                <th
+                  scope="col"
+                  class="w-1/4"
+                >
+                  Row label
+                </th>
+                <th scope="col">
+                  Turns
+                </th>
+                <th scope="col">
+                  Prompt
+                </th>
+                <th scope="col">
+                  Completion
+                </th>
+                <th scope="col">
+                  Reasoning
+                </th>
+                <th scope="col">
+                  Cached
+                </th>
+                <th scope="col">
+                  Cost
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <th
+                  scope="row"
+                  class="px-4 py-2 text-left text-xs font-medium text-fg-muted uppercase tracking-wide w-1/4"
+                >
+                  Combined total
+                </th>
+                <td class="px-3 py-2 text-right font-mono text-fg-primary">
+                  {{ combinedTurns.toLocaleString() }}
+                </td>
+                <td class="px-3 py-2 text-right font-mono text-fg-muted">
+                  {{ combinedPrompt.toLocaleString() }}
+                </td>
+                <td class="px-3 py-2 text-right font-mono text-fg-muted">
+                  {{ combinedCompletion.toLocaleString() }}
+                </td>
+                <td class="px-3 py-2 text-right font-mono text-fg-muted">
+                  {{ combinedReasoning.toLocaleString() }}
+                </td>
+                <td class="px-3 py-2 text-right font-mono text-yellow-700 dark:text-yellow-400">
+                  {{ combinedCached.toLocaleString() }}
+                </td>
+                <td class="px-3 py-2 text-right font-mono text-emerald-700 dark:text-emerald-400">
+                  {{ formatStatCurrency(combinedTotal) }}
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </template>
+    </div>
+
+    <!-- Cost-column tooltip. Teleported to <body> so it renders outside
+         the table wrapper's overflow-x-auto clipping context (which
+         clips Y too — see showCostTooltip). Fixed positioning anchored
+         from the icon's bounding rect; right/bottom offsets keep it
+         above and right-aligned with the icon without needing the
+         tooltip's intrinsic dimensions. -->
+    <Teleport to="body">
+      <!-- eslint-disable-next-line vuejs-accessibility/mouse-events-have-key-events, vuejs-accessibility/no-static-element-interactions -- pointer-only hover persistence; keyboard users open it by focusing the info button, and blur or Esc closes it -->
+      <div
+        v-if="costTooltipVisible"
+        :style="{ bottom: costTooltipBottom + 'px', right: costTooltipRight + 'px' }"
+        class="fixed z-50 w-64 px-2.5 py-2 bg-muted border border-input text-xs text-fg-muted leading-relaxed shadow-xl"
+        role="tooltip"
+        data-testid="cost-info-tooltip"
+        @mouseenter="keepCostTooltip"
+        @mouseleave="scheduleHideCostTooltip"
+      >
+        Subscription cost allocated across models by total tokens (prompt + completion + reasoning).
+      </div>
+    </Teleport>
+  </div>
+</template>

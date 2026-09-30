@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Architecture Diagram</title>
+  <style>
+    :root {
+      --primary-color: #3498db;
+      --secondary-color: #2ecc71;
+      --background-color: #ffffff;
+      --text-color: #333333;
+      --accent-color: #e74c3c;
+      --link-color: #2980b9;
+      --card-bg: #f8f9fa;
+      --border-color: #e1e4e8;
+    }
+    
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --primary-color: #2980b9;
+        --secondary-color: #27ae60;
+        --background-color: #1a1a1a;
+        --text-color: #f0f0f0;
+        --accent-color: #c0392b;
+        --link-color: #3498db;
+        --card-bg: #2d2d2d;
+        --border-color: #444444;
+      }
+    }
+    
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;
+      margin: 0;
+      padding: 0;
+      background-color: var(--background-color);
+      color: var(--text-color);
+      line-height: 1.6;
+    }
+    
+    .container {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 2rem;
+    }
+    
+    h1, h2, h3 {
+      font-weight: 600;
+    }
+    
+    h1 {
+      color: var(--primary-color);
+      margin-bottom: 2rem;
+    }
+    
+    .diagram-container {
+      margin: 2rem 0;
+      padding: 1rem;
+      background-color: var(--card-bg);
+      border-radius: 8px;
+      box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+    }
+    
+    .mermaid {
+      font-family: 'Courier New', Courier, monospace;
+      text-align: center;
+    }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
+  <script>
+    document.addEventListener('DOMContentLoaded', function() {
+      mermaid.initialize({
+        theme: window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'default',
+        startOnLoad: true,
+        securityLevel: 'loose',
+        flowchart: {
+          htmlLabels: true,
+          curve: 'basis'
+        }
+      });
+      
+      // Listen for theme changes
+      window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', event => {
+        mermaid.initialize({
+          theme: event.matches ? 'dark' : 'default'
+        });
+        location.reload();
+      });
+    });
+  </script>
+</head>
+<body>
+  <div class="container">
+    <h1>Architecture Diagram</h1>
+    
+    <div class="diagram-container">
+      <div class="mermaid">
+        graph TD
+          A[Client] --> B[Load Balancer]
+          B --> C[Web Server 1]
+          B --> D[Web Server 2]
+          C --> E[Database]
+          D --> E
+      </div>
+    </div>
+    
+    <div class="details">
+      <h2>Component Details</h2>
+      <!-- Component details would go here -->
+    </div>
+  </div>
+</body>
+</html>

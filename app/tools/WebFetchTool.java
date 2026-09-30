@@ -1,0 +1,352 @@
+package tools;
+
+import agents.ToolAction;
+import agents.ToolRegistry;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+import models.Agent;
+import okhttp3.OkHttpClient;
+import org.jspecify.annotations.Nullable;
+import services.AgentService;
+import services.ConfigService;
+import services.EventLogger;
+import services.scrape.BlockClassifier;
+import services.scrape.ScrapeObservation;
+import services.scrape.ScrapeReason;
+import services.scrape.ScrapeRung;
+import tools.scrape.ScrapeLadder;
+import tools.scrape.ScrapeOutput;
+import tools.scrape.ScrapeProxy;
+import utils.ErrorTemplate;
+import utils.GsonHolder;
+import utils.SsrfGuard;
+import utils.ToolErrorTemplates;
+import utils.WebExtraction;
+
+import javax.net.ssl.SSLException;
+
+import java.net.ConnectException;
+import java.net.NoRouteToHostException;
+import java.net.SocketTimeoutException;
+import java.net.URI;
+import java.net.UnknownHostException;
+import java.time.Duration;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
+/**
+ * Fetch the content of a URL. By default HTML is run through a Readability main-content pass
+ * (falling back to a Jsoup boilerplate strip) and converted to Markdown; PDF / Office / other
+ * non-HTML documents are extracted to text with Apache Tika; JSON, XML and plain text pass
+ * through unchanged. {@code format} and {@code extract} ask for something else instead — plain
+ * text, a JSON record, raw HTML, or named values — as {@link ScrapeOutput} describes.
+ *
+ * <p>The fetch and extraction chain lives in {@link WebExtraction}, shared with
+ * {@code web_scrape} (JCLAW-1082). What stays here is what is specific to this
+ * tool: the schema, the html-mode workspace save, and the mapping of failures
+ * onto LLM-facing error strings.
+ *
+ * <p>Because this tool consumes URLs emitted by the LLM, every request goes
+ * through {@link SsrfGuard}: the scheme is pinned to http/https and the DNS
+ * resolver rejects loopback, link-local (cloud metadata), RFC-1918, and
+ * multicast ranges before any socket is opened. Redirects are followed
+ * manually so each hop can be re-validated — the built-in OkHttp redirect
+ * path is disabled.
+ *
+ * <p>{@link SsrfGuard} only constrains which hosts are reachable, not what
+ * leaves: a prompt-injected agent can still encode conversation content into a
+ * URL on a host it is allowed to reach. An operator who wants that contained
+ * sets {@code web_fetch.allowlist}.
+ */
+public class WebFetchTool implements ToolRegistry.Tool {
+
+    private static final int MAX_HTML_LENGTH = 100_000;
+    private static final int CONNECT_TIMEOUT_SECONDS = 10;
+    private static final int TIMEOUT_SECONDS = 30;
+
+    /** Identifies this client honestly. A per-request value in
+     *  {@link WebExtraction#fetch} so a caller can present differently without
+     *  forking the redirect loop. */
+    private static final Map<String, String> HEADERS =
+            Map.of("User-Agent", "Mozilla/5.0 (compatible; JClaw/1.0)");
+
+    /** Raw HTML and selectors both need the page's own source, so they ask for it: the shared
+     *  default prefers markdown, and a site that honors that had its markdown written
+     *  to the workspace as {@code <host>.html}. */
+    private static Map<String, String> headersFor(ScrapeOutput.Request output) {
+        if (!output.needsHtml()) return HEADERS;
+        var withAccept = new HashMap<>(HEADERS);
+        withAccept.put("Accept", "text/html,application/xhtml+xml");
+        return Map.copyOf(withAccept);
+    }
+
+    /**
+     * Package-private and non-final so {@code WebFetchToolTest} can substitute
+     * a loopback-friendly client (SsrfGuard's {@code SAFE_DNS} blocks 127.0.0.1
+     * where MockWebServer binds). Production code must not mutate this — the
+     * guarded client is the only supported runtime path.
+     */
+    static OkHttpClient CLIENT = SsrfGuard.buildGuardedClient(
+            CONNECT_TIMEOUT_SECONDS, TIMEOUT_SECONDS);
+
+    private static final String EVENT_CATEGORY = "scrape";
+    private static final String CFG_MAX_ESCALATIONS = "web_fetch.max-escalations-per-minute";
+
+    /** A single-URL tool has no crawl to budget within, so the bound spans calls: a page
+     *  extracting under 200 characters classifies THIN_CONTENT, so an agent walking a list
+     *  of short pages paid for a browser render on every one. Five a minute leaves any
+     *  hand-driven fetch escalating and caps the loop. */
+    private static final int DEFAULT_MAX_ESCALATIONS_PER_MINUTE = 5;
+    private static final long ESCALATION_WINDOW_MILLIS = Duration.ofMinutes(1).toMillis();
+
+    /** Agent name to the window it is currently spending, keyed per agent rather than per
+     *  JVM: the loop this bounds runs inside one agent's turn, and a shared counter would
+     *  let it refuse escalation to every other agent for the rest of the minute. */
+    private static final ConcurrentHashMap<String, Window> ESCALATION_WINDOWS =
+            new ConcurrentHashMap<>();
+
+    /** Which window an agent is in, and how many escalations it has admitted there. */
+    private static final class Window {
+        long id;
+        int count;
+    }
+
+    /**
+     * Record an escalation for {@code agentKey} and report whether it fits inside
+     * {@code limit} for the fixed window {@code nowMillis} falls in; a {@code limit} of
+     * zero or less admits nothing. Counts only what it admits, so a refusal does not
+     * deepen the shortfall. Pure in {@code nowMillis}, and the per-key {@code compute} is
+     * atomic, so two parallel fetches by one agent cannot overdraw. Mirrors
+     * {@link services.AppInvokeLimits#tryAcquire}.
+     */
+    public static boolean claimEscalation(String agentKey, int limit, long nowMillis) {
+        long windowId = nowMillis / ESCALATION_WINDOW_MILLIS;
+        boolean[] admitted = {false};
+        ESCALATION_WINDOWS.compute(agentKey, (_, existing) -> {
+            var window = existing != null && existing.id == windowId ? existing : new Window();
+            window.id = windowId;
+            if (window.count < limit) {
+                window.count++;
+                admitted[0] = true;
+            }
+            return window;
+        });
+        return admitted[0];
+    }
+
+    /** {@link #claimEscalation(String, int, long)} against the wall clock + live limit config. */
+    private static boolean claimEscalation(Agent agent) {
+        return claimEscalation(agent == null ? "" : agent.name,
+                ConfigService.getInt(CFG_MAX_ESCALATIONS, DEFAULT_MAX_ESCALATIONS_PER_MINUTE),
+                System.currentTimeMillis());
+    }
+
+    @Override
+    public String name() { return "web_fetch"; }
+
+    @Override
+    public String category() { return "Web"; }
+
+    @Override
+    public String icon() { return "globe"; }
+
+    @Override
+    public String shortDescription() {
+        return "Fetch and extract readable text or raw HTML from any URL.";
+    }
+
+    @Override
+    public List<ToolAction> actions() {
+        return List.of(
+                new ToolAction("fetch", "Retrieve a URL as readable Markdown, plain text or a JSON record"),
+                new ToolAction("extract", "Pull named values from a page by CSS selector, or its own structured data"),
+                new ToolAction("fetch (html)", "Retrieve a URL and return the raw HTML source")
+        );
+    }
+
+    @Override
+    public String description() {
+        return """
+                Fetch the content of a URL as readable Markdown — best for reading, summarizing, saving \
+                content, or answering questions about a page. Handles HTML articles, PDFs and Office \
+                documents. Use extract to pull specific values instead of the whole page.""";
+    }
+
+    @Override
+    public Map<String, Object> parameters() {
+        return Map.of(
+                SchemaKeys.TYPE, SchemaKeys.OBJECT,
+                SchemaKeys.PROPERTIES, properties(),
+                SchemaKeys.REQUIRED, List.of("url")
+        );
+    }
+
+    private static Map<String, Object> properties() {
+        var props = new LinkedHashMap<String, Object>();
+        props.put("url", Map.of(SchemaKeys.TYPE, SchemaKeys.STRING, SchemaKeys.DESCRIPTION, "The URL to fetch"));
+        props.putAll(ScrapeOutput.schema(true));
+        return props;
+    }
+
+    /** The format a call gets when it names none. {@code mode} predates {@code format} (JCLAW-1271)
+     *  and is still honored, so a prompt or skill written against it keeps working. */
+    private static ScrapeOutput.Format legacyFormat(JsonObject args) {
+        return args.has("mode") && "html".equals(args.get("mode").getAsString())
+                ? ScrapeOutput.Format.HTML : ScrapeOutput.Format.MARKDOWN;
+    }
+
+    /** Stateless HTTP GET — holds no handles between calls, writes nothing
+     *  to disk. Safe to call many URLs in parallel. */
+    @Override public boolean parallelSafe() { return true; }
+
+    @Override
+    public String execute(String argsJson, Agent agent) {
+        return executeRich(argsJson, agent).text();
+    }
+
+    /** JCLAW-1132: every failure carries its {@code ErrorTemplate} in {@code structuredJson}. */
+    @Override
+    public ToolRegistry.ToolResult executeRich(String argsJson, Agent agent) {
+        var args = JsonParser.parseString(argsJson).getAsJsonObject();
+        var url = args.get("url").getAsString();
+        ScrapeOutput.Request output;
+        try {
+            output = ScrapeOutput.parse(args, true, legacyFormat(args));
+        } catch (IllegalArgumentException e) {
+            return ToolRegistry.ToolResult.error(ToolErrorTemplates.webBadArgument(String.valueOf(e.getMessage())));
+        }
+
+        try {
+            var fetched = WebExtraction.fetch(url, ScrapeProxy.client(CLIENT), headersFor(output));
+            var text = WebExtraction.toText(fetched);
+            var best = climb(url, fetched, text, null, agent).best();
+            var body = best.fetched() == null ? fetched : best.fetched();
+            var extracted = best.text() == null ? text : best.text();
+            return ToolRegistry.ToolResult.text(render(output, url, body, extracted, best.servedBy(), agent));
+        } catch (WebExtraction.HostNotAllowedException e) {
+            // Already a three-part refusal, authored where the allowlist lives.
+            return ToolRegistry.ToolResult.text(e.getMessage());
+        } catch (SecurityException e) {
+            return ToolRegistry.ToolResult.error(
+                    ToolErrorTemplates.webBlocked(String.valueOf(e.getMessage())));
+        } catch (UnknownHostException e) {
+            return ToolRegistry.ToolResult.error(
+                    ToolErrorTemplates.webHostUnresolved(url, String.valueOf(e.getMessage())));
+        } catch (SocketTimeoutException _) {
+            return ToolRegistry.ToolResult.error(ToolErrorTemplates.webTimedOut(url, TIMEOUT_SECONDS));
+        } catch (SSLException e) {
+            return ToolRegistry.ToolResult.error(
+                    ToolErrorTemplates.webTlsFailed(url, String.valueOf(e.getMessage())));
+        } catch (Exception e) {
+            return escalateOrReport(url, output, agent, e);
+        }
+    }
+
+    private String render(ScrapeOutput.Request output, String url, WebExtraction.FetchResult body,
+                          String text, ScrapeRung servedBy, Agent agent) {
+        if (output.json()) {
+            // Links only when JSON was asked for outright: beside extract or metadata, up to two hundred
+            // URLs would undo the saving those arguments exist for.
+            boolean withLinks = output.format() == ScrapeOutput.Format.JSON && !output.contentOmitted();
+            return GsonHolder.GSON.toJson(ScrapeOutput.pageRecord(output, url, body, text, servedBy, withLinks));
+        }
+        return switch (output.format()) {
+            case HTML -> rawHtml(body, url, agent);
+            case TEXT -> WebExtraction.toPlain(body, text);
+            case MARKDOWN, JSON -> text;
+        };
+    }
+
+    /** The failures {@link #executeRich} has no specific catch for: a wrapped TLS failure, or one to escalate. */
+    private ToolRegistry.ToolResult escalateOrReport(String url, ScrapeOutput.Request output, Agent agent,
+                                                     Exception e) {
+        if (e.getCause() instanceof SSLException sslEx) {
+            return ToolRegistry.ToolResult.error(
+                    ToolErrorTemplates.webTlsFailed(url, String.valueOf(sslEx.getMessage())));
+        }
+        // A refusal is the case escalation exists for — an HTTP 403 arrives here as
+        // an IOException, and giving up on it is exactly what left the higher rungs
+        // unreachable (JCLAW-1099). The SSRF, host-allowlist and TLS branches above
+        // deliberately do NOT escalate: those are our own refusals, and retrying
+        // them through a different transport would be a way around the guard.
+        var climb = climb(url, null, null, e, agent);
+        var escalated = climb.best();
+        if (escalated.usable()) {
+            var escalatedBody = escalated.fetched();
+            return ToolRegistry.ToolResult.text(escalatedBody == null ? escalated.resolvedText()
+                    : render(output, url, escalatedBody, escalated.resolvedText(), escalated.servedBy(), agent));
+        }
+        return ToolRegistry.ToolResult.error(classifyFetchFailure(url, e, escalated.reason(), climb.climbed()));
+    }
+
+    /**
+     * A connection refused or unroutable host reaches the generic branch rather than its own
+     * catch, because those are the failures the escalation ladder exists to get past. Once the
+     * ladder has given up they still need their own remedy: a timeout means wait, a refused
+     * connection means the port or scheme is wrong, and retrying longer cannot fix the second.
+     */
+    private static ErrorTemplate classifyFetchFailure(String url, Exception e, ScrapeReason reason, boolean climbed) {
+        var cause = e.getCause();
+        boolean unreachable = e instanceof ConnectException || e instanceof NoRouteToHostException
+                || cause instanceof ConnectException || cause instanceof NoRouteToHostException;
+        var detail = String.valueOf(e.getMessage());
+        if (unreachable) return ToolErrorTemplates.webHostUnreachable(url, detail);
+        return switch (reason) {
+            case GEO_BLOCK -> ToolErrorTemplates.webEgressBanned(url, detail, true);
+            case IP_BLOCK -> ToolErrorTemplates.webEgressBanned(url, detail, false);
+            default -> ToolErrorTemplates.webFetchFailed(url, detail, climbed);
+        };
+    }
+
+    /** The ladder's best attempt, and whether any rung past the first was tried for it. */
+    private record Climb(ScrapeLadder.Attempt best, boolean climbed) {}
+
+    /** Hand one URL to the ladder, classifying the plain attempt the way the crawler and
+     *  the harness both do so all three agree on what counts as a failure. */
+    private static Climb climb(String url, WebExtraction.@Nullable FetchResult fetched,
+                               @Nullable String text, @Nullable Exception failure, Agent agent) {
+        var error = failure == null ? null : failure.getMessage();
+        ScrapeObservation obs;
+        if (fetched != null) {
+            obs = ScrapeObservation.of(fetched, text);
+        } else if (failure instanceof WebExtraction.HttpStatusException refusal) {
+            obs = ScrapeObservation.refused(url, refusal);
+        } else {
+            obs = ScrapeObservation.failed(url, error == null ? "fetch failed" : error);
+        }
+        var plain = new ScrapeLadder.Attempt(
+                ScrapeRung.PLAIN, fetched, text, BlockClassifier.classify(obs), error, obs.status());
+        // Ask before claiming, as the crawler does: a reason no installed rung addresses
+        // would spend the budget without a request ever being issued.
+        if (plain.usable() || !ScrapeLadder.wouldAttempt(plain.reason(), plain.status())) return new Climb(plain, false);
+        if (!claimEscalation(agent)) {
+            EventLogger.info(EVENT_CATEGORY,
+                    "%s: not escalated, this agent's budget for the minute is spent".formatted(url),
+                    "%s; raise %s to escalate more often".formatted(plain.reason(), CFG_MAX_ESCALATIONS));
+            return new Climb(plain, false);
+        }
+        return new Climb(ScrapeLadder.climb(url, plain), true);
+    }
+
+    /**
+     * Raw HTML mode. Large pages are written to the agent workspace instead of
+     * returned, so hundreds of KB of markup can't flood the LLM context.
+     */
+    private String rawHtml(WebExtraction.FetchResult fetched, String url, Agent agent) {
+        var html = new String(fetched.body(), WebExtraction.charsetFor(fetched.contentType()));
+        if (html.length() > WebExtraction.MAX_TEXT_LENGTH && agent != null) {
+            var filename = URI.create(url).getHost().replaceAll("[^a-zA-Z0-9.-]", "_") + ".html";
+            AgentService.writeWorkspaceFile(agent.name, filename, html);
+            return "HTML saved to workspace as '%s' (%d characters from %s)"
+                    .formatted(filename, html.length(), url);
+        }
+        if (html.length() > MAX_HTML_LENGTH) {
+            return html.substring(0, MAX_HTML_LENGTH)
+                    + "\n\n[Truncated: HTML exceeds %d characters]".formatted(MAX_HTML_LENGTH);
+        }
+        return html;
+    }
+}

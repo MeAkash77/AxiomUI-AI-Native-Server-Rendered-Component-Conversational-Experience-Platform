@@ -1,0 +1,372 @@
+import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
+import mcp.McpClient;
+import mcp.McpException;
+import mcp.McpToolDef;
+import mcp.jsonrpc.JsonRpc;
+import mcp.transport.McpTransport;
+import org.junit.jupiter.api.Test;
+import play.test.UnitTest;
+
+import java.io.IOException;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
+
+class McpClientTest extends UnitTest {
+
+    private FakeTransport transport;
+
+    // ==================== handshake ====================
+
+    @Test
+    void connectPerformsInitializeHandshake() throws Exception {
+        transport = new FakeTransport();
+        try (var client = new McpClient("test", transport, "0.0.1")) {
+            // Drive the conversation in a background thread so connect() can block on responses.
+            var driver = Thread.ofVirtual().start(() -> {
+                try {
+                    var initReq = transport.takeSent(JsonRpc.Request.class);
+                    assertEquals("initialize", initReq.method());
+                    assertNotNull(initReq.id());
+                    var initResult = new JsonObject();
+                    initResult.addProperty("protocolVersion", McpClient.PROTOCOL_VERSION);
+                    initResult.add("capabilities", new JsonObject());
+                    transport.deliver(new JsonRpc.Response(initReq.id(), initResult, null));
+
+                    var initialized = transport.takeSent(JsonRpc.Notification.class);
+                    assertEquals("notifications/initialized", initialized.method());
+
+                    var listReq = transport.takeSent(JsonRpc.Request.class);
+                    assertEquals("tools/list", listReq.method());
+                    transport.deliver(new JsonRpc.Response(listReq.id(), toolsResult(), null));
+                } catch (InterruptedException _) {
+                    Thread.currentThread().interrupt();
+                }
+            });
+
+            client.connect();
+            driver.join(5000);
+            assertEquals(McpClient.State.READY, client.state());
+            assertEquals(1, client.tools().size());
+            assertEquals("echo", client.tools().get(0).name());
+        }
+    }
+
+    @Test
+    void connectRejectsServerErrorOnInitialize() {
+        transport = new FakeTransport();
+        try (var client = new McpClient("test", transport, "0.0.1")) {
+            Thread.ofVirtual().start(() -> {
+                try {
+                    var req = transport.takeSent(JsonRpc.Request.class);
+                    transport.deliver(new JsonRpc.Response(req.id(), null,
+                            new JsonRpc.Error(-32602, "Unsupported version")));
+                } catch (InterruptedException _) {}
+            });
+
+            var ex = assertThrows(McpException.class, client::connect);
+            assertTrue(ex.getMessage().contains("Unsupported version"),
+                    "exception should propagate server error message: " + ex.getMessage());
+            assertEquals(McpClient.State.DISCONNECTED, client.state());
+        }
+    }
+
+    @Test
+    void connectRefusedFromNonDisconnectedState() throws Exception {
+        transport = new FakeTransport();
+        try (var client = new McpClient("test", transport, "0.0.1")) {
+            completeHandshake(client);
+            assertThrows(McpException.class, client::connect);
+        }
+    }
+
+    // ==================== callTool ====================
+
+    // JCLAW-1191: the generous first-connect budget belongs to the handshake alone. A client
+    // that kept it for every request made a hung server cost two minutes per tool call.
+    @Test
+    void aToolCallUsesTheRequestBudgetNotTheHandshakeBudget() throws Exception {
+        transport = new FakeTransport();
+        try (var client = new McpClient("test", transport, "0.0.1", Duration.ofSeconds(30), Duration.ofMillis(300))) {
+            completeHandshake(client);
+
+            // The server never answers the call.
+            var t0 = System.nanoTime();
+            var ex = assertThrows(McpException.class, () -> client.callTool("echo", new JsonObject()));
+            var elapsedMs = (System.nanoTime() - t0) / 1_000_000;
+
+            assertTrue(ex.getMessage().contains("timed out after PT0.3S"), ex.getMessage());
+            assertTrue(elapsedMs < 5_000, "the 30 s handshake budget must not apply to a tool call: " + elapsedMs + " ms");
+        }
+    }
+
+    @Test
+    void callToolReturnsTextContent() throws Exception {
+        transport = new FakeTransport();
+        try (var client = new McpClient("test", transport, "0.0.1")) {
+            completeHandshake(client);
+
+            Thread.ofVirtual().start(() -> {
+                try {
+                    var call = transport.takeSent(JsonRpc.Request.class);
+                    assertEquals("tools/call", call.method());
+                    var result = new JsonObject();
+                    var content = new JsonArray();
+                    var part = new JsonObject();
+                    part.addProperty("type", "text");
+                    part.addProperty("text", "echoed");
+                    content.add(part);
+                    result.add("content", content);
+                    transport.deliver(new JsonRpc.Response(call.id(), result, null));
+                } catch (InterruptedException _) {}
+            });
+
+            var args = new JsonObject();
+            args.addProperty("text", "hello");
+            var result = client.callTool("echo", args);
+            assertEquals("echoed", result.content());
+            assertFalse(result.isError());
+        }
+    }
+
+    @Test
+    void callToolPropagatesServerErrorAsMcpException() throws Exception {
+        transport = new FakeTransport();
+        try (var client = new McpClient("test", transport, "0.0.1")) {
+            completeHandshake(client);
+
+            Thread.ofVirtual().start(() -> {
+                try {
+                    var call = transport.takeSent(JsonRpc.Request.class);
+                    transport.deliver(new JsonRpc.Response(call.id(), null,
+                            new JsonRpc.Error(-32000, "tool crashed")));
+                } catch (InterruptedException _) {}
+            });
+
+            var args = new JsonObject();
+            var ex = assertThrows(McpException.class,
+                    () -> client.callTool("echo", args));
+            assertTrue(ex.getMessage().contains("tool crashed"));
+        }
+    }
+
+    @Test
+    void callToolRejectedBeforeReady() {
+        transport = new FakeTransport();
+        try (var client = new McpClient("test", transport, "0.0.1")) {
+            // No connect() — state remains DISCONNECTED.
+            var args = new JsonObject();
+            assertThrows(McpException.class, () -> client.callTool("echo", args));
+        }
+    }
+
+    // ==================== notifications ====================
+
+    @Test
+    void toolsListChangedTriggersRefreshAndCallback() throws Exception {
+        transport = new FakeTransport();
+        try (var client = new McpClient("test", transport, "0.0.1")) {
+            var fired = new AtomicReference<List<McpToolDef>>();
+            client.onToolsChanged(fired::set);
+
+            completeHandshake(client);
+
+            // Server pushes a list_changed notification.
+            transport.deliver(new JsonRpc.Notification("notifications/tools/list_changed", null));
+
+            // The handler spawns a VT that fetches tools/list. We respond with a different list.
+            var refresh = transport.takeSent(JsonRpc.Request.class);
+            assertEquals("tools/list", refresh.method());
+            var newTools = new JsonObject();
+            var arr = new JsonArray();
+            var t = new JsonObject();
+            t.addProperty("name", "echo");
+            t.addProperty("description", "Echo");
+            t.add("inputSchema", new JsonObject());
+            arr.add(t);
+            var t2 = new JsonObject();
+            t2.addProperty("name", "noop");
+            t2.addProperty("description", "Do nothing");
+            t2.add("inputSchema", new JsonObject());
+            arr.add(t2);
+            newTools.add("tools", arr);
+            transport.deliver(new JsonRpc.Response(refresh.id(), newTools, null));
+
+            // Wait briefly for the VT to complete the refresh and fire the callback.
+            var deadline = System.currentTimeMillis() + 2000;
+            while (fired.get() == null && System.currentTimeMillis() < deadline) {
+                Thread.sleep(20);
+            }
+            assertNotNull(fired.get(), "onToolsChanged callback must fire after refresh");
+            assertEquals(2, fired.get().size());
+            assertEquals(2, client.tools().size());
+        }
+    }
+
+    // ==================== server-initiated requests ====================
+
+    @Test
+    void serverInitiatedRequestRepliedWithMethodNotFound() throws Exception {
+        transport = new FakeTransport();
+        try (var client = new McpClient("test", transport, "0.0.1")) {
+            completeHandshake(client);
+
+            // Server requests something we don't support (e.g., sampling/createMessage).
+            transport.deliver(new JsonRpc.Request(99L, "sampling/createMessage", null));
+
+            var reply = transport.takeSent(JsonRpc.Response.class);
+            assertEquals(99L, reply.id());
+            assertTrue(reply.isError());
+            assertEquals(-32601, reply.error().code());
+        }
+    }
+
+    // ==================== transport errors ====================
+
+    @Test
+    void transportErrorMovesToDisconnectedAndCancelsPending() throws Exception {
+        transport = new FakeTransport();
+        try (var client = new McpClient("test", transport, "0.0.1")) {
+            completeHandshake(client);
+
+            // Issue a callTool but never respond — instead, trip a transport error.
+            var pendingCall = Thread.ofVirtual().start(() -> {
+                try {
+                    client.callTool("echo", new JsonObject());
+                    fail("callTool should have failed");
+                } catch (Exception _) {
+                    // expected: future is completed exceptionally
+                }
+            });
+
+            // Wait for the request to land.
+            transport.takeSent(JsonRpc.Request.class);
+            transport.tripError(new IOException("connection reset"));
+
+            pendingCall.join(2000);
+            assertEquals(McpClient.State.DISCONNECTED, client.state());
+            assertNotNull(client.lastError());
+        }
+    }
+
+    /**
+     * Regression: a transport-level error must symmetrically close the
+     * transport. Without this, the underlying host process (e.g. a
+     * `docker run` subprocess wrapping an MCP server image) stays alive
+     * holding stdio open even after the inner server has died — the
+     * connection manager observes state≠READY and reconnects, but the
+     * orphaned host process persists. Repeated disconnect-reconnect
+     * cycles leak one process (and one docker --rm container) each.
+     */
+    @Test
+    void transportErrorTriggersTransportCloseSoUnderlyingProcessIsReleased() throws Exception {
+        transport = new FakeTransport();
+        try (var client = new McpClient("test", transport, "0.0.1")) {
+            completeHandshake(client);
+
+            assertFalse(transport.closed, "precondition: transport open after handshake");
+            transport.tripError(new IOException("server died"));
+
+            assertEquals(McpClient.State.DISCONNECTED, client.state());
+            assertTrue(transport.closed,
+                    "onTransportError must call transport.close() so the underlying "
+                            + "host process (e.g. docker run subprocess) exits and --rm "
+                            + "releases the container");
+        }
+    }
+
+    // ==================== close ====================
+
+    @Test
+    void closeIsIdempotent() {
+        transport = new FakeTransport();
+        try (var client = new McpClient("test", transport, "0.0.1")) {
+            client.close();
+            client.close();  // must not throw
+            assertEquals(McpClient.State.DISCONNECTED, client.state());
+        }
+    }
+
+    // ==================== helpers ====================
+
+    private void completeHandshake(McpClient client) throws Exception {
+        var driver = Thread.ofVirtual().start(() -> {
+            try {
+                var init = transport.takeSent(JsonRpc.Request.class);
+                var ok = new JsonObject();
+                ok.addProperty("protocolVersion", McpClient.PROTOCOL_VERSION);
+                ok.add("capabilities", new JsonObject());
+                transport.deliver(new JsonRpc.Response(init.id(), ok, null));
+                transport.takeSent(JsonRpc.Notification.class);  // initialized
+                var list = transport.takeSent(JsonRpc.Request.class);
+                transport.deliver(new JsonRpc.Response(list.id(), toolsResult(), null));
+            } catch (InterruptedException _) {}
+        });
+        client.connect();
+        driver.join(5000);
+    }
+
+    private static JsonObject toolsResult() {
+        var result = new JsonObject();
+        var arr = new JsonArray();
+        var t = new JsonObject();
+        t.addProperty("name", "echo");
+        t.addProperty("description", "Echo");
+        var schema = new JsonObject();
+        schema.addProperty("type", "object");
+        t.add("inputSchema", schema);
+        arr.add(t);
+        result.add("tools", arr);
+        return result;
+    }
+
+    /** In-memory transport that captures sent messages and lets the test deliver inbound ones. */
+    static class FakeTransport implements McpTransport {
+        private final LinkedBlockingQueue<JsonRpc.Message> sent = new LinkedBlockingQueue<>();
+        private final List<JsonRpc.Message> sentLog = new ArrayList<>();
+        private Consumer<JsonRpc.Message> onMessage;
+        private Consumer<Throwable> onError;
+        private volatile boolean closed;
+
+        @Override
+        public void start(Consumer<JsonRpc.Message> onMessage, Consumer<Throwable> onError) {
+            this.onMessage = onMessage;
+            this.onError = onError;
+        }
+
+        @Override
+        public synchronized void send(JsonRpc.Message msg) throws IOException {
+            if (closed) throw new IOException("transport closed");
+            sent.offer(msg);
+            sentLog.add(msg);
+        }
+
+        @Override
+        public void close() {
+            closed = true;
+        }
+
+        @SuppressWarnings("unchecked")
+        <T extends JsonRpc.Message> T takeSent(Class<T> expected) throws InterruptedException {
+            var msg = sent.poll(5, TimeUnit.SECONDS);
+            if (msg == null) throw new AssertionError("Timed out waiting for sent " + expected.getSimpleName());
+            if (!expected.isInstance(msg)) {
+                throw new AssertionError("Expected " + expected.getSimpleName() + " got " + msg);
+            }
+            return (T) msg;
+        }
+
+        void deliver(JsonRpc.Message msg) {
+            if (onMessage != null) onMessage.accept(msg);
+        }
+
+        void tripError(Throwable t) {
+            if (onError != null) onError.accept(t);
+        }
+    }
+}

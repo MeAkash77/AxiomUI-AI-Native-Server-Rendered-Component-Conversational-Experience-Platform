@@ -1,0 +1,12 @@
+[project]
+name = "jclaw-asr-sidecar"
+version = "0.1.0"
+description = "ASR transcription sidecar for jclaw — Faster-Whisper (CUDA/CPU) / mlx-whisper (Apple silicon)"
+requires-python = ">=3.11"
+# The daemon (serve.py) is a stdlib-only HTTP supervisor: it holds no ML
+# dependencies and shells every request to the ASR worker (transcribe.py),
+# which carries faster-whisper + mlx-whisper in its own PEP 723 inline
+# script env. So this project env has an empty runtime dependency set.
+# (Local diarization / embedding / separation were removed in JCLAW-654;
+# their torch / pyannote / sherpa-onnx dependencies went with them.)
+dependencies = []

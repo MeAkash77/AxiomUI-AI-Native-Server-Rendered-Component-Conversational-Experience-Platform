@@ -1,0 +1,63 @@
+package jobs;
+
+import models.LatencyMetric;
+import play.jobs.Every;
+import play.jobs.Job;
+import play.jobs.OnApplicationStart;
+import services.EventLogger;
+import services.Tx;
+import utils.AppClock;
+
+import java.time.temporal.ChronoUnit;
+
+/**
+ * JCLAW-515: scheduled auto-cleanup for {@link LatencyMetric} rows past their
+ * {@code latency.metrics.retentionDays} TTL. Latency emits ~14 rows per turn, so
+ * the table grows much faster than the other metric tables — retention is what
+ * bounds it. Runs every 24h off the chat hot path; a single bulk JPQL delete
+ * removes every expired row regardless of count.
+ *
+ * <p>Configuration: {@code latency.metrics.retentionDays} (integer; default
+ * {@link #DEFAULT_RETENTION_DAYS}). Set to {@link #RETENTION_DISABLED} — or unset
+ * to the default — to govern behavior; out-of-range / non-numeric values fall back
+ * to the default with a one-shot warn.
+ */
+// JCLAW-1067: @Every alone first fires a full interval after boot, so a 24h period
+// never elapses on an instance restarted more often than daily.
+@OnApplicationStart(async = true)
+@Every("24h")
+public class LatencyMetricCleanupJob extends Job<Void> {
+
+    private static final String EVENT_CATEGORY = "LATENCY_CLEANUP";
+    private static final String CONFIG_KEY = "latency.metrics.retentionDays";
+
+    /** Default retention window when the config key is absent. Shorter than the
+     *  task default because latency rows are an order of magnitude more numerous. */
+    public static final int DEFAULT_RETENTION_DAYS = 14;
+
+    /** Sentinel value (0) meaning "retention disabled, never auto-delete". */
+    public static final int RETENTION_DISABLED = RetentionDays.DISABLED;
+
+    private static final int MAX_RETENTION_DAYS = 3650;
+
+    @Override
+    public void doJob() {
+        var retentionDays = resolveRetentionDays();
+        if (retentionDays == RETENTION_DISABLED) return;
+
+        var cutoff = AppClock.now().minus(retentionDays, ChronoUnit.DAYS);
+        int deleted = Tx.run(() -> LatencyMetric.delete("createdAt < ?1", cutoff));
+        if (deleted > 0) {
+            EventLogger.info(EVENT_CATEGORY, null, null,
+                    "Deleted %d latency metric(s) older than %d day(s) (cutoff=%s)"
+                            .formatted(deleted, retentionDays, cutoff));
+        }
+    }
+
+    /** Read {@code latency.metrics.retentionDays} through the resolver the three cleanup
+     *  jobs share. Public for direct test access. */
+    public static int resolveRetentionDays() {
+        return RetentionDays.fromConfig(CONFIG_KEY, DEFAULT_RETENTION_DAYS,
+                MAX_RETENTION_DAYS, EVENT_CATEGORY);
+    }
+}

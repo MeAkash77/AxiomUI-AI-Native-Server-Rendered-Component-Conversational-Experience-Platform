@@ -1,0 +1,182 @@
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.EnabledOnOs;
+import org.junit.jupiter.api.condition.OS;
+import play.test.UnitTest;
+import services.ConfigService;
+import tools.ClaudeAdapter;
+import tools.GenericAdapter;
+import tools.HarnessSandbox;
+import tools.PiAdapter;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.List;
+
+
+/**
+ * JCLAW-672: the opt-in coding-harness sandbox — disabled passthrough,
+ * fail-closed on an unavailable mechanism, adapter allowance composition,
+ * and (on macOS, with sandbox-exec present) a real confined run: writes land
+ * only inside the session directory, and a write outside it is blocked.
+ */
+class HarnessSandboxTest extends UnitTest {
+
+    private Path session;
+
+    @BeforeEach
+    void setup() throws Exception {
+        ConfigService.clearCache();
+        ConfigService.set(HarnessSandbox.ACP_SANDBOX_KEY, "");
+        session = Files.createTempDirectory("jclaw-sbx-session-");
+    }
+
+    @AfterEach
+    void teardown() throws Exception {
+        ConfigService.set(HarnessSandbox.ACP_SANDBOX_KEY, "");
+        if (session != null) {
+            try (var walk = Files.walk(session)) {
+                walk.sorted(java.util.Comparator.reverseOrder()).forEach(p -> p.toFile().delete());
+            }
+        }
+    }
+
+    @Test
+    void disabledIsPassthrough() {
+        var argv = List.of("claude", "-p");
+        assertEquals(argv, HarnessSandbox.wrap(argv, session.toFile(), new ClaudeAdapter()));
+    }
+
+    @Test
+    void claudeAllowancesAreItsOwnStateOnly() {
+        assertEquals(List.of(".claude", ".claude.json"), new ClaudeAdapter().sandboxAllowances());
+        assertTrue(new GenericAdapter().sandboxAllowances().isEmpty(),
+                "the generic harness declares no HOME allowances");
+        assertEquals(List.of(".pi", ".config/pi"), new PiAdapter().sandboxAllowances());
+    }
+
+    @Test
+    void enabledButNoWorkdirFailsClosed() {
+        ConfigService.set(HarnessSandbox.ACP_SANDBOX_KEY, "true");
+        var e = assertThrows(HarnessSandbox.SandboxUnavailableException.class,
+                () -> HarnessSandbox.wrap(List.of("claude"), null, new ClaudeAdapter()));
+        assertTrue(e.getMessage().contains("session working directory"), e.getMessage());
+    }
+
+    // JCLAW-709: the tri-state config parses to the right Scope, back-compat intact.
+    @Test
+    void scopeParsesTriState() {
+        ConfigService.set(HarnessSandbox.ACP_SANDBOX_KEY, "");
+        assertEquals(HarnessSandbox.Scope.OFF, HarnessSandbox.scope());
+        assertFalse(HarnessSandbox.enabled());
+        ConfigService.set(HarnessSandbox.ACP_SANDBOX_KEY, "true");
+        assertEquals(HarnessSandbox.Scope.ALL, HarnessSandbox.scope());
+        assertTrue(HarnessSandbox.enabled());
+        ConfigService.set(HarnessSandbox.ACP_SANDBOX_KEY, "untrusted");
+        assertEquals(HarnessSandbox.Scope.UNTRUSTED, HarnessSandbox.scope());
+        // untrusted is NOT "confine everything", so enabled() (== ALL) stays false.
+        assertFalse(HarnessSandbox.enabled());
+    }
+
+    // JCLAW-709: untrusted mode confines ONLY untrusted-origin runs. A trusted
+    // origin passes through even with the mode on; an untrusted origin takes the
+    // sandbox path (proven cross-platform by the null-workdir fail-closed guard).
+    @Test
+    void untrustedModeConfinesOnlyUntrustedOrigin() {
+        ConfigService.set(HarnessSandbox.ACP_SANDBOX_KEY, "untrusted");
+        var argv = List.of("claude", "-p");
+        // trustedOrigin=true → not confined even though the mode is on.
+        assertEquals(argv, HarnessSandbox.wrap(argv, session.toFile(), new ClaudeAdapter(), true));
+        // trustedOrigin=false → the sandbox applies; a null workdir fails closed
+        // (same guard as the always-on mode), proving the confine path is taken.
+        var e = assertThrows(HarnessSandbox.SandboxUnavailableException.class,
+                () -> HarnessSandbox.wrap(List.of("claude"), null, new ClaudeAdapter(), false));
+        assertTrue(e.getMessage().contains("session working directory"), e.getMessage());
+    }
+
+    /**
+     * bwrap applies mounts in argument order and a tmpfs over an ancestor hides every earlier
+     * bind beneath it, so a write root under $HOME is reachable only if it is bound after the
+     * $HOME tmpfs. Pinned on every host because no Linux test can run the real thing here.
+     */
+    @Test
+    void linuxBindsTheWriteRootAfterTheHomeTmpfs() {
+        var home = System.getProperty("user.home");
+        var writeRoot = Path.of(home, "workspace", "agent").toFile();
+        var argv = HarnessSandbox.linuxArgv(List.of("/bin/sh", "-c", "true"), writeRoot, List.of("/opt/state"));
+
+        int homeTmpfs = indexOfPair(argv, "--tmpfs", home);
+        assertTrue(homeTmpfs >= 0, "the $HOME tmpfs is missing, argv=" + argv);
+        assertTrue(indexOfPair(argv, "--bind", writeRoot.getAbsolutePath()) > homeTmpfs,
+                "the write-root bind must follow the $HOME tmpfs, argv=" + argv);
+        assertTrue(indexOfPair(argv, "--ro-bind-try", "/opt/state") > homeTmpfs,
+                "allowances must follow the $HOME tmpfs, argv=" + argv);
+        assertEquals(List.of("/bin/sh", "-c", "true"), argv.subList(argv.size() - 3, argv.size()));
+    }
+
+    private static int indexOfPair(List<String> argv, String flag, String value) {
+        for (int i = 0; i + 1 < argv.size(); i++) {
+            if (flag.equals(argv.get(i)) && value.equals(argv.get(i + 1))) return i;
+        }
+        return -1;
+    }
+
+    @Test
+    @EnabledOnOs(OS.MAC)
+    void macProfileWrapsAndConfinesWrites() throws Exception {
+        ConfigService.set(HarnessSandbox.ACP_SANDBOX_KEY, "true");
+        var wrapped = HarnessSandbox.wrap(List.of("/bin/sh"), session.toFile(), new GenericAdapter());
+        assertEquals("sandbox-exec", wrapped.get(0));
+        assertEquals("-p", wrapped.get(1));
+        assertTrue(wrapped.get(2).contains(session.toAbsolutePath().toString()),
+                "the profile grants the session dir");
+        assertTrue(wrapped.get(2).contains(".ssh"), "the profile denies ~/.ssh reads");
+
+        // Run a real confined shell: write inside (must succeed) and outside
+        // (must fail). "Outside" must be a genuinely-denied path — NOT the temp
+        // tree (/var/folders is an intentional write allowance for TMPDIR), so
+        // target the home root, which the profile denies.
+        var inside = session.resolve("out.txt");
+        var outside = Path.of(System.getProperty("user.home"), "jclaw-sbx-escape-probe.txt");
+        Files.deleteIfExists(outside);
+        var script = "echo in > " + inside + "; echo out > " + outside + " 2>/dev/null; true";
+        var full = new java.util.ArrayList<>(wrapped);
+        full.add("-c");
+        full.add(script);
+        var proc = new ProcessBuilder(full).redirectErrorStream(true).start();
+        assertTrue(proc.waitFor(30, java.util.concurrent.TimeUnit.SECONDS), "sandboxed run finished");
+
+        assertTrue(Files.exists(inside), "write inside the session dir is allowed");
+        assertFalse(Files.exists(outside),
+                "write to the home root (a denied path) must be blocked by the sandbox");
+        Files.deleteIfExists(outside);
+    }
+
+    // JCLAW-731: a session path containing a double-quote and parens cannot
+    // break out of the Seatbelt (subpath "...") string literal to widen the
+    // profile. The quote is backslash-escaped, so the injected clause stays
+    // inert text inside the literal rather than a new s-expression.
+    @Test
+    @EnabledOnOs(OS.MAC)
+    void macProfileEscapesHostileSessionPath() {
+        ConfigService.set(HarnessSandbox.ACP_SANDBOX_KEY, "true");
+        // The '"' would close the intended subpath early; the ')(injected...'
+        // that follows would open a fresh grant if it escaped the literal.
+        var hostile = new java.io.File("/tmp/jclaw-evil\")(injected-grant");
+        var wrapped = HarnessSandbox.wrap(List.of("/bin/sh"), hostile, new GenericAdapter());
+        var profile = wrapped.get(2);
+
+        // The quote after 'evil' must be escaped (\"), keeping ')(injected...'
+        // inside the string literal.
+        assertTrue(profile.contains("evil\\\")(injected"),
+                "hostile quote must be backslash-escaped: " + profile);
+        // The UNescaped breakout form must be absent — its presence would mean
+        // the literal closed early and the injected clause became live syntax.
+        assertFalse(profile.contains("evil\")(injected"),
+                "an unescaped quote let the path break out of the string literal");
+        // The legit session grant survives escaping intact.
+        assertTrue(profile.contains("(allow file-write* (subpath \"/tmp/jclaw-evil"),
+                "the session path must still be granted (escaping must not corrupt it)");
+    }
+}

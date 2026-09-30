@@ -1,0 +1,288 @@
+<script setup lang="ts">
+import { ChevronDownIcon } from '@heroicons/vue/24/outline'
+import type { ToolAction, ToolCategory, ToolMeta } from '~/composables/useToolMeta'
+
+// JCLAW-173: this page is a read-only catalog. Per-tool enable/disable
+// lives on the agent detail page (pages/agents/[[name]].vue) — the tool registry
+// itself is global, but binding a tool to a specific agent is the only
+// meaningful axis. The previous "global toggle" was a fan-out that wrote
+// to every agent's AgentToolConfig row, which was a leaky abstraction.
+const { TOOL_META, ORDERED_TOOLS, getPillClass, refresh: refreshTools } = useToolMeta()
+
+// Force a refetch on every visit so the MCP tab reflects live server
+// state. Without this the module-level cache means an operator who
+// disabled an MCP server in another tab still sees its card here until
+// a hard reload.
+onMounted(() => {
+  refreshTools()
+})
+
+// JCLAW-281: 'MCP' filter dropped — MCP servers live on /mcp-servers, not here.
+const CATEGORIES = ['All', 'System', 'Web', 'Files', 'Utilities'] as const
+
+// Category order for the "All" view's subheadings. Distinct from the filter-chip
+// order above: the All view groups tools System → Utilities → Files → Web, with
+// tools sorted alphabetically within each group.
+const ALL_VIEW_CATEGORY_ORDER: ToolCategory[] = ['System', 'Utilities', 'Files', 'Web']
+
+// ─── Derived lists ─────────────────────────────────────────────────────────────
+
+/**
+ * One renderable card on the /tools page. Native tools yield exactly one
+ * card per tool; MCP tools sharing a {@code group} (the server name) fold
+ * into a single card whose Functions disclosure lists every tool that
+ * server advertises. The LLM-facing tool catalog is unaffected — every
+ * MCP tool remains its own callable entry; this is purely UI grouping.
+ */
+interface ToolCard {
+  key: string
+  displayName: string
+  category: ToolCategory
+  iconBg: string
+  iconColor: string
+  iconKey: string
+  description: string
+  functions: ToolAction[]
+}
+
+function cardFromSingleTool(name: string, meta: ToolMeta): ToolCard {
+  return {
+    key: name,
+    displayName: name,
+    category: meta.category,
+    iconBg: meta.iconBg,
+    iconColor: meta.iconColor,
+    iconKey: meta.icon,
+    description: meta.shortDescription,
+    functions: meta.functions,
+  }
+}
+
+const allCards = computed<ToolCard[]>(() => {
+  // JCLAW-281: MCP servers are a separate abstraction and own the
+  // /mcp-servers page; this Tools page only renders native tools so the
+  // two abstractions don't blur. Tools with a non-null group() (MCP per-
+  // action wrappers and server-level handles) are filtered out
+  // unconditionally.
+  const cards: ToolCard[] = []
+  for (const name of ORDERED_TOOLS.value) {
+    const meta = TOOL_META.value[name]
+    if (!meta) continue
+    if (meta.group) continue
+    cards.push(cardFromSingleTool(name, meta))
+  }
+  return cards
+})
+
+const activeCategory = ref<typeof CATEGORIES[number]>('All')
+
+const filteredCards = computed(() =>
+  activeCategory.value === 'All'
+    ? allCards.value
+    : allCards.value.filter(c => c.category === activeCategory.value),
+)
+
+// Per-category tool counts for the filter-chip badges. Absolute totals: the
+// chips are the only filter on this page (the top-bar ⌘K palette is global
+// navigation, not a tools-grid search), so there's nothing to react to.
+// Derived from allCards so the counts stay correct as tools are added and
+// exclude MCP-grouped cards exactly as the grid does.
+const categoryCounts = computed<Record<string, number>>(() => {
+  const counts: Record<string, number> = { All: allCards.value.length }
+  for (const cat of CATEGORIES) {
+    if (cat === 'All') continue
+    counts[cat] = allCards.value.filter(c => c.category === cat).length
+  }
+  return counts
+})
+
+function sortByName(cards: ToolCard[]): ToolCard[] {
+  return [...cards].sort((a, b) => a.displayName.localeCompare(b.displayName))
+}
+
+// Cards to render, grouped for display. In the All view, one section per category
+// in ALL_VIEW_CATEGORY_ORDER, each sorted alphabetically and shown under a
+// subheading. In a single-category view, one alphabetical section with no
+// subheading (the active filter chip already labels it). Within a grid the cards
+// flow left-to-right, top-to-bottom, so an alphabetical array reads alphabetically.
+const displaySections = computed<{ category: ToolCategory, cards: ToolCard[] }[]>(() => {
+  const cat = activeCategory.value
+  if (cat === 'All') {
+    return ALL_VIEW_CATEGORY_ORDER
+      .map(c => ({ category: c, cards: sortByName(allCards.value.filter(card => card.category === c)) }))
+      .filter(section => section.cards.length > 0)
+  }
+  return [{ category: cat, cards: sortByName(filteredCards.value) }]
+})
+
+// ─── Expand/collapse ──────────────────────────────────────────────────────────
+
+const expandedSet = ref(new Set<string>())
+
+function toggleExpand(key: string) {
+  const s = new Set(expandedSet.value)
+  if (s.has(key)) s.delete(key)
+  else s.add(key)
+  expandedSet.value = s
+}
+
+const allExpanded = computed(() =>
+  filteredCards.value.length > 0
+  && filteredCards.value.every(c => expandedSet.value.has(c.key)),
+)
+
+function toggleAllExpanded() {
+  if (allExpanded.value) {
+    expandedSet.value = new Set()
+  }
+  else {
+    expandedSet.value = new Set(filteredCards.value.map(c => c.key))
+  }
+}
+</script>
+
+<template>
+  <div>
+    <!-- Header -->
+    <div class="mb-6">
+      <h1 class="text-lg font-semibold text-fg-strong">
+        Tools
+      </h1>
+      <p class="mt-1 text-sm text-fg-muted">
+        Built-in capabilities available to every agent. Open an agent's
+        detail page to bind or unbind a tool for that specific agent.
+      </p>
+    </div>
+
+    <!-- Category filter + global expand/collapse -->
+    <div class="flex items-center justify-between gap-3 mb-6">
+      <div class="flex gap-1.5 flex-wrap">
+        <button
+          v-for="cat in CATEGORIES"
+          :key="cat"
+          class="px-3 py-1 text-xs border transition-colors"
+          :class="activeCategory === cat
+            ? 'bg-emerald-500/10 border-emerald-600 dark:border-emerald-500/40 text-emerald-700 dark:text-emerald-400'
+            : 'bg-surface-elevated border-border text-fg-muted hover:text-fg-primary hover:border-input'"
+          @click="activeCategory = cat"
+        >
+          {{ cat }} <span class="tabular-nums text-fg-muted">({{ categoryCounts[cat] }})</span>
+        </button>
+      </div>
+
+      <!-- Expand/collapse all -->
+      <button
+        class="flex items-center gap-1.5 px-3 py-1 text-xs border border-border bg-surface-elevated text-fg-muted hover:text-fg-primary hover:border-input transition-colors shrink-0"
+        @click="toggleAllExpanded"
+      >
+        <ChevronDownIcon
+          class="w-3 h-3 transition-transform duration-200"
+          :class="allExpanded ? 'rotate-180' : ''"
+          aria-hidden="true"
+        />
+        {{ allExpanded ? 'Collapse all' : 'Expand all' }}
+      </button>
+    </div>
+
+    <!-- Category-grouped, alphabetised grids -->
+    <div class="space-y-8">
+      <section
+        v-for="section in displaySections"
+        :key="section.category"
+      >
+        <!-- Category subheading — All view only; single-category tabs are self-labelling -->
+        <h2
+          v-if="activeCategory === 'All'"
+          class="mb-3 text-xs font-semibold uppercase tracking-wider text-fg-muted"
+        >
+          {{ section.category }}
+          <span class="tabular-nums text-fg-muted">({{ section.cards.length }})</span>
+        </h2>
+
+        <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+          <div
+            v-for="card in section.cards"
+            :key="card.key"
+            class="bg-surface-elevated border border-border flex flex-col"
+          >
+            <!-- Card header -->
+            <div class="p-4 flex items-start gap-3">
+              <!-- Icon -->
+              <div
+                class="w-9 h-9 rounded flex items-center justify-center shrink-0"
+                :class="card.iconBg"
+              >
+                <component
+                  :is="toolIconFor(card.iconKey)"
+                  class="w-5 h-5"
+                  :class="[card.iconColor, toolIconClassFor(card.iconKey)]"
+                  aria-hidden="true"
+                />
+              </div>
+
+              <!-- Name + category badge -->
+              <div class="flex-1 min-w-0">
+                <span class="text-sm font-mono font-semibold text-fg-strong truncate block">
+                  {{ card.displayName }}
+                </span>
+                <span
+                  class="mt-1.5 inline-block text-xs font-medium px-1.5 py-px rounded-sm leading-tight border"
+                  :class="getPillClass(card.key)"
+                >
+                  {{ card.category }}
+                </span>
+              </div>
+            </div>
+
+            <!-- Description — never clamped: it is shown nowhere else, so a clamp loses
+                 text under WCAG 1.4.12 spacing. The min-height floor stops short
+                 descriptions collapsing the card; footer alignment across a row is
+                 handled by mt-auto on the Functions header below, not by this
+                 min-height (a longer description can exceed 4rem). -->
+            <p class="px-4 pb-4 text-xs text-fg-muted leading-relaxed min-h-[4rem]">
+              {{ card.description }}
+            </p>
+
+            <!-- Functions accordion header — mt-auto pins it to the bottom of the
+                 (grid-stretched) card so every card's Functions disclosure aligns
+                 across the row regardless of description length. -->
+            <button
+              class="mt-auto px-4 py-2.5 border-t border-border flex items-center justify-between w-full group transition-colors"
+              :class="expandedSet.has(card.key) ? 'bg-muted' : 'hover:bg-muted'"
+              @click="toggleExpand(card.key)"
+            >
+              <div class="flex items-center gap-2">
+                <span class="text-[11px] font-medium text-fg-muted group-hover:text-fg-primary transition-colors">
+                  Functions
+                </span>
+                <span class="text-xs text-fg-primary bg-muted px-1.5 py-px rounded tabular-nums">
+                  {{ card.functions.length }}
+                </span>
+              </div>
+              <ChevronDownIcon
+                class="w-3.5 h-3.5 text-fg-muted group-hover:text-fg-muted transition-all duration-200 shrink-0"
+                :class="expandedSet.has(card.key) ? 'rotate-180' : ''"
+                aria-hidden="true"
+              />
+            </button>
+
+            <!-- Functions panel -->
+            <div
+              v-if="expandedSet.has(card.key)"
+              class="border-t border-border"
+            >
+              <div
+                v-for="fn in card.functions"
+                :key="fn.name"
+                class="px-4 py-2 flex items-start gap-3 border-b border-border last:border-b-0"
+              >
+                <code class="text-xs font-mono text-emerald-700 dark:text-emerald-400/80 shrink-0 mt-px w-32 truncate">{{ fn.name }}</code>
+                <span class="text-xs text-fg-muted leading-relaxed">{{ fn.description }}</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </div>
+  </div>
+</template>

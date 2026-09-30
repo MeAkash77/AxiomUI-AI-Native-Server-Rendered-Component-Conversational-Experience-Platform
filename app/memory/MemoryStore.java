@@ -1,0 +1,192 @@
+package memory;
+
+import org.jspecify.annotations.Nullable;
+
+import java.time.Instant;
+import java.util.List;
+
+/**
+ * Memory backend interface. Implementations provide store, search, delete, list.
+ * The base contract is minimal — backends add richness internally.
+ * <p>
+ * The sole implementation is {@link JpaMemoryStore} (H2/PostgreSQL; pgvector for
+ * vector similarity). The interface is retained as a seam for testing and future
+ * Postgres-backed strategies.
+ */
+public interface MemoryStore {
+
+    record MemoryEntry(
+            String id,
+            String agentId,
+            String text,
+            String category,
+            double importance,
+            Instant createdAt,
+            double relevance,
+            Instant recencyAt
+    ) {
+        /**
+         * Non-recall paths (list, single fetch) carry no search relevance, so this
+         * convenience constructor defaults {@code relevance} to 1.0. The recall
+         * blend (JCLAW-532) reads {@link #relevance()}; a constant 1.0 makes it
+         * degrade to importance ordering when a backend can't supply real scores.
+         */
+        public MemoryEntry(String id, String agentId, String text, String category,
+                           double importance, Instant createdAt) {
+            this(id, agentId, text, category, importance, createdAt, 1.0);
+        }
+
+        /**
+         * Source-compatible with the pre-JCLAW-526 canonical form: defaults the
+         * decay anchor ({@code recencyAt}) to {@code createdAt}. The store's
+         * recall paths pass the real anchor ({@code Memory.recencyAnchor()} —
+         * last content change or last recall access, whichever is newer).
+         */
+        public MemoryEntry(String id, String agentId, String text, String category,
+                           double importance, Instant createdAt, double relevance) {
+            this(id, agentId, text, category, importance, createdAt, relevance, createdAt);
+        }
+    }
+
+    /**
+     * Store a memory with an explicit importance score. This is the primary
+     * contract (JCLAW-39/40); the three-arg convenience below delegates with a
+     * category-derived default importance, keeping pre-existing call sites
+     * source-compatible.
+     */
+    String store(String agentId, String text, String category, double importance);
+
+    default String store(String agentId, String text, String category) {
+        return store(agentId, text, category, MemoryCategory.defaultImportanceFor(category));
+    }
+
+    /**
+     * JCLAW-807-follow-up: persist a memory row WITHOUT generating its (vector)
+     * embedding, returning the new id. Callers pair this with {@link #embedStored}
+     * to move the blocking embedding round-trip out of the persistence
+     * transaction, so a pooled DB connection is never held across the embedding
+     * HTTP call. Backends with no separate embedding leg default to {@link #store}
+     * — there is nothing to defer.
+     */
+    default String storeDeferred(String agentId, String text, String category, double importance) {
+        return store(agentId, text, category, importance);
+    }
+
+    /**
+     * As {@link #storeDeferred}, carrying the questions this memory answers (JCLAW-529).
+     * Backends with no retrieval-key column ignore it and store the statement alone,
+     * which is the pre-529 behavior rather than a degradation.
+     */
+    default String storeDeferred(String agentId, String text, String category, double importance,
+            @Nullable String retrievalKey) {
+        return storeDeferred(agentId, text, category, importance);
+    }
+
+    /**
+     * JCLAW-807-follow-up: generate and persist the embedding for a row previously
+     * written by {@link #storeDeferred}, with the embedding HTTP call held outside
+     * any DB transaction. No-op for backends without a vector leg, when vector
+     * memory is disabled, or when the id is unknown.
+     */
+    default void embedStored(String id) {
+        // no-op: backends without a deferred embedding leg embed inline in store()
+    }
+
+    List<MemoryEntry> search(String agentId, String query, int limit);
+
+    /**
+     * JCLAW-960: the query embedding for a recall, computed with no DB connection held.
+     *
+     * <p><b>Must be called outside a transaction.</b> This is a blocking HTTP round-trip,
+     * and recall's cache barely helps — recall text is a user message, so it is usually
+     * novel. Pair it with {@link #search(String, String, int, float[])}, the read-path
+     * mirror of {@link #storeDeferred} + {@link #embedStored}: embed outside the
+     * transaction, then search and hydrate inside it.
+     *
+     * @return {@code null} when vector memory is disabled, no provider can embed, or the
+     *         backend has no vector leg — callers pass that straight through and get the
+     *         keyword-only degradation they would have got anyway.
+     */
+    default float @Nullable [] embedQuery(String query) {
+        return null;
+    }
+
+    /**
+     * As {@link #search(String, String, int)}, but with the query embedding already
+     * computed by {@link #embedQuery} outside the caller's transaction. A {@code null}
+     * embedding means "none was precomputed" and leaves the implementation to fall back
+     * to whatever the three-arg form does.
+     */
+    default List<MemoryEntry> search(String agentId, String query, int limit, float @Nullable [] queryEmbedding) {
+        return search(agentId, query, limit);
+    }
+
+    /**
+     * JCLAW-922: ids of the agent's memories whose embedding is at least
+     * {@code minCosine} similar to {@code text} — the semantic leg of capture-time
+     * dedup, catching a restatement that shares no wording with what it restates.
+     * Empty when vector memory is disabled, when no provider can embed, or for a
+     * backend with no vector leg.
+     *
+     * <p><b>Must be called outside a transaction.</b> Implementations embed
+     * {@code text}, which is a blocking HTTP round-trip; the capture pipeline calls
+     * this in its own phase precisely so the plan transaction never spans it.
+     */
+    default List<Long> semanticNeighbors(String agentId, String text, @Nullable String retrievalKey,
+            int limit, double minCosine) {
+        return semanticNeighbors(agentId, text, limit, minCosine);
+    }
+
+    default List<Long> semanticNeighbors(String agentId, String text, int limit, double minCosine) {
+        return List.of();
+    }
+
+    /**
+     * Memories within {@code minCosine} of {@code query}, embedded as a <em>query</em> —
+     * prefix included, no retrieval key — rather than as a statement (JCLAW-942).
+     *
+     * <p>{@link #semanticNeighbors} is the wrong tool for a caller holding a description
+     * instead of a statement. It embeds bare and symmetric, which is right for comparing a
+     * capture candidate against stored rows, and wrong against the same rows when the input
+     * is what an operator typed: measured on this corpus, an identical memory scores a mean
+     * 0.869 bare-against-keyed, so a caller on the 0.90 dedup threshold never matches
+     * anything at all.
+     */
+    default List<Long> semanticMatchesForQuery(String agentId, String query, int limit, double minCosine) {
+        return List.of();
+    }
+
+    /**
+     * The best cosine any stored memory reaches for {@code query}, embedded the way the
+     * recall path embeds a query — prefix included. {@code NaN} when the vector leg cannot
+     * run at all (disabled, no provider, empty index), which is not a failure.
+     *
+     * <p>Diagnostic only. Exists because the recall floor is compared against a scale that
+     * belongs to the embedding model, so a floor swept for one model silently rejects every
+     * vector hit under another and recall degrades to keyword-only with no error. Nothing
+     * else on this interface can observe that: {@link #search} returns the keyword leg's
+     * results either way, and {@link #semanticNeighbors} embeds bare, so it cannot see a
+     * misconfigured query prefix.
+     */
+    default double bestQueryCosine(String agentId, String query) {
+        return Double.NaN;
+    }
+
+    void delete(String id);
+
+    List<MemoryEntry> list(String agentId);
+
+    default List<MemoryEntry> list(String agentId, int limit, int offset) {
+        var all = list(agentId);
+        if (offset >= all.size()) return List.of();
+        return all.subList(offset, Math.min(offset + limit, all.size()));
+    }
+
+    /**
+     * Bulk-delete every memory belonging to the given agent. Called when an
+     * agent itself is deleted, so per-agent data doesn't outlive its owner.
+     * Returns the number of entries removed (best-effort — backends may
+     * return 0 if they can't cheaply count).
+     */
+    int deleteAll(String agentId);
+}

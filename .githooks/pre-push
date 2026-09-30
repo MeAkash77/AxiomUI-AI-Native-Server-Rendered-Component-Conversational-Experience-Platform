@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+# Pre-push hook: run the consolidated test suite before a push leaves the
+# laptop. Skips the run when the current HEAD has already been tested (so
+# the two-remote deploy flow — origin + github — only pays the ~10 min cost
+# once). Cache lives inside $GIT_DIR so it stays local to this clone and
+# is automatically scoped per worktree.
+#
+# Enable once per clone:  git config core.hooksPath .githooks
+# Bypass for a single push (use sparingly):  JCLAW_SKIP_TESTS=1 git push ...
+
+set -euo pipefail
+
+if [[ "${JCLAW_SKIP_TESTS:-}" == "1" ]]; then
+    echo "[jclaw pre-push] JCLAW_SKIP_TESTS=1 — skipping tests."
+    exit 0
+fi
+
+# git hands the hook one "<local ref> <local sha> <remote ref> <remote sha>"
+# line per ref on stdin. A deletion carries an all-zero local sha and pushes
+# no commits, so a push made only of deletions has nothing to test — before
+# this check, deleting a stale branch ran the whole suite against whatever
+# unrelated HEAD the clone happened to be on.
+zero_sha=0000000000000000000000000000000000000000
+refs_seen=0; deletions_only=1
+while read -r _local_ref local_sha _remote_ref _remote_sha; do
+    refs_seen=1
+    [[ "$local_sha" == "$zero_sha" ]] || deletions_only=0
+done
+if [[ "$refs_seen" == 1 && "$deletions_only" == 1 ]]; then
+    echo "[jclaw pre-push] Push only deletes refs — nothing to test."
+    exit 0
+fi
+
+repo_root=$(git rev-parse --show-toplevel)
+git_dir=$(git rev-parse --git-dir)
+cache_file="$git_dir/jclaw-last-tested-sha"
+current_sha=$(git rev-parse HEAD)
+
+if [[ -f "$cache_file" ]] && [[ "$(cat "$cache_file")" == "$current_sha" ]]; then
+    echo "[jclaw pre-push] HEAD $current_sha already tested — skipping."
+    exit 0
+fi
+
+# Path-aware skip: if the entire push range only touches documentation
+# (docs/**, *.md at any depth, .github/**) or only bumps the version
+# line in conf/application.conf, the test suite has nothing
+# meaningful to validate. Doc-only and version-only-bump pushes drop
+# to instant. Anything that touches real code paths (jclaw.sh, app/,
+# conf/* beyond the version line, frontend/, test/, etc.) still runs
+# the full suite. Cache the SHA on skip so the second remote push in
+# the two-remote /deploy flow also short-circuits.
+should_skip_for_docs() {
+    # No upstream → can't compute scope cheaply, fall through to tests
+    git rev-parse --abbrev-ref --symbolic-full-name @{u} >/dev/null 2>&1 || return 1
+
+    local files
+    files=$(git diff --name-only "@{u}..HEAD" 2>/dev/null) || return 1
+    [[ -z "$files" ]] && return 1  # nothing changed (force-push?)
+
+    # Files that aren't pure documentation. Filter out docs/**, any *.md,
+    # and .github/** (CI configs). Anything left is a candidate for
+    # "real code change."
+    local non_docs
+    non_docs=$(echo "$files" | grep -vE '^(docs/|.*\.md$|\.github/)' || true)
+    [[ -z "$non_docs" ]] && return 0  # pure docs
+
+    # Tolerate a version-only bump in conf/application.conf as the
+    # single non-doc change. The diff in that file must contain only
+    # +/-application.version=... lines (no other content edits).
+    if [[ "$non_docs" == "conf/application.conf" ]]; then
+        local non_version
+        non_version=$(git diff "@{u}..HEAD" -- conf/application.conf \
+            | grep -E '^[+-][^+-]' \
+            | grep -vE '^[+-]application\.version=' || true)
+        [[ -z "$non_version" ]] && return 0
+    fi
+
+    return 1  # has real code change, run tests
+}
+
+if should_skip_for_docs; then
+    echo "[jclaw pre-push] Push range is docs-only or version-bump-only — skipping tests."
+    echo "$current_sha" > "$cache_file"
+    exit 0
+fi
+
+# Import-hygiene gate (code-audit follow-up): production code must have no wildcard
+# imports, and import order must be canonical (Spotless). Both are fast — run them
+# before the slower test suite so a hygiene slip fails the push immediately.
+wildcards=$(cd "$repo_root" && grep -rlE '^import (static )?[a-z][[:alnum:]_.]*\.\*;' app/ test/ 2>/dev/null || true)
+if [[ -n "$wildcards" ]]; then
+    echo "[jclaw pre-push] Wildcard imports are banned in app/ — found in:" >&2
+    echo "$wildcards" >&2
+    echo "[jclaw pre-push] Replace them with explicit imports, then re-commit." >&2
+    exit 1
+fi
+echo "[jclaw pre-push] Checking import order (spotlessCheck)..."
+# Capture rather than stream so the failure can be classified before this hook
+# names a cause. spotlessCheck exits non-zero for anything that stops the build,
+# including failures during Gradle *configuration* that run no Spotless task at
+# all — the .play-version/fork-mismatch guard in build.gradle.kts is one. This
+# hook used to report every such exit as "Import order drift", which sent the
+# v0.17.8 release chasing a spotlessApply that could not have fixed it.
+# Assigning inside the `if` keeps `set -e` from aborting before we can report.
+if ! spotless_out=$(cd "$repo_root" && ./gradlew --quiet spotlessCheck 2>&1); then
+    printf '%s\n' "$spotless_out" >&2
+    if printf '%s' "$spotless_out" | grep -q 'format violations'; then
+        echo "[jclaw pre-push] Import drift in app/ or test/ — run ./gradlew spotlessApply, then re-commit." >&2
+    else
+        echo "[jclaw pre-push] spotlessCheck failed without reporting format violations." >&2
+        echo "[jclaw pre-push] See the Gradle output above for the real cause; spotlessApply will not fix it." >&2
+    fi
+    exit 1
+fi
+
+# JCLAW-1149: nullness gate. Play's ECJ compile cannot host a javac plugin, so the Gradle
+# compileJava is the only place NullAway runs. The suite below reaches it through the play
+# CLI's task graph too, but this step fails in ~10 s instead of after the suite's own compile.
+echo "[jclaw pre-push] Checking nullness (NullAway on compileJava)..."
+if ! nullaway_out=$(cd "$repo_root" && ./gradlew --quiet compileJava 2>&1); then
+    printf '%s\n' "$nullaway_out" >&2
+    echo "[jclaw pre-push] compileJava failed — see the output above." >&2
+    if printf '%s' "$nullaway_out" | grep -q '\[NullAway\]'; then
+        echo "[jclaw pre-push] Annotate the nullable contract (@Nullable / @NullMarked), then re-commit." >&2
+    fi
+    exit 1
+fi
+
+echo "[jclaw pre-push] Testing HEAD $current_sha before push..."
+if (cd "$repo_root" && ./jclaw.sh test); then
+    echo "$current_sha" > "$cache_file"
+    echo "[jclaw pre-push] Tests passed — proceeding with push."
+    exit 0
+else
+    echo "[jclaw pre-push] Tests FAILED — push aborted." >&2
+    echo "[jclaw pre-push] To push anyway: JCLAW_SKIP_TESTS=1 git push ..." >&2
+    exit 1
+fi

@@ -1,0 +1,62 @@
+services:
+  jclaw:
+    image: ghcr.io/tsukhani/jclaw:latest
+    pull_policy: always
+    # PLAY_SECRET is forwarded from the host environment (or the project's
+    # auto-loaded .env, if one exists) via Compose's variable substitution.
+    # The `:-` default keeps Compose happy when neither is set — the
+    # container's entrypoint then auto-generates and persists a secret to
+    # ./certs/.env on first boot. So `docker compose up -d` works on a
+    # fresh extract with no prior setup.
+    #
+    # If you'd rather pin the secret yourself, write `PLAY_SECRET=<value>`
+    # into a `.env` file at this directory; Compose will pick it up here
+    # and the entrypoint will defer to it instead of generating one.
+    environment:
+      PLAY_SECRET: "${PLAY_SECRET:-}"
+    ports:
+      # HTTP/1.1.
+      - "${JCLAW_PORT:-9000}:9000"
+      # HTTP/2 over TLS (TCP) and HTTP/3 over QUIC (UDP). Both must be
+      # mapped — Compose's short-form short-circuits to TCP, so QUIC
+      # packets need their own /udp entry to reach the container.
+      - "${JCLAW_HTTPS_PORT:-9443}:9443/tcp"
+      - "${JCLAW_HTTPS_PORT:-9443}:9443/udp"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./workspace:/app/workspace
+      - ./skills:/app/skills
+      # Runtime secrets and TLS material. Holds the auto-generated
+      # PLAY_SECRET (in ./certs/.env) and the self-signed PEM cert+key
+      # (./certs/host.cert and ./certs/host.key). Operators can replace
+      # the self-signed cert with mkcert-signed PEM to get browser-
+      # trusted local TLS — Chrome's QUIC stack only honors trusted
+      # certs, so HTTP/3 in a real browser requires an mkcert-signed
+      # (or otherwise CA-trusted) cert here.
+      - ./certs:/app/certs
+    restart: unless-stopped
+    # Readiness probe via curl against ApiController.status. curl is already
+    # in the runtime image (the Dockerfile's RUN block installs it for the
+    # Play CLI download from GitHub), so this adds nothing to the image
+    # surface. Hitting /api/status — not just :9000's TCP bind — closes the
+    # false-positive window where the JVM has bound the port but Play hasn't
+    # finished registering routes yet, so a "healthy" container is one that
+    # actually serves requests rather than one that merely accepts sockets.
+    #
+    # start_period (60s) suppresses failure-counting during cold boot so a
+    # slow precompile/DB-seed doesn't trip `retries` and force a restart.
+    # start_interval (2s) tightens the probe cadence during start_period
+    # only — without it, the first probe wouldn't fire until t=30s
+    # (interval), so even an instant-ready app would show "starting" for
+    # 30s. After start_period ends the engine reverts to interval=30s for
+    # steady-state polling. start_interval requires Docker engine 25.0+ /
+    # Compose Spec 2.20+; older hosts will silently ignore it (the only
+    # cost is a slower first-healthy transition there).
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9000/api/status"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+      start_interval: 2s

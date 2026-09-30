@@ -1,0 +1,263 @@
+package controllers;
+
+import agents.ToolRegistry;
+import com.google.gson.Gson;
+import com.google.gson.JsonObject;
+import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.media.ArraySchema;
+import io.swagger.v3.oas.annotations.media.Content;
+import io.swagger.v3.oas.annotations.media.Schema;
+import io.swagger.v3.oas.annotations.parameters.RequestBody;
+import io.swagger.v3.oas.annotations.responses.ApiResponse;
+import mcp.McpConnectionManager;
+import models.McpServer;
+import play.mvc.Controller;
+import play.mvc.With;
+import services.McpServerService;
+import utils.ApiResponses;
+import utils.JsonArgs;
+
+import java.util.List;
+import java.util.Map;
+
+import static controllers.AgentAccess.Level.OPEN;
+import static utils.GsonHolder.GSON;
+
+/**
+ * Admin CRUD over the {@code mcp_server} table (JCLAW-33).
+ *
+ * <p>Six endpoints:
+ *
+ * <ul>
+ *   <li>{@code GET /api/mcp-servers} — list with merged DB + runtime state</li>
+ *   <li>{@code POST /api/mcp-servers} — create + connect-if-enabled</li>
+ *   <li>{@code GET /api/mcp-servers/{id}} — single row</li>
+ *   <li>{@code PUT /api/mcp-servers/{id}} — partial update; reconnect if needed</li>
+ *   <li>{@code DELETE /api/mcp-servers/{id}} — disconnect + delete row
+ *       (allowlist + tool registry teardown is handled by
+ *       {@link McpConnectionManager#stop} which already audits
+ *       {@code MCP_TOOL_UNREGISTER})</li>
+ *   <li>{@code POST /api/mcp-servers/{id}/test} — synchronous test:
+ *       throwaway client tries initialize + tools/list, returns
+ *       success+tool count or error message</li>
+ * </ul>
+ *
+ * <p>Auth: class-level {@code @With(AuthCheck.class)} mirrors every other
+ * Api* controller. The {@code mcp_server} table is operator-wide — JClaw is
+ * single-operator, so there is no per-user scoping.
+ */
+@With(AuthCheck.class)
+public class ApiMcpServersController extends Controller {
+
+    private static final Gson gson = GSON;
+
+    public record McpServerRequest(String name, Boolean enabled, Boolean requiresApproval,
+                                   String transport, String command, List<String> args,
+                                   Map<String, String> env, String url,
+                                   Map<String, String> headers) {}
+
+    // JSON body keys reused across create/update parsers.
+    private static final String KEY_ENABLED = "enabled";
+    private static final String KEY_TRANSPORT = "transport";
+    private static final String KEY_REQUIRES_APPROVAL = "requiresApproval";
+
+    @ApiResponse(responseCode = "200", content = @Content(array = @ArraySchema(schema = @Schema(implementation = McpServerService.View.class))))
+    @Operation(summary = "List MCP servers with status and tool count")
+    @AgentAccess(OPEN)
+    public static void list() {
+        renderJSON(gson.toJson(McpServerService.listAll()));
+    }
+
+    @ApiResponse(responseCode = "200", content = @Content(schema = @Schema(implementation = McpServerService.View.class)))
+    @Operation(summary = "Get a single MCP server by id")
+    @AgentAccess(OPEN)
+    public static void get(Long id) {
+        var row = requireServer(id);
+        renderJSON(gson.toJson(McpServerService.View.of(row)));
+    }
+
+    @SuppressWarnings("java:S2259")
+    @ApiResponse(responseCode = "200", content = @Content(schema = @Schema(implementation = McpServerService.View.class)))
+    @RequestBody(required = true, content = @Content(schema = @Schema(implementation = McpServerRequest.class)))
+    @Operation(summary = "Add an MCP server (STDIO or HTTP)")
+    @AgentAccess(value = OPEN,
+            reason = "HTTP transports are agent-reachable and DangerousActionGate bounds the verb; "
+                    + "a STDIO command is main-only (JCLAW-1270)")
+    public static void create() {
+        var body = JsonBodyReader.readJsonBody();
+        if (body == null) {
+            badRequest();
+            throw ApiResponses.unreachable();
+        }
+
+        var name = JsonBodyReader.requiredOr400(body, "name");
+        if (McpServer.findByName(name) != null) {
+            ApiResponses.error(409, ApiResponses.CONFLICT, "An MCP server named '%s' already exists".formatted(name));
+        }
+        var transport = readTransport(body);
+        requireMainForStdio(transport);
+        var row = new McpServer();
+        row.name = name;
+        // Default true when the key is absent or explicitly null; otherwise
+        // honor the user-supplied boolean.
+        row.enabled = !body.has(KEY_ENABLED) || body.get(KEY_ENABLED).isJsonNull()
+                || body.get(KEY_ENABLED).getAsBoolean();
+        // JCLAW-388: per-server approval gate. Defaults false (opt-in) when the
+        // key is absent or null; honors the supplied boolean otherwise.
+        row.requiresApproval = body.has(KEY_REQUIRES_APPROVAL)
+                && !body.get(KEY_REQUIRES_APPROVAL).isJsonNull()
+                && body.get(KEY_REQUIRES_APPROVAL).getAsBoolean();
+        row.transport = transport;
+        restoreMaskedSecrets(body, McpServerService.TransportConfig.empty());
+        row.configJson = McpServerService.composeConfigJson(transport, body);
+        try {
+            McpServerService.validate(row);
+        } catch (IllegalArgumentException e) {
+            ApiResponses.error(400, ApiResponses.INVALID_REQUEST, ApiResponses.messageOf(e));
+        }
+        row.save();
+
+        McpServerService.syncRuntime(row);
+        renderJSON(gson.toJson(McpServerService.View.of(row)));
+    }
+
+    @SuppressWarnings("java:S2259")
+    @ApiResponse(responseCode = "200", content = @Content(schema = @Schema(implementation = McpServerService.View.class)))
+    @RequestBody(required = true, content = @Content(schema = @Schema(implementation = McpServerRequest.class)))
+    @Operation(summary = "Update an MCP server by id; it reconnects automatically")
+    @AgentAccess(value = OPEN,
+            reason = "same seam as create; a STDIO command is main-only (JCLAW-1270)")
+    public static void update(Long id) {
+        var row = requireServer(id);
+        var body = JsonBodyReader.readJsonBody();
+        if (body == null) {
+            badRequest();
+            throw ApiResponses.unreachable();
+        }
+
+        // Renaming is allowed; if it happens we tear down the prior connection
+        // (under the OLD name) before re-syncing under the new one. Otherwise
+        // McpConnectionManager would carry a stale entry forever.
+        var priorName = row.name;
+        var priorConfig = McpServerService.explodeConfigJson(row.transport, row.configJson);
+        applyRenameIfPresent(row, body);
+        if (body.has(KEY_ENABLED) && !body.get(KEY_ENABLED).isJsonNull()) {
+            row.enabled = body.get(KEY_ENABLED).getAsBoolean();
+        }
+        // JCLAW-388: only mutate the approval flag when the key is present —
+        // a partial update that omits it leaves the persisted value intact.
+        if (body.has(KEY_REQUIRES_APPROVAL) && !body.get(KEY_REQUIRES_APPROVAL).isJsonNull()) {
+            row.requiresApproval = body.get(KEY_REQUIRES_APPROVAL).getAsBoolean();
+        }
+        if (body.has(KEY_TRANSPORT) && !body.get(KEY_TRANSPORT).isJsonNull()) {
+            row.transport = readTransport(body);
+        }
+        // configJson rebuild: any of (transport, command, args, env, url, headers)
+        // appearing in the body triggers a fresh compose. Cheaper than diffing.
+        if (touchesTransportConfig(body)) {
+            // Guarded on the row's transport rather than the body's: a body that omits
+            // `transport` but carries a new `command` rewrites what an existing STDIO server
+            // executes, which is the same authority as creating one.
+            requireMainForStdio(row.transport);
+            restoreMaskedSecrets(body, priorConfig);
+            row.configJson = McpServerService.composeConfigJson(row.transport, body);
+        }
+        try {
+            McpServerService.validate(row);
+        } catch (IllegalArgumentException e) {
+            ApiResponses.error(400, ApiResponses.INVALID_REQUEST, ApiResponses.messageOf(e));
+        }
+        row.save();
+
+        if (!priorName.equals(row.name)) {
+            McpConnectionManager.stop(priorName);
+            // No grant fix-up: JCLAW-983 keys them by this row's id, so the rename cannot
+            // strand any. Restoring one here would reintroduce the coupling it removed.
+        }
+        McpServerService.syncRuntime(row);
+        renderJSON(gson.toJson(McpServerService.View.of(row)));
+    }
+
+    @SuppressWarnings("java:S2259")
+    private static void applyRenameIfPresent(McpServer row, JsonObject body) {
+        var newName = JsonArgs.optString(body, "name");
+        if (newName == null || newName.equals(row.name)) return;
+        var existing = McpServer.findByName(newName);
+        if (existing != null && !existing.id.equals(row.id)) {
+            ApiResponses.error(409, ApiResponses.CONFLICT, "An MCP server named '%s' already exists".formatted(newName));
+        }
+        row.name = newName;
+    }
+
+    @Operation(summary = "Disconnect and delete an MCP server by id")
+    @AgentAccess(value = OPEN,
+            reason = "removes a server an agent can equally add; DangerousActionGate bounds it")
+    public static void delete(Long id) {
+        var row = requireServer(id);
+        // stop() handles every teardown concern: closes the McpClient,
+        // unpublishes the tools from ToolRegistry, deletes allowlist rows,
+        // and emits MCP_TOOL_UNREGISTER. Doing it here means even a failed
+        // row.delete() leaves the runtime clean.
+        McpConnectionManager.stop(row.name);
+        row.delete();
+        // The FK cascade takes this server's grant rows out from under Hibernate, which
+        // cannot know its per-agent disabled-tool sets are now stale. stop() clears them
+        // too, but only when the server was connected — a disabled one never reaches that.
+        ToolRegistry.clearDisabledToolsCache();
+        ApiResponses.ok("deleted", true);
+    }
+
+    @SuppressWarnings("java:S2259")
+    @Operation(summary = "Test an MCP server connection by id (probe); returns success, toolCount, toolNames")
+    @AgentAccess(value = OPEN, reason = "probes an already-configured server and adds no reach")
+    public static void test(Long id) {
+        var row = requireServer(id);
+        var result = McpServerService.testConnection(row);
+        renderJSON(gson.toJson(result));
+    }
+
+    // ==================== helpers ====================
+
+    @SuppressWarnings("java:S2259")
+    private static McpServer requireServer(Long id) {
+        var row = McpServerService.findById(id);
+        if (row != null) return row;
+        notFound();
+        throw new AssertionError("notFound() did not throw");
+    }
+
+    /**
+     * A STDIO server is a command this JVM spawns, unconfined — {@code McpStdioTransport} builds
+     * a bare {@code ProcessBuilder}, outside {@code HarnessSandbox} and outside the shell
+     * allowlist. That is the operator's authority to delegate, and {@code main} holds it;
+     * a custom agent gets HTTP transports only (JCLAW-1270).
+     */
+    private static void restoreMaskedSecrets(JsonObject body, McpServerService.TransportConfig stored) {
+        var refusal = McpServerService.restoreMaskedSecrets(body, stored);
+        if (refusal != null) ApiResponses.error(400, ApiResponses.INVALID_REQUEST, refusal);
+    }
+
+    private static void requireMainForStdio(McpServer.Transport transport) {
+        if (transport == McpServer.Transport.STDIO && !RequestPrincipal.isOperatorOrMainAgent()) {
+            ApiResponses.error(403, ApiResponses.AGENT_SCOPE,
+                    "A STDIO MCP server runs a local command; only the operator or the main agent "
+                            + "may configure one. Use an HTTP transport, or ask the operator.");
+        }
+    }
+
+    @SuppressWarnings("java:S2259")
+    private static McpServer.Transport readTransport(JsonObject body) {
+        var raw = JsonBodyReader.requiredOr400(body, KEY_TRANSPORT);
+        try {
+            return McpServer.Transport.valueOf(raw.toUpperCase());
+        } catch (IllegalArgumentException _) {
+            ApiResponses.error(400, ApiResponses.INVALID_REQUEST, "Unknown transport '%s' (expected STDIO or HTTP)".formatted(raw));
+            throw ApiResponses.unreachable();
+        }
+    }
+
+    private static boolean touchesTransportConfig(JsonObject body) {
+        return body.has(KEY_TRANSPORT) || body.has("command") || body.has("args")
+                || body.has("env") || body.has("url") || body.has("headers");
+    }
+}

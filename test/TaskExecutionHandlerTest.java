@@ -1,0 +1,1060 @@
+import com.github.kagkarlsson.scheduler.SchedulerClient;
+import com.github.kagkarlsson.scheduler.task.CompletionHandler;
+import com.github.kagkarlsson.scheduler.task.Execution;
+import com.github.kagkarlsson.scheduler.task.ExecutionComplete;
+import com.github.kagkarlsson.scheduler.task.ExecutionContext;
+import com.github.kagkarlsson.scheduler.task.ExecutionOperations;
+import com.github.kagkarlsson.scheduler.task.SchedulableInstance;
+import com.github.kagkarlsson.scheduler.task.TaskInstance;
+import com.github.kagkarlsson.scheduler.task.TaskInstanceId;
+import jobs.BootConsistencyCheck;
+import models.Agent;
+import models.EventLog;
+import models.Task;
+import models.TaskRun;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import play.db.jpa.JPA;
+import play.test.Fixtures;
+import play.test.UnitTest;
+import services.ConfigService;
+import services.EventLogger;
+import services.TaskExecutionHandler;
+import services.TaskSchedulingService;
+
+import java.lang.reflect.Method;
+import java.lang.reflect.Proxy;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicReference;
+
+/**
+ * JCLAW-310: targeted coverage for {@link TaskExecutionHandler} call
+ * paths that the existing TaskFireFunctionalTest does not exercise.
+ *
+ * <p>Drives {@link TaskExecutionHandler#buildTask}'s lambda directly
+ * with a stub {@link SchedulerClient} so we can assert the
+ * self-rescheduling shape for CRON/INTERVAL Tasks without standing
+ * up a live db-scheduler. The same dynamic-Proxy stub pattern used
+ * by TaskSchedulingServiceTest / BootConsistencyCheckTest applies
+ * here — we capture {@code schedule()} calls and surface a
+ * configurable scheduled-rows set for the boot-consistency sweep.
+ *
+ * <p>What this file pins:
+ * <ul>
+ *   <li>IMMEDIATE one-shot fire produces exactly one TaskRun and
+ *       returns {@link CompletionHandler.OnCompleteRemove}.</li>
+ *   <li>SCHEDULED one-shot at a fixed future timestamp produces one
+ *       TaskRun and removes its row.</li>
+ *   <li>CRON fire self-rescheduling: a successful fire invokes
+ *       {@code SchedulerClient.schedule} with the next cron tick.</li>
+ *   <li>CRON fire cancelled-skip: a Task whose status flipped to
+ *       CANCELLED is skipped without producing a TaskRun.</li>
+ *   <li>INTERVAL drift: completion handler schedules the next fire at
+ *       roughly {@code completionTime + intervalSeconds}.</li>
+ *   <li>Dead-execution recovery: {@link BootConsistencyCheck#sweep}
+ *       reschedules an orphan PENDING Task whose previous
+ *       scheduled_tasks row vanished.</li>
+ *   <li>Undecodable / missing Task ids: handler logs warn and exits
+ *       cleanly without producing a TaskRun.</li>
+ * </ul>
+ */
+class TaskExecutionHandlerTest extends UnitTest {
+
+    private com.sun.net.httpserver.HttpServer llmServer;
+    private int port;
+    private RecordingSchedulerStub stub;
+
+    @BeforeEach
+    void setup() {
+        Fixtures.deleteDatabase();
+        ConfigService.clearCache();
+        llm.ProviderRegistry.refresh();
+        stub = new RecordingSchedulerStub();
+        // Wire the static schedulerClient field so the CRON / INTERVAL
+        // self-reschedule paths can observe the stub instead of the
+        // (null) bootstrap reference.
+        TaskExecutionHandler.setSchedulerClient(stub.proxy());
+        services.TaskSchedulingServiceTestHooks.setSchedulerClient(stub.proxy());
+    }
+
+    @AfterEach
+    void teardown() {
+        if (llmServer != null) {
+            llmServer.stop(0);
+            llmServer = null;
+        }
+        services.TaskSchedulingServiceTestHooks.reset();
+        // Reset the static handoff so the next test starts clean.
+        TaskExecutionHandler.setSchedulerClient(null);
+    }
+
+    // === IMMEDIATE fire produces one TaskRun, OnCompleteRemove ===
+
+    @Test
+    void immediateFireProducesOneRunAndRemovesScheduledRow() throws Exception {
+        startLlmServer(simpleResponse("ok"));
+        configureProvider();
+
+        var agent = createAgent("immediate-handler-agent");
+        var task = persistTask(agent, "Immediate", "Do it.",
+                Task.Type.IMMEDIATE, null, null, null);
+
+        commitAndReopen();
+
+        var handler = driveFireCaptureHandler(task.id);
+        JPA.em().clear();
+
+        // Exactly one TaskRun, in COMPLETED.
+        var runs = listRunsForTask(task.id);
+        assertEquals(1, runs.size(), "IMMEDIATE fire produces exactly one TaskRun");
+        assertEquals(TaskRun.Status.COMPLETED, runs.getFirst().status);
+
+        // Returned CompletionHandler removes the row (OnCompleteRemove).
+        assertTrue(handler instanceof CompletionHandler.OnCompleteRemove,
+                "IMMEDIATE fire returns OnCompleteRemove; got: " + handler);
+    }
+
+    // === SCHEDULED fire at fixed future timestamp ===
+
+    @Test
+    void scheduledFireProducesOneRun() throws Exception {
+        startLlmServer(simpleResponse("scheduled-done"));
+        configureProvider();
+
+        var agent = createAgent("scheduled-handler-agent");
+        var future = Instant.now().plusSeconds(3600);
+        var task = persistTask(agent, "Scheduled", "Do it later.",
+                Task.Type.SCHEDULED, future, null, null);
+
+        commitAndReopen();
+
+        var handler = driveFireCaptureHandler(task.id);
+        JPA.em().clear();
+
+        var runs = listRunsForTask(task.id);
+        assertEquals(1, runs.size(), "SCHEDULED fire produces exactly one TaskRun");
+        assertEquals(TaskRun.Status.COMPLETED, runs.getFirst().status);
+        // One-shot → OnCompleteRemove
+        assertTrue(handler instanceof CompletionHandler.OnCompleteRemove,
+                "SCHEDULED fire returns OnCompleteRemove");
+    }
+
+    // === CRON self-rescheduling ===
+
+    @Test
+    void cronFireSchedulesNextTickViaCompletionHandler() throws Exception {
+        startLlmServer(simpleResponse("cron-done"));
+        configureProvider();
+
+        var agent = createAgent("cron-handler-agent");
+        // Top-of-every-minute → next tick within ~60s.
+        var task = persistTask(agent, "CronTask", "Tick.",
+                Task.Type.CRON, null, "0 * * * * *", null);
+
+        commitAndReopen();
+
+        var handler = driveFireCaptureHandler(task.id);
+        JPA.em().clear();
+
+        // The fire body ran and produced one TaskRun.
+        var runs = listRunsForTask(task.id);
+        assertEquals(1, runs.size(), "CRON fire produces a TaskRun");
+
+        // The returned handler is NOT OnCompleteRemove — it's the
+        // CRON next-tick lambda.
+        assertFalse(handler instanceof CompletionHandler.OnCompleteRemove,
+                "CRON fire returns custom CompletionHandler, not OnCompleteRemove");
+
+        // Drive the completion handler to trigger the self-reschedule.
+        var ops = new RecordingExecutionOperations(
+                new Execution(Instant.now(), instance(task.id)));
+        var complete = ExecutionComplete.success(
+                ops.execution(), Instant.now().minusSeconds(1), Instant.now());
+        var before = Instant.now();
+        handler.complete(complete, ops);
+        var after = Instant.now();
+
+        // stop-then-schedule sequence — stop removes the current row,
+        // schedule inserts the next-tick row.
+        assertTrue(ops.stopped, "CRON completion handler must stop() current row");
+        assertEquals(1, stub.schedules.size(),
+                "CRON completion handler must schedule next tick via SchedulerClient");
+        var next = stub.schedules.getFirst();
+        assertEquals(task.id.toString(), next.instance.getId(),
+                "next tick keeps the same task_instance id");
+        // Top-of-minute cron → next tick is within the next 60 seconds.
+        long deltaSeconds = next.when.getEpochSecond() - after.getEpochSecond();
+        assertTrue(deltaSeconds >= 0 && deltaSeconds <= 60,
+                "next CRON tick should fall within the next minute; got " + deltaSeconds + "s");
+        assertTrue(next.when.isAfter(before.minusSeconds(1)),
+                "next CRON tick should be in the future relative to the call site");
+    }
+
+    // === CRON cancelled-skip ===
+
+    @Test
+    void cancelledCronTaskIsSkippedWithoutOpeningRun() throws Exception {
+        var agent = createAgent("cron-cancelled-agent");
+        var task = persistTask(agent, "Cancelled cron", "Should skip.",
+                Task.Type.CRON, null, "0 * * * * *", null);
+        task.status = Task.Status.CANCELLED;
+        task.save();
+
+        commitAndReopen();
+
+        var handler = driveFireCaptureHandler(task.id);
+        JPA.em().clear();
+
+        // CANCELLED skip: no TaskRun.
+        var runs = listRunsForTask(task.id);
+        assertTrue(runs.isEmpty(),
+                "CANCELLED CRON Task must not open a TaskRun");
+        // The handler is OnCompleteRemove (defaultCompletion path) — no
+        // self-reschedule because the cancelled-skip falls through to
+        // defaultCompletion() per the handler body.
+        assertTrue(handler instanceof CompletionHandler.OnCompleteRemove,
+                "cancelled-skip returns OnCompleteRemove; got: " + handler);
+        // No SchedulerClient calls from the completion path either.
+        assertTrue(stub.schedules.isEmpty(),
+                "cancelled-skip must not schedule a next tick");
+    }
+
+    // === INTERVAL self-rescheduling at completion-time + intervalSeconds ===
+
+    @Test
+    void intervalCompletionHandlerSchedulesNextFireAtIntervalOffset() throws Exception {
+        startLlmServer(simpleResponse("ok"));
+        configureProvider();
+
+        var agent = createAgent("interval-handler-agent");
+        long intervalSecs = 1800L;  // 30 minutes
+        var task = persistTask(agent, "IntervalTask", "Tick.",
+                Task.Type.INTERVAL, null, null, intervalSecs);
+
+        commitAndReopen();
+
+        var handler = driveFireCaptureHandler(task.id);
+        JPA.em().clear();
+
+        // The returned handler is the interval next-fire lambda, not OnCompleteRemove.
+        assertFalse(handler instanceof CompletionHandler.OnCompleteRemove,
+                "INTERVAL fire returns custom CompletionHandler");
+
+        var ops = new RecordingExecutionOperations(
+                new Execution(Instant.now(), instance(task.id)));
+        var complete = ExecutionComplete.success(
+                ops.execution(), Instant.now().minusSeconds(1), Instant.now());
+        var beforeComplete = Instant.now();
+        handler.complete(complete, ops);
+        var afterComplete = Instant.now();
+
+        assertTrue(ops.stopped, "INTERVAL completion handler must stop() the current row");
+        assertEquals(1, stub.schedules.size(),
+                "INTERVAL completion handler must schedule next fire");
+        var next = stub.schedules.getFirst();
+        assertEquals(task.id.toString(), next.instance.getId());
+
+        // Drift-window AC: next fire should land at
+        // ~completionTime + intervalSeconds.
+        long deltaSeconds = next.when.getEpochSecond() - beforeComplete.getEpochSecond();
+        assertTrue(deltaSeconds >= intervalSecs - 1 && deltaSeconds <= intervalSecs + 2,
+                "next INTERVAL fire should be ~" + intervalSecs + "s after completion; got "
+                        + deltaSeconds + "s");
+        // And it should be strictly after the completion call site.
+        assertTrue(next.when.isAfter(afterComplete),
+                "next INTERVAL fire must be in the future relative to the completion");
+    }
+
+    // === JCLAW-1103: duplicate revive / stop() failure must not strand the schedule ===
+
+    @Test
+    void droppedDuplicateReviveReArmsScheduleInsteadOfRemovingRow() throws Exception {
+        var agent = createAgent("dup-revive-agent");
+        var task = persistTask(agent, "DupRevive", "Tick.",
+                Task.Type.INTERVAL, null, null, 1800L);
+
+        commitAndReopen();
+
+        // Stand in for a fire already live on this node, so the dedup guard trips.
+        assertTrue(services.TaskRunRegistry.tryClaimTask(task.id),
+                "test must own the claim it is simulating");
+        CompletionHandler<Void> handler;
+        try {
+            handler = driveFireCaptureHandler(task.id);
+        } finally {
+            services.TaskRunRegistry.releaseTask(task.id);
+        }
+        JPA.em().clear();
+
+        assertFalse(handler instanceof CompletionHandler.OnCompleteRemove,
+                "a dropped revive must not return OnCompleteRemove — a Task holds at most one "
+                        + "scheduled_tasks row, so removing it strands the live fire");
+
+        var ops = new RecordingExecutionOperations(
+                new Execution(Instant.now(), instance(task.id)));
+        handler.complete(ExecutionComplete.success(
+                ops.execution(), Instant.now().minusSeconds(1), Instant.now()), ops);
+
+        assertEquals(1, stub.schedules.size(),
+                "dropped revive must re-arm the next INTERVAL fire");
+        assertEquals(task.id.toString(), stub.schedules.getFirst().instance.getId());
+
+        assertEquals(0L, TaskRun.count("task.id = ?1", task.id),
+                "the duplicate revive must not open a second run");
+    }
+
+    @Test
+    void recurringCompletionReSchedulesEvenWhenStopThrows() throws Exception {
+        startLlmServer(simpleResponse("ok"));
+        configureProvider();
+
+        var agent = createAgent("stop-throws-agent");
+        var task = persistTask(agent, "StopThrows", "Tick.",
+                Task.Type.INTERVAL, null, null, 1800L);
+
+        commitAndReopen();
+
+        var handler = driveFireCaptureHandler(task.id);
+        JPA.em().clear();
+
+        // db-scheduler's stop() deletes by (id, version) and throws when that
+        // matches nothing — what a concurrent revive causes by bumping the version.
+        var ops = new ThrowingStopExecutionOperations(
+                new Execution(Instant.now(), instance(task.id)));
+        try {
+            handler.complete(ExecutionComplete.success(
+                    ops.execution(), Instant.now().minusSeconds(1), Instant.now()), ops);
+        } catch (RuntimeException ex) {
+            fail("completion handler must absorb a failing stop(); threw " + ex);
+        }
+
+        assertEquals(1, stub.schedules.size(),
+                "a failing stop() must not skip the re-schedule — that silently ends the recurrence");
+        assertEquals(task.id.toString(), stub.schedules.getFirst().instance.getId());
+    }
+
+    // === Missing-Task / undecodable id: log + exit cleanly ===
+
+    @Test
+    void undecodableInstanceIdLogsWarnAndExitsCleanly() throws Exception {
+        commitAndReopen();
+        var dbTask = TaskExecutionHandler.buildTask();
+        var instance = new TaskInstance<Void>(TaskExecutionHandler.TASK_NAME, "not-a-number");
+        var ctx = new ExecutionContext(null,
+                new Execution(Instant.now(), instance), null, null);
+
+        var errorRef = new AtomicReference<Throwable>();
+        var resultRef = new AtomicReference<CompletionHandler<Void>>();
+        var t = Thread.ofVirtual().start(() -> {
+            try {
+                resultRef.set(dbTask.execute(instance, ctx));
+            } catch (Throwable ex) {
+                errorRef.set(ex);
+            }
+        });
+        t.join(10_000);
+        if (errorRef.get() != null) throw new RuntimeException(errorRef.get());
+        assertNotNull(resultRef.get(),
+                "undecodable id must return a CompletionHandler, not throw");
+        assertTrue(resultRef.get() instanceof CompletionHandler.OnCompleteRemove,
+                "undecodable id falls through to defaultCompletion()");
+
+        EventLogger.flush();
+        var warnings = loadEventsByCategory("task");
+        assertTrue(warnings.stream().anyMatch(e ->
+                e.message != null && e.message.contains("undecodable task_instance")),
+                "undecodable id must log the warn");
+    }
+
+    @Test
+    void missingTaskIdLogsWarnAndExitsCleanly() throws Exception {
+        commitAndReopen();
+        var dbTask = TaskExecutionHandler.buildTask();
+        var instance = new TaskInstance<Void>(TaskExecutionHandler.TASK_NAME, "999999999");
+        var ctx = new ExecutionContext(null,
+                new Execution(Instant.now(), instance), null, null);
+
+        var errorRef = new AtomicReference<Throwable>();
+        var resultRef = new AtomicReference<CompletionHandler<Void>>();
+        var t = Thread.ofVirtual().start(() -> {
+            try {
+                resultRef.set(dbTask.execute(instance, ctx));
+            } catch (Throwable ex) {
+                errorRef.set(ex);
+            }
+        });
+        t.join(10_000);
+        if (errorRef.get() != null) throw new RuntimeException(errorRef.get());
+        assertNotNull(resultRef.get(),
+                "missing Task must return a CompletionHandler, not throw");
+        assertTrue(resultRef.get() instanceof CompletionHandler.OnCompleteRemove,
+                "missing Task id falls through to defaultCompletion()");
+
+        EventLogger.flush();
+        var warnings = loadEventsByCategory("task");
+        assertTrue(warnings.stream().anyMatch(e ->
+                e.message != null
+                && e.message.contains("scheduled fire arrived for missing Task id")),
+                "missing-Task fire must log the warn");
+    }
+
+
+    // === Race-tolerant findById (db-scheduler tx-visibility race fix) ===
+
+    @Test
+    void findTaskWithRaceBackoffReturnsExistingTaskOnFirstAttempt() throws Exception {
+        // Happy path: a Task that's already committed must be returned on
+        // the first attempt without any wall-clock cost. Pins the
+        // production scheduler's common case — the race-loss window is
+        // sub-millisecond, so 99.9% of fires resolve on the first try.
+        var agent = createAgent("race-happy-agent");
+        var task = persistTask(agent, "race-happy",
+                "irrelevant — never fires.",
+                Task.Type.IMMEDIATE, null, null, null);
+
+        commitAndReopen();
+
+        var m = invokeFindWithBackoff();
+        long t0 = System.nanoTime();
+        var found = (Task) m.invoke(null, task.id);
+        long elapsedMs = (System.nanoTime() - t0) / 1_000_000L;
+
+        assertNotNull(found, "existing Task must be found");
+        assertEquals(task.id, found.id);
+        // Negative-result retries take ~80ms in this config; an immediate
+        // hit must finish in a fraction of that. 30ms cap leaves comfortable
+        // headroom for JVM warmup / CI scheduling jitter without forfeiting
+        // the regression value of the assertion.
+        assertTrue(elapsedMs < 30,
+                "found-on-first-attempt must be fast (<30ms), got %dms"
+                        .formatted(elapsedMs));
+    }
+
+    @Test
+    void findTaskWithRaceBackoffReturnsNullAfterFullBudgetForMissingId() throws Exception {
+        // Negative path: a Task id that genuinely doesn't exist makes the
+        // helper exhaust its retry budget before returning null. The
+        // wall-clock floor is the regression guard — if a future refactor
+        // dropped the retry loop, this assertion would fail because the
+        // helper would return null in <5ms instead of ~80ms.
+        commitAndReopen();
+
+        long missingId = 999_999_999L;
+        var m = invokeFindWithBackoff();
+
+        long t0 = System.nanoTime();
+        var found = (Task) m.invoke(null, missingId);
+        long elapsedMs = (System.nanoTime() - t0) / 1_000_000L;
+
+        assertNull(found, "missing Task id must return null after the budget");
+
+        // Read the budget constants by reflection so this assertion stays
+        // honest if FIND_TASK_ATTEMPTS / FIND_TASK_BACKOFF_MS change. The
+        // floor is (attempts - 1) * sleep — one less sleep than attempts
+        // because the last attempt skips the trailing sleep.
+        var attempts = TaskExecutionHandler.class.getDeclaredField("FIND_TASK_ATTEMPTS");
+        attempts.setAccessible(true);
+        var sleepMs = TaskExecutionHandler.class.getDeclaredField("FIND_TASK_BACKOFF_MS");
+        sleepMs.setAccessible(true);
+        long expectedFloor = ((int) attempts.get(null) - 1) * (long) (int) sleepMs.get(null);
+        // 20ms slack below the floor to absorb sleep-quantum jitter on
+        // loaded CI runners — the SIGNAL is "did we retry at all", not
+        // "did we sleep exactly the documented amount". Without the floor
+        // assertion a no-retry implementation would silently pass.
+        assertTrue(elapsedMs >= expectedFloor - 20,
+                "missing-id lookup must take roughly the full retry budget "
+                        + "(>=%dms), got %dms — the retry loop has been bypassed"
+                                .formatted(expectedFloor - 20, elapsedMs));
+    }
+
+    @Test
+    void findTaskWithRaceBackoffFindsTaskCommittedByAnotherThreadMidRetry() throws Exception {
+        // Race repro: an inserter VT holds an open Tx with the new Task
+        // staged but UNCOMMITTED for ~40ms, then commits. The main thread
+        // starts the helper while the VT is mid-sleep. The first findById
+        // attempts must miss (row uncommitted, isolation hides it from the
+        // main thread's tx); a later attempt — after the VT commits — must
+        // see the row.
+        //
+        // This is the production race shape: db-scheduler's poll thread
+        // sees the scheduled_tasks row before the controller's Tx commits
+        // the Task INSERT in the same Tx. Without the retry loop, the
+        // first findById returns null and the fire is permanently lost.
+        var agent = createAgent("race-late-commit-agent");
+        commitAndReopen();
+        var agentId = agent.id;
+
+        var taskIdRef = new java.util.concurrent.atomic.AtomicLong();
+        var taskInserted = new java.util.concurrent.CountDownLatch(1);
+        var mainCanProceed = new java.util.concurrent.CountDownLatch(1);
+
+        var inserter = Thread.ofVirtual().start(() -> services.Tx.run(() -> {
+            var t = new Task();
+            t.agent = (Agent) Agent.findById(agentId);
+            t.name = "late-commit-race";
+            t.description = "irrelevant";
+            t.type = Task.Type.IMMEDIATE;
+            t.status = Task.Status.PENDING;
+            t.nextRunAt = Instant.now();
+            t.createdAt = Instant.now();
+            t.updatedAt = Instant.now();
+            t.save();
+            // Force the INSERT so the autogenerated id is assigned before
+            // we signal main — without flush() the id is still null in
+            // some Hibernate configs until commit time.
+            play.db.jpa.JPA.em().flush();
+            taskIdRef.set(t.id);
+            taskInserted.countDown();
+            // Hold the Tx open while main starts polling. ~40ms straddles
+            // the first findById attempt's budget without exhausting the
+            // ~80ms total — at least one retry should land after commit.
+            try {
+                mainCanProceed.await(2, java.util.concurrent.TimeUnit.SECONDS);
+                Thread.sleep(40);
+            } catch (InterruptedException _) {
+                Thread.currentThread().interrupt();
+            }
+            return null;
+        }));
+
+        // Wait until the inserter has staged the row and we have its id.
+        assertTrue(taskInserted.await(5, java.util.concurrent.TimeUnit.SECONDS),
+                "inserter must publish the new Task id within 5s");
+        long taskId = taskIdRef.get();
+        // Let the inserter sleep with the row uncommitted while we begin
+        // the retry loop. Without this gate the main thread might race
+        // ahead of the VT's commit AND its sleep, which would make the
+        // test pass for the wrong reason (timing rather than retry).
+        mainCanProceed.countDown();
+
+        var m = invokeFindWithBackoff();
+        var found = (Task) m.invoke(null, taskId);
+        inserter.join(10_000);
+
+        assertNotNull(found,
+                "helper must retry until the inserter's Tx commits and the row "
+                        + "becomes visible — retrieved null means the loop bailed early");
+        assertEquals(taskId, found.id);
+    }
+
+    @Test
+    void concurrentRaceBackoffsAllResolveWhenRowsCommitMidRetry() throws Exception {
+        // JCLAW-401: the backoff wait runs on the db-scheduler's virtual
+        // thread, and the failure mode it guards (an INSERT/poll race)
+        // is precisely the burst case — many newly-scheduled tasks firing
+        // near-simultaneously, each parking in the backoff at once. That
+        // is the JDK-8373224 many-VTs-in-Thread.sleep starvation scenario.
+        // After the off-carrier LockSupport.parkNanos fix, a fleet of
+        // concurrent backoff loops must each still resolve once their row
+        // commits mid-retry — no fire is starved into the missing-Task
+        // skip path. We assert the eventual resolution, not the timing.
+        int fleet = 24;
+        var agent = createAgent("race-fleet-agent");
+        commitAndReopen();
+        var agentId = agent.id;
+
+        // Stage `fleet` Tasks in one Tx, hold it open ~30ms so every
+        // finder's first attempt misses (rows uncommitted), then commit so
+        // a later attempt sees them. Mirrors the production single-Tx
+        // INSERT-then-commit the poll thread races against.
+        var ids = new java.util.concurrent.CopyOnWriteArrayList<Long>();
+        var rowsStaged = new java.util.concurrent.CountDownLatch(1);
+        var inserter = Thread.ofVirtual().start(() -> services.Tx.run(() -> {
+            for (int i = 0; i < fleet; i++) {
+                var t = new Task();
+                t.agent = (Agent) Agent.findById(agentId);
+                t.name = "fleet-" + i;
+                t.description = "irrelevant";
+                t.type = Task.Type.IMMEDIATE;
+                t.status = Task.Status.PENDING;
+                t.nextRunAt = Instant.now();
+                t.createdAt = Instant.now();
+                t.updatedAt = Instant.now();
+                t.save();
+                play.db.jpa.JPA.em().flush();
+                ids.add(t.id);
+            }
+            rowsStaged.countDown();
+            // Hold the Tx open so the finders' first attempts miss, then
+            // let the commit make the rows visible mid-retry.
+            try {
+                Thread.sleep(30);
+            } catch (InterruptedException _) {
+                Thread.currentThread().interrupt();
+            }
+            return null;
+        }));
+
+        assertTrue(rowsStaged.await(5, java.util.concurrent.TimeUnit.SECONDS),
+                "inserter must stage all fleet rows within 5s");
+
+        var m = invokeFindWithBackoff();
+        var firstError = new AtomicReference<Throwable>();
+        var resolved = new java.util.concurrent.atomic.AtomicInteger();
+        var start = new java.util.concurrent.CountDownLatch(1);
+        var finishers = new ArrayList<Thread>(fleet);
+        for (long id : ids) {
+            finishers.add(Thread.ofVirtual().start(() -> {
+                try {
+                    start.await();
+                    Task t = (Task) m.invoke(null, id);
+                    if (t != null && id == t.id) resolved.incrementAndGet();
+                } catch (Throwable ex) {
+                    firstError.compareAndSet(null, ex);
+                }
+            }));
+        }
+        // Release the whole fleet at once so they all park in the backoff
+        // concurrently — the burst the fix is about.
+        start.countDown();
+        for (var f : finishers) f.join(15_000);
+        inserter.join(15_000);
+
+        if (firstError.get() != null) throw new RuntimeException(firstError.get());
+        assertEquals(fleet, resolved.get(),
+                "every concurrent race-backoff must resolve its row once the "
+                        + "inserter's Tx commits mid-retry — a starved/early-bailed "
+                        + "finder would leave resolved < fleet");
+    }
+
+    private static java.lang.reflect.Method invokeFindWithBackoff() throws Exception {
+        var m = TaskExecutionHandler.class.getDeclaredMethod(
+                "findTaskWithRaceBackoff", long.class);
+        m.setAccessible(true);
+        return m;
+    }
+
+    // === CRON self-reschedule swallows malformed next-fire computation ===
+
+    @Test
+    void cronCompletionHandlerSwallowsSchedulerExceptionsCleanly() throws Exception {
+        startLlmServer(simpleResponse("ok"));
+        configureProvider();
+
+        var agent = createAgent("cron-throws-agent");
+        var task = persistTask(agent, "ThrowyCron", "Tick.",
+                Task.Type.CRON, null, "0 * * * * *", null);
+
+        commitAndReopen();
+
+        var handler = driveFireCaptureHandler(task.id);
+        JPA.em().clear();
+
+        // Make the stub throw on schedule() — the completion handler
+        // must swallow the exception and not propagate (so a transient
+        // scheduler outage doesn't blow up the executor thread).
+        stub.throwOnSchedule = true;
+
+        var ops = new RecordingExecutionOperations(
+                new Execution(Instant.now(), instance(task.id)));
+        var complete = ExecutionComplete.success(
+                ops.execution(), Instant.now().minusSeconds(1), Instant.now());
+
+        // Should NOT throw — handler swallows and logs.
+        try {
+            handler.complete(complete, ops);
+        } catch (Exception ex) {
+            fail("CRON completion handler must swallow scheduler exceptions; threw " + ex);
+        }
+        assertTrue(ops.stopped,
+                "current row must still be stopped even when next-schedule fails");
+    }
+
+    // === Dead-execution recovery via BootConsistencyCheck ===
+
+    @Test
+    void deadExecutionRecoveryReregistersOrphanPending() {
+        // Simulate the "JVM crashed mid-fire, scheduled_tasks row gone,
+        // Task row left PENDING" scenario. BootConsistencyCheck.sweep
+        // should pick this up and register a fresh row.
+        var agent = createAgent("dead-recovery-agent");
+        var orphan = persistTask(agent, "Dead-row task", "Recover.",
+                Task.Type.IMMEDIATE, null, null, null);
+        // Stub has no scheduled rows — orphan from scheduler's
+        // perspective.
+
+        commitAndReopen();
+
+        int registered = BootConsistencyCheck.sweep(stub.proxy());
+
+        assertEquals(1, registered,
+                "orphan PENDING Task should be re-registered by the sweep");
+        assertEquals(1, stub.schedules.size(),
+                "sweep should call SchedulerClient.schedule for the orphan");
+        assertEquals(orphan.id.toString(), stub.schedules.getFirst().instance.getId(),
+                "scheduled task_instance must carry the orphan's id");
+    }
+
+    // === Helpers ===
+
+    private Agent createAgent(String name) {
+        var a = new Agent();
+        a.name = name;
+        a.modelProvider = "test-provider";
+        a.modelId = "test-model";
+        a.enabled = true;
+        a.save();
+        return a;
+    }
+
+    private Task persistTask(Agent agent, String name, String description,
+                              Task.Type type, Instant scheduledAt,
+                              String cronExpression, Long intervalSeconds) {
+        var t = new Task();
+        t.agent = agent;
+        t.name = name;
+        t.description = description;
+        t.type = type;
+        t.scheduledAt = scheduledAt;
+        t.cronExpression = cronExpression;
+        t.intervalSeconds = intervalSeconds;
+        t.status = Task.Status.PENDING;
+        t.nextRunAt = scheduledAt != null ? scheduledAt : Instant.now();
+        t.createdAt = Instant.now();
+        t.updatedAt = Instant.now();
+        t.save();
+        return t;
+    }
+
+    private static TaskInstance<Void> instance(Long taskId) {
+        return new TaskInstance<>(TaskExecutionHandler.TASK_NAME, taskId.toString());
+    }
+
+    /**
+     * Drive one db-scheduler lambda invocation on a virtual thread,
+     * return the {@link CompletionHandler} the lambda produced. Mirrors
+     * the driver in TaskFireFunctionalTest but exposes the
+     * CompletionHandler so callers can probe the self-reschedule path.
+     */
+    private CompletionHandler<Void> driveFireCaptureHandler(Long taskId) throws Exception {
+        var dbTask = TaskExecutionHandler.buildTask();
+        var inst = instance(taskId);
+        var ctx = new ExecutionContext(null,
+                new Execution(Instant.now(), inst), null, null);
+
+        var resultRef = new AtomicReference<CompletionHandler<Void>>();
+        var errorRef = new AtomicReference<Throwable>();
+        var t = Thread.ofVirtual().start(() -> {
+            try {
+                resultRef.set(dbTask.execute(inst, ctx));
+            } catch (Throwable ex) {
+                errorRef.set(ex);
+            }
+        });
+        t.join(30_000);
+        if (t.isAlive()) throw new AssertionError("execute did not finish within 30s");
+        if (errorRef.get() != null) throw new RuntimeException(errorRef.get());
+        return resultRef.get();
+    }
+
+    private void startLlmServer(String staticResponse) throws Exception {
+        llmServer = com.sun.net.httpserver.HttpServer.create(
+                new java.net.InetSocketAddress("127.0.0.1", 0), 0);
+        llmServer.createContext("/chat/completions", exchange -> {
+            exchange.getResponseHeaders().set("Content-Type", "application/json");
+            exchange.sendResponseHeaders(200, staticResponse.getBytes().length);
+            exchange.getResponseBody().write(staticResponse.getBytes());
+            exchange.close();
+        });
+        llmServer.start();
+        port = llmServer.getAddress().getPort();
+    }
+
+    private void configureProvider() {
+        ConfigService.set("provider.test-provider.baseUrl", "http://127.0.0.1:" + port);
+        ConfigService.set("provider.test-provider.apiKey", "sk-test");
+        ConfigService.set("provider.test-provider.models",
+                "[{\"id\":\"test-model\",\"name\":\"Test\",\"contextWindow\":100000,\"maxTokens\":4096}]");
+        llm.ProviderRegistry.refresh();
+    }
+
+    private static String simpleResponse(String content) {
+        return """
+            {"choices":[{"index":0,"message":{"role":"assistant","content":"%s"},"finish_reason":"stop"}],
+             "usage":{"prompt_tokens":10,"completion_tokens":5}}""".formatted(
+                content.replace("\"", "\\\""));
+    }
+
+    private static void commitAndReopen() {
+        JPA.em().getTransaction().commit();
+        JPA.em().getTransaction().begin();
+    }
+
+    private List<TaskRun> listRunsForTask(Long taskId) {
+        return services.Tx.run(() -> {
+            var raw = TaskRun.find("task.id = ?1 ORDER BY startedAt ASC", taskId).fetch();
+            var typed = new ArrayList<TaskRun>(raw.size());
+            for (var r : raw) typed.add((TaskRun) r);
+            return typed;
+        });
+    }
+
+    private List<EventLog> loadEventsByCategory(String category) {
+        return services.Tx.run(() -> {
+            var raw = EventLog.find("category = ?1", category).fetch();
+            var typed = new ArrayList<EventLog>(raw.size());
+            for (var r : raw) typed.add((EventLog) r);
+            return typed;
+        });
+    }
+
+    // === Stubs ===
+
+    /**
+     * Subclasses {@link ExecutionOperations} so completion handlers can
+     * record their stop/schedule decisions without touching a real
+     * TaskRepository. Mirrors TaskRetryRoundtripTest's helper.
+     */
+    private static class RecordingExecutionOperations extends ExecutionOperations<Void> {
+        boolean stopped = false;
+        final Execution execution;
+
+        RecordingExecutionOperations(Execution execution) {
+            super(null, null, execution);
+            this.execution = execution;
+        }
+
+        Execution execution() { return execution; }
+
+        @Override public void stop() { stopped = true; }
+        @Override public void remove() { stopped = true; }
+        @Override public void reschedule(ExecutionComplete c, Instant n) { /* no-op: this test doesn't exercise reschedule paths */ }
+        @Override public void removeAndScheduleNew(SchedulableInstance<?> i) { /* no-op: this test doesn't exercise reschedule paths */ }
+    }
+
+    /**
+     * {@link RecordingExecutionOperations} whose {@code stop()} fails the way
+     * db-scheduler's does when the row was re-picked or already removed.
+     */
+    private static class ThrowingStopExecutionOperations extends RecordingExecutionOperations {
+        ThrowingStopExecutionOperations(Execution execution) { super(execution); }
+
+        @Override public void stop() {
+            throw new com.github.kagkarlsson.scheduler.exceptions.ExecutionException(
+                    "Expected one execution to be removed, but removed 0.", execution());
+        }
+    }
+
+    // === resume() re-arms a one-shot whose fire was dropped during the pause ===
+
+    /**
+     * A paused one-shot that reaches its fire time loses its scheduled_tasks
+     * row: the handler skips the body and returns OnCompleteRemove. Clearing
+     * the flag alone would leave the Task PENDING with nothing left to fire it,
+     * so resume re-arms it.
+     */
+    @Test
+    void resumeReArmsAOneShotWhoseFireWasDroppedWhilePaused() {
+        var agent = createAgent("resume-oneshot-agent");
+        var task = persistTask(agent, "Paused one-shot", "Later.",
+                Task.Type.SCHEDULED, Instant.now().plusSeconds(3600), null, null);
+        commitAndReopen();
+
+        TaskSchedulingService.pause(task.id);
+        stub.scheduleIfNotExists.clear();
+        TaskSchedulingService.resume(task.id);
+        commitAndReopen();
+
+        assertEquals(1, stub.scheduleIfNotExists.size(),
+                () -> "resume must re-arm a one-shot; calls=" + stub.scheduleIfNotExists.size());
+        assertEquals(task.id.toString(), stub.scheduleIfNotExists.getFirst().instance.getId());
+    }
+
+    /**
+     * Through the API, resume joins the request's transaction, and a past-due re-arm fires at once
+     * under enableImmediateExecution: armed before the commit, the handler reads the old
+     * paused=true and drops the row again.
+     */
+    @Test
+    void resumeReArmsOnlyAfterTheClearedFlagCommits() {
+        var agent = createAgent("resume-commit-agent");
+        var task = persistTask(agent, "Paused one-shot", "Later.",
+                Task.Type.SCHEDULED, Instant.now().plusSeconds(3600), null, null);
+        commitAndReopen();
+
+        TaskSchedulingService.pause(task.id);
+        commitAndReopen();
+        stub.scheduleIfNotExists.clear();
+        TaskSchedulingService.resume(task.id);
+
+        assertTrue(stub.scheduleIfNotExists.isEmpty(),
+                "re-armed before paused=false committed; the fire would read paused=true and drop the row");
+        commitAndReopen();
+        assertEquals(1, stub.scheduleIfNotExists.size(),
+                () -> "resume must re-arm once the flag commits; calls=" + stub.scheduleIfNotExists.size());
+    }
+
+    /**
+     * scheduleIfNotExists, not schedule: a one-shot paused and resumed before
+     * its fire time still holds its row, and re-arming must leave that row's
+     * time alone rather than throwing on a duplicate.
+     */
+    @Test
+    void resumeLeavesASurvivingOneShotRowAlone() {
+        var agent = createAgent("resume-intact-agent");
+        var task = persistTask(agent, "Intact one-shot", "Later.",
+                Task.Type.SCHEDULED, Instant.now().plusSeconds(3600), null, null);
+        commitAndReopen();
+
+        stub.scheduleIfNotExistsReturns = false; // the row is still there
+        TaskSchedulingService.pause(task.id);
+        stub.schedules.clear();
+        stub.scheduleIfNotExists.clear();
+        TaskSchedulingService.resume(task.id);
+        commitAndReopen();
+
+        // Paired: an empty schedules list alone is also what a resume that never ran would leave.
+        assertEquals(1, stub.scheduleIfNotExists.size(),
+                "resume must attempt the re-arm through scheduleIfNotExists");
+        assertTrue(stub.schedules.isEmpty(),
+                "a surviving one-shot row keeps its time: resume must create no schedule");
+    }
+
+    /**
+     * A recurring Task self-reschedules through a pause, so its row always
+     * survives; re-arming one would double-schedule it.
+     */
+    @Test
+    void resumeDoesNotReArmARecurringTask() {
+        var agent = createAgent("resume-cron-agent");
+        var task = persistTask(agent, "Cron task", "Recur.",
+                Task.Type.CRON, null, "0 0 4 1 1 *", null);
+        commitAndReopen();
+
+        TaskSchedulingService.pause(task.id);
+        stub.scheduleIfNotExists.clear();
+        TaskSchedulingService.resume(task.id);
+        commitAndReopen();
+
+        assertTrue(stub.scheduleIfNotExists.isEmpty(),
+                "a recurring Task keeps its row through a pause; re-arming double-schedules it");
+    }
+
+    /**
+     * A resume that commits while a paused fire is still skipping finds that fire's row and does not
+     * re-arm; the fire's completion then drops the row. The completion re-reads the flag after the
+     * drop, so it re-arms in that case instead of stranding the Task.
+     */
+    @Test
+    void pausedOneShotFireReArmsWhenResumeCommitsBeforeItsRowIsDropped() throws Exception {
+        var agent = createAgent("midskip-resume-agent");
+        var task = persistTask(agent, "Paused one-shot", "Earlier.",
+                Task.Type.SCHEDULED, Instant.now().minusSeconds(60), null, null);
+        commitAndReopen();
+        TaskSchedulingService.pause(task.id);
+        commitAndReopen();
+
+        var handler = driveFireCaptureHandler(task.id);
+
+        stub.scheduleIfNotExistsReturns = false; // the in-flight fire still holds its row
+        TaskSchedulingService.resume(task.id);
+        commitAndReopen();
+        JPA.em().clear();
+        stub.scheduleIfNotExistsReturns = true;
+        stub.scheduleIfNotExists.clear();
+
+        var ops = new RecordingExecutionOperations(new Execution(Instant.now(), instance(task.id)));
+        handler.complete(ExecutionComplete.success(
+                ops.execution(), Instant.now().minusSeconds(1), Instant.now()), ops);
+
+        assertTrue(ops.stopped, "the skipped fire must still drop its own row");
+        assertEquals(1, stub.scheduleIfNotExists.size(),
+                () -> "a resume that landed mid-skip must be re-armed by the fire; calls="
+                        + stub.scheduleIfNotExists.size());
+        assertTrue(listRunsForTask(task.id).isEmpty(), "the fire read paused=true, so its body must not run");
+    }
+
+    @Test
+    void pausedOneShotFireStaysDroppedWhileTheTaskIsStillPaused() throws Exception {
+        var agent = createAgent("still-paused-agent");
+        var task = persistTask(agent, "Paused one-shot", "Earlier.",
+                Task.Type.SCHEDULED, Instant.now().minusSeconds(60), null, null);
+        commitAndReopen();
+        TaskSchedulingService.pause(task.id);
+        commitAndReopen();
+
+        var handler = driveFireCaptureHandler(task.id);
+        stub.scheduleIfNotExists.clear();
+
+        var ops = new RecordingExecutionOperations(new Execution(Instant.now(), instance(task.id)));
+        handler.complete(ExecutionComplete.success(
+                ops.execution(), Instant.now().minusSeconds(1), Instant.now()), ops);
+
+        assertTrue(ops.stopped, "a paused one-shot's fire drops its row");
+        assertTrue(stub.scheduleIfNotExists.isEmpty(), "still paused, so nothing may re-arm it");
+    }
+
+    /**
+     * Dynamic-Proxy SchedulerClient stub. Captures schedule() calls for
+     * the self-reschedule assertions and surfaces a configurable set of
+     * "already-scheduled" ids for the BootConsistencyCheck sweep.
+     */
+    static class RecordingSchedulerStub {
+        static class ScheduleCall {
+            final TaskInstance<?> instance;
+            final Instant when;
+            ScheduleCall(TaskInstance<?> i, Instant w) { instance = i; when = w; }
+        }
+        final List<ScheduleCall> schedules = new ArrayList<>();
+        final List<ScheduleCall> scheduleIfNotExists = new ArrayList<>();
+        final List<TaskInstanceId> cancels = new ArrayList<>();
+        final List<String> scheduledIds = new ArrayList<>();
+        boolean throwOnSchedule = false;
+        /** What scheduleIfNotExists reports: true = no row existed, so it armed one. */
+        boolean scheduleIfNotExistsReturns = true;
+
+        SchedulerClient proxy() {
+            return (SchedulerClient) Proxy.newProxyInstance(
+                    SchedulerClient.class.getClassLoader(),
+                    new Class<?>[] { SchedulerClient.class },
+                    this::dispatch);
+        }
+
+        @SuppressWarnings({"unchecked", "rawtypes"})
+        private Object dispatch(Object proxy, Method method, Object[] args) {
+            String name = method.getName();
+            if ("schedule".equals(name) && args != null && args.length == 2
+                    && args[0] instanceof TaskInstance<?> inst
+                    && args[1] instanceof Instant when) {
+                if (throwOnSchedule) throw new RuntimeException("Stub: schedule failed");
+                schedules.add(new ScheduleCall(inst, when));
+                return null;
+            }
+            if ("scheduleIfNotExists".equals(name) && args != null && args.length == 2
+                    && args[0] instanceof TaskInstance<?> inst
+                    && args[1] instanceof Instant when) {
+                scheduleIfNotExists.add(new ScheduleCall(inst, when));
+                // schedules means "created": production schedules through this method now.
+                if (scheduleIfNotExistsReturns) schedules.add(new ScheduleCall(inst, when));
+                return scheduleIfNotExistsReturns;
+            }
+            if ("cancel".equals(name) && args != null && args.length == 1
+                    && args[0] instanceof TaskInstanceId id) {
+                cancels.add(id);
+                return null;
+            }
+            if ("getScheduledExecutionsForTask".equals(name)
+                    && args != null && args.length >= 1
+                    && args[0] instanceof String taskName) {
+                var out = new ArrayList<com.github.kagkarlsson.scheduler.ScheduledExecution<Object>>();
+                for (var id : scheduledIds) {
+                    var ti = new TaskInstance(taskName, id);
+                    var exec = new Execution(Instant.now(), ti);
+                    out.add(new com.github.kagkarlsson.scheduler.ScheduledExecution<>(
+                            Object.class, exec));
+                }
+                return out;
+            }
+            Class<?> r = method.getReturnType();
+            if (r == boolean.class || r == Boolean.class) return false;
+            if (r == int.class || r == Integer.class) return 0;
+            if (r == long.class || r == Long.class) return 0L;
+            if (r == List.class) return List.of();
+            if (r == java.util.Optional.class) return java.util.Optional.empty();
+            return null;
+        }
+    }
+}

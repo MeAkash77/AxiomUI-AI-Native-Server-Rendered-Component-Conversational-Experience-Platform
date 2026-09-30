@@ -1,0 +1,150 @@
+package agents;
+
+import llm.LlmProvider;
+import llm.LlmTypes.ChatMessage;
+import llm.LlmTypes.ModelInfo;
+import llm.LlmTypes.ToolDef;
+import llm.TokenUsageEstimator;
+import models.Agent;
+import org.jspecify.annotations.Nullable;
+import services.ConfigService;
+import services.ConversationService;
+import services.EventLogger;
+import services.SessionCompactor;
+import services.Tx;
+
+import java.util.List;
+import java.util.Set;
+
+/**
+ * JCLAW-38 / JCLAW-268 compaction trigger. Extracted from
+ * {@link AgentRunner} as part of JCLAW-299. The single entry point
+ * {@link #maybeCompactAndRebuild} runs between the prep Tx and the
+ * LLM call, deciding whether the assembled message list has crossed
+ * the per-model compaction budget; if so it invokes
+ * {@link SessionCompactor#compact} and re-hydrates the message list
+ * with the freshly stored summary injected.
+ *
+ * <p>The decision is intentionally side-effect-free outside the
+ * compactor: a snapshot read in a bounded Tx, a token-count check
+ * against {@link ModelInfo}, and the compactor's own summarizer
+ * lambda which makes its own LLM call. The summarizer call MUST run
+ * outside any JPA transaction because it is LLM-bound and may take
+ * tens of seconds — holding a JDBC connection through that would
+ * starve the connection pool.
+ *
+ * <p>Even on success the caller should pass the rebuilt message list
+ * through {@link ContextWindowManager#trimToContextWindow} as a
+ * final safety net — if the summary plus retained tail somehow
+ * still doesn't fit, drop-oldest guarantees we never ship an
+ * over-budget context.
+ */
+public final class CompactionGate {
+
+    private CompactionGate() {
+    }
+
+    private record CompactionDecision(@Nullable ModelInfo modelInfo, @Nullable String modelId,
+                                      @Nullable String channelType) {
+    }
+
+    /**
+     * If {@code current} exceeds the compaction budget for the
+     * effective model, run {@link SessionCompactor#compact} and
+     * return a freshly rebuilt message list (with the new summary
+     * injected into the system prompt and the older turns dropped).
+     * Otherwise, returns {@code current} unchanged (JCLAW-38).
+     *
+     * <p>Called from both {@link AgentRunner#run} and the streaming
+     * loop after the initial prep Tx closes, because the
+     * summarization call itself is LLM-bound and must not hold a JDBC
+     * connection.
+     */
+    public static List<ChatMessage> maybeCompactAndRebuild(
+            Agent agent, Long conversationId, String userMessage,
+            @Nullable Set<String> disabledTools, LlmProvider primary,
+            List<ChatMessage> current) {
+        return maybeCompactAndRebuild(agent, conversationId, userMessage, disabledTools,
+                primary, current, List.of());
+    }
+
+    /**
+     * Overload taking the request's tool schemas so the compaction trigger
+     * measures the same payload {@link ContextWindowManager#trimToContextWindow}
+     * sees — tool JSON contributes to the provider's prompt_tokens count and
+     * was previously absent from the chars/4 estimate, letting large
+     * tool-heavy turns slip past the compaction threshold and get truncated
+     * by the trim drop-oldest fallback instead of summarized.
+     */
+    public static List<ChatMessage> maybeCompactAndRebuild(
+            Agent agent, Long conversationId, String userMessage,
+            @Nullable Set<String> disabledTools, LlmProvider primary,
+            List<ChatMessage> current, List<ToolDef> tools) {
+        return maybeCompactAndRebuild(agent, conversationId, userMessage, disabledTools, primary,
+                new MessageHydrator.Hydration(current, List.of(), List.of(), List.of()), tools).messages();
+    }
+
+    /**
+     * Bearer-aware overload. A rebuild replaces the message list, so the media bearers whose
+     * {@code chatMessageIndex} addressed the pre-compaction list stop being valid; this returns the
+     * rebuild's own bearers beside its messages so the capability rewrites downstream write into
+     * the list they were actually computed against (JCLAW-1232). When no compaction fires,
+     * {@code current} is returned unchanged.
+     */
+    public static MessageHydrator.Hydration maybeCompactAndRebuild(
+            Agent agent, Long conversationId, String userMessage,
+            @Nullable Set<String> disabledTools, LlmProvider primary,
+            MessageHydrator.Hydration current, List<ToolDef> tools) {
+        // Cheap snapshot: model info + effective model id + channel type.
+        // resolveModelInfo reads only in-memory provider config, so this
+        // Tx is bounded by one findById.
+        var snapshot = Tx.run(() -> {
+            var conv = ConversationService.findById(conversationId);
+            if (conv == null) return null;
+            var mi = ModelResolver.resolveModelInfo(agent, conv, primary).orElse(null);
+            var modelId = ModelResolver.effectiveModelId(agent, conv);
+            return new CompactionDecision(mi, modelId, conv.channelType);
+        });
+        if (snapshot == null || snapshot.modelInfo() == null || snapshot.modelId() == null) return current;
+        // No-op when the caller has no provider wired up — without one we
+        // can't even make the summarization LLM call. Bail out instead of
+        // letting providerName/modelLabel construction NPE later.
+        if (primary == null || primary.config() == null) return current;
+        final var providerName = primary.config().name();
+        var estimate = TokenUsageEstimator.estimateChatRequest(snapshot.modelId(), current.messages(), tools);
+        int estimatedTokens = ContextWindowManager.adjustedPromptTokens(providerName, snapshot.modelId(), estimate);
+        if (!SessionCompactor.shouldCompact(estimatedTokens, snapshot.modelInfo())) return current;
+
+        final var modelId = snapshot.modelId();
+        final var compactionChannel = snapshot.channelType();
+        final var maxOutput = ConfigService.getInt("chat.compactionMaxTokens", 8192);
+        final var modelLabel = providerName + "/" + modelId;
+
+        SessionCompactor.Summarizer summarizer = sumMsgs -> {
+            var resp = primary.chat(modelId, sumMsgs, List.of(), maxOutput, null, compactionChannel);
+            return SessionCompactor.firstChoiceText(resp);
+        };
+
+        var result = SessionCompactor.compact(conversationId, modelLabel, summarizer);
+        if (!result.compacted()) {
+            EventLogger.info("compaction", agent.name, snapshot.channelType(),
+                    "Compaction skipped (%s); falling back to drop-oldest".formatted(result.skipReason()));
+            return current;
+        }
+        EventLogger.info("compaction", agent.name, snapshot.channelType(),
+                "Compacted %d turns (%d chars) via %s".formatted(
+                        result.turnsCompacted(), result.summaryChars(), modelLabel));
+
+        // Rebuild messages: fresh read picks up the bumped compactionSince,
+        // appendSummaryToPrompt re-injects the (now stored) summary.
+        return Tx.run(() -> {
+            var conv = ConversationService.findById(conversationId);
+            if (conv == null) return current;
+            var assembled = SystemPromptAssembler.assemble(agent, userMessage, disabledTools, conv.channelType);
+            var sysPrompt = SessionCompactor.appendSummaryToPrompt(assembled.systemPrompt(), conv);
+            // JCLAW-268: re-inject spawn-time parent context for inherit-mode subagents.
+            sysPrompt = SessionCompactor.appendParentContextToPrompt(sysPrompt, conv);
+            return MessageHydrator.buildMessages(sysPrompt, conv);
+        });
+    }
+}

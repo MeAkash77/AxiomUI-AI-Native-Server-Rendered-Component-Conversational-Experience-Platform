@@ -1,0 +1,1456 @@
+import com.google.gson.JsonParser;
+import mockwebserver3.MockResponse;
+import mockwebserver3.MockWebServer;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import play.test.UnitTest;
+import services.ModelDiscoveryService;
+import services.discovery.DiscoveryResult;
+import services.discovery.DiscoveryStrategy;
+import services.discovery.LmStudioDiscoveryStrategy;
+import services.discovery.ModelCatalogParser;
+import services.discovery.OllamaDiscoveryStrategy;
+import services.discovery.OpenAiCompatDiscoveryStrategy;
+
+/**
+ * Tests for ModelDiscoveryService static parsing and inference methods.
+ * No network calls — exercises the pure-logic helpers only.
+ */
+class ModelDiscoveryServiceTest extends UnitTest {
+
+    // --- stripVariant ---
+
+    @Test
+    void stripVariantRemovesSuffix() {
+        assertEquals("openai/gpt-4", ModelCatalogParser.stripVariant("openai/gpt-4:extended"));
+    }
+
+    @Test
+    void stripVariantPreservesIdWithoutVariant() {
+        assertEquals("openai/gpt-4", ModelCatalogParser.stripVariant("openai/gpt-4"));
+    }
+
+    @Test
+    void stripVariantHandlesMultipleColons() {
+        assertEquals("vendor/model", ModelCatalogParser.stripVariant("vendor/model:v1:extra"));
+    }
+
+    // --- stripVersionSuffix ---
+
+    @Test
+    void stripVersionSuffixRemovesDateSuffix() {
+        assertEquals("openai/gpt-4", ModelCatalogParser.stripVersionSuffix("openai/gpt-4-20250101"));
+    }
+
+    @Test
+    void stripVersionSuffixRemovesShortSuffix() {
+        assertEquals("openai/gpt-4", ModelCatalogParser.stripVersionSuffix("openai/gpt-4-0125"));
+    }
+
+    @Test
+    void stripVersionSuffixPreservesCleanId() {
+        assertEquals("openai/gpt-4", ModelCatalogParser.stripVersionSuffix("openai/gpt-4"));
+    }
+
+    @Test
+    void stripVersionSuffixRemovesDashSeparatedDate() {
+        // OpenAI's checkpoint format like gpt-4o-2024-08-06; the prior
+        // regex only handled contiguous dates and 3-4 digit version pins,
+        // missing this shape entirely. Required for LiteLLM id lookups
+        // (JCLAW-28 follow-up: PricingRefreshService).
+        assertEquals("gpt-4o", ModelCatalogParser.stripVersionSuffix("gpt-4o-2024-08-06"));
+        assertEquals("openai/gpt-4o-mini",
+                ModelCatalogParser.stripVersionSuffix("openai/gpt-4o-mini-2024-07-18"));
+    }
+
+    // --- detectThinkingSupport ---
+
+    @Test
+    void detectThinkingSupportFromProviderParams() {
+        var obj = JsonParser.parseString("""
+                {"id": "some-model", "supported_parameters": ["reasoning", "temperature"]}
+                """).getAsJsonObject();
+        var result = ModelCatalogParser.detectThinkingSupport(obj);
+        assertTrue(result.confirmed());
+        assertTrue(result.fromProvider());
+    }
+
+    @Test
+    void detectThinkingSupportFromProviderParamsNegative() {
+        var obj = JsonParser.parseString("""
+                {"id": "some-model", "supported_parameters": ["temperature", "top_p"]}
+                """).getAsJsonObject();
+        var result = ModelCatalogParser.detectThinkingSupport(obj);
+        assertFalse(result.confirmed());
+        assertTrue(result.fromProvider());
+    }
+
+    @Test
+    void detectThinkingSupportFallbackO1() {
+        var obj = JsonParser.parseString("""
+                {"id": "openai/o1-preview"}
+                """).getAsJsonObject();
+        var result = ModelCatalogParser.detectThinkingSupport(obj);
+        assertTrue(result.confirmed());
+        assertFalse(result.fromProvider());
+    }
+
+    @Test
+    void detectThinkingSupportFallbackDeepseekR1() {
+        var obj = JsonParser.parseString("""
+                {"id": "deepseek/deepseek-r1"}
+                """).getAsJsonObject();
+        var result = ModelCatalogParser.detectThinkingSupport(obj);
+        assertTrue(result.confirmed());
+        assertFalse(result.fromProvider());
+    }
+
+    @Test
+    void detectThinkingSupportUnknownModel() {
+        var obj = JsonParser.parseString("""
+                {"id": "vendor/some-regular-model"}
+                """).getAsJsonObject();
+        var result = ModelCatalogParser.detectThinkingSupport(obj);
+        assertFalse(result.confirmed());
+        assertFalse(result.fromProvider());
+    }
+
+    // --- detectAlwaysThinks ---
+    // No provider exposes "thinking is mandatory" in metadata except
+    // OpenRouter's architecture.instruct_type for the R1 family. Everywhere
+    // else we rely on tight id-pattern matching.
+
+    @Test
+    void detectAlwaysThinksFromOpenRouterInstructType() {
+        // The single provider-surfaced signal we get for "always thinks."
+        var obj = JsonParser.parseString("""
+                {"id": "deepseek/deepseek-r1",
+                 "architecture": {"instruct_type": "deepseek-r1"}}
+                """).getAsJsonObject();
+        var result = ModelCatalogParser.detectAlwaysThinks(obj);
+        assertTrue(result.confirmed());
+        assertTrue(result.fromProvider());
+    }
+
+    @Test
+    void detectAlwaysThinksInstructTypeIsCaseInsensitive() {
+        var obj = JsonParser.parseString("""
+                {"id": "deepseek/deepseek-r1",
+                 "architecture": {"instruct_type": "DeepSeek-R1"}}
+                """).getAsJsonObject();
+        assertTrue(ModelCatalogParser.detectAlwaysThinks(obj).confirmed());
+    }
+
+    @Test
+    void detectAlwaysThinksMatchesO1Family() {
+        for (var id : java.util.List.of(
+                "o1", "o1-mini", "o1-pro", "o1-preview",
+                "openai/o1", "openai/o1-mini", "openai/o1-preview"
+        )) {
+            var obj = JsonParser.parseString("{\"id\": \"" + id + "\"}").getAsJsonObject();
+            var result = ModelCatalogParser.detectAlwaysThinks(obj);
+            assertTrue(result.confirmed(), id + " should match");
+            assertFalse(result.fromProvider(), id + " is name-pattern, not provider");
+        }
+    }
+
+    @Test
+    void detectAlwaysThinksMatchesO3Family() {
+        for (var id : java.util.List.of("o3", "o3-mini", "o3-pro", "openai/o3-mini")) {
+            var obj = JsonParser.parseString("{\"id\": \"" + id + "\"}").getAsJsonObject();
+            assertTrue(ModelCatalogParser.detectAlwaysThinks(obj).confirmed(),
+                    id + " should match");
+        }
+    }
+
+    @Test
+    void detectAlwaysThinksMatchesO4Mini() {
+        var obj = JsonParser.parseString("{\"id\": \"openai/o4-mini\"}").getAsJsonObject();
+        assertTrue(ModelCatalogParser.detectAlwaysThinks(obj).confirmed());
+    }
+
+    @Test
+    void detectAlwaysThinksMatchesDeepseekR1Variants() {
+        for (var id : java.util.List.of(
+                "deepseek-r1", "deepseek-ai/deepseek-r1",
+                "deepseek-r1:latest", "deepseek-r1-distill-llama-70b"
+        )) {
+            var obj = JsonParser.parseString("{\"id\": \"" + id + "\"}").getAsJsonObject();
+            assertTrue(ModelCatalogParser.detectAlwaysThinks(obj).confirmed(),
+                    id + " should match");
+        }
+    }
+
+    @Test
+    void detectAlwaysThinksMatchesQwq() {
+        for (var id : java.util.List.of("qwq", "qwen/qwq-32b", "qwq:latest")) {
+            var obj = JsonParser.parseString("{\"id\": \"" + id + "\"}").getAsJsonObject();
+            assertTrue(ModelCatalogParser.detectAlwaysThinks(obj).confirmed(),
+                    id + " should match");
+        }
+    }
+
+    @Test
+    void detectAlwaysThinksRejectsClaudeOpus() {
+        // Critical regression guard: "claude-opus-4-1" contains "o" and a
+        // digit, but must NOT match the o-series pattern. The tight regex
+        // requires the o-token to start the id-component.
+        for (var id : java.util.List.of(
+                "claude-opus-4-1", "anthropic/claude-opus-4-1",
+                "claude-opus-4", "claude-haiku-4-1"
+        )) {
+            var obj = JsonParser.parseString("{\"id\": \"" + id + "\"}").getAsJsonObject();
+            assertFalse(ModelCatalogParser.detectAlwaysThinks(obj).confirmed(),
+                    id + " must not match");
+        }
+    }
+
+    @Test
+    void detectAlwaysThinksRejectsGpt4o() {
+        // gpt-4o contains "o" but is hybrid (and uses GPT-4o-style audio,
+        // not o-series reasoning architecture).
+        for (var id : java.util.List.of("gpt-4o", "gpt-4o-mini", "openai/gpt-4o")) {
+            var obj = JsonParser.parseString("{\"id\": \"" + id + "\"}").getAsJsonObject();
+            assertFalse(ModelCatalogParser.detectAlwaysThinks(obj).confirmed(),
+                    id + " must not match");
+        }
+    }
+
+    @Test
+    void detectAlwaysThinksRejectsHybridReasoners() {
+        // Hybrid models that DO support thinking but can be turned off —
+        // the toggle is real for these, so they must NOT be locked.
+        for (var id : java.util.List.of(
+                "openai/gpt-5", "openai/gpt-5-mini",
+                "anthropic/claude-sonnet-4-7",
+                "google/gemini-2.5-pro", "google/gemini-3-flash-preview",
+                "qwen/qwen3-32b", "deepseek/deepseek-v3",
+                "kimi-k2.5"
+        )) {
+            var obj = JsonParser.parseString("{\"id\": \"" + id + "\"}").getAsJsonObject();
+            assertFalse(ModelCatalogParser.detectAlwaysThinks(obj).confirmed(),
+                    id + " is hybrid, must not match");
+        }
+    }
+
+    @Test
+    void detectAlwaysThinksUnknownModel() {
+        var obj = JsonParser.parseString("""
+                {"id": "vendor/some-regular-model"}
+                """).getAsJsonObject();
+        var result = ModelCatalogParser.detectAlwaysThinks(obj);
+        assertFalse(result.confirmed());
+        assertFalse(result.fromProvider());
+    }
+
+    // --- detectVisionSupport ---
+
+    /**
+     * Provider-surfaced vision signals from {@code architecture}: the new
+     * input_modalities array (positive + text-only negative) and the legacy
+     * single modality string. All three are provider-confirmed; confirmed()
+     * tracks whether "image" is present.
+     */
+    @ParameterizedTest(name = "{0}")
+    @CsvSource(delimiter = '|', value = {
+            "OpenRouterModalitiesImage | {\"id\":\"anthropic/claude-sonnet-4-6\",\"architecture\":{\"input_modalities\":[\"text\",\"image\"]}} | true",
+            "OpenRouterModalitiesText  | {\"id\":\"vendor/text-only-model\",\"architecture\":{\"input_modalities\":[\"text\"]}}             | false",
+            "LegacyModalityString      | {\"id\":\"vendor/legacy\",\"architecture\":{\"modality\":\"text+image->text\"}}                     | true"
+    })
+    void detectVisionFromArchitecture(String label, String json, boolean expectedConfirmed) {
+        var obj = JsonParser.parseString(json).getAsJsonObject();
+        var result = ModelCatalogParser.detectVisionSupport(obj);
+        assertEquals(expectedConfirmed, result.confirmed());
+        assertTrue(result.fromProvider());
+    }
+
+    @Test
+    void detectVisionFromOllamaCapabilities() {
+        // Ollama surfaces capabilities via /api/show; some /api/tags variants
+        // merge them in. "vision" is the canonical token.
+        var obj = JsonParser.parseString("""
+                {"id": "llava:13b", "capabilities": ["completion", "vision"]}
+                """).getAsJsonObject();
+        var result = ModelCatalogParser.detectVisionSupport(obj);
+        assertTrue(result.confirmed());
+        assertTrue(result.fromProvider());
+    }
+
+    @Test
+    void detectVisionFallbackGpt4o() {
+        // No architecture, no capabilities — ID heuristic kicks in.
+        var obj = JsonParser.parseString("""
+                {"id": "openai/gpt-4o"}
+                """).getAsJsonObject();
+        var result = ModelCatalogParser.detectVisionSupport(obj);
+        assertTrue(result.confirmed());
+        assertFalse(result.fromProvider());
+    }
+
+    @Test
+    void detectVisionFallbackClaudeSonnet() {
+        var obj = JsonParser.parseString("""
+                {"id": "anthropic/claude-sonnet-4-6"}
+                """).getAsJsonObject();
+        var result = ModelCatalogParser.detectVisionSupport(obj);
+        assertTrue(result.confirmed());
+        assertFalse(result.fromProvider());
+    }
+
+    @Test
+    void detectVisionUnknownModel() {
+        var obj = JsonParser.parseString("""
+                {"id": "vendor/plain-text-model"}
+                """).getAsJsonObject();
+        var result = ModelCatalogParser.detectVisionSupport(obj);
+        assertFalse(result.confirmed());
+        assertFalse(result.fromProvider());
+    }
+
+    // --- detectAudioSupport ---
+
+    /**
+     * Audio support confirmed across all three positive signals — the
+     * OpenRouter input_modalities array, the gpt-4o-audio id heuristic
+     * (fromProvider=false), and the Ollama capabilities array. confirmed()
+     * is true throughout; only the modality/capabilities cases are
+     * provider-confirmed, the bare-id case is a heuristic guess.
+     */
+    @ParameterizedTest(name = "{0}")
+    @CsvSource(delimiter = '|', value = {
+            "OpenRouterModalities | {\"id\":\"openai/gpt-4o-audio-preview\",\"architecture\":{\"input_modalities\":[\"text\",\"audio\"]}} | true",
+            "FallbackGpt4oAudioId  | {\"id\":\"openai/gpt-4o-audio-preview\"}                                                            | false",
+            "OllamaCapabilities    | {\"id\":\"qwen2-audio:7b\",\"capabilities\":[\"completion\",\"audio\"]}                              | true"
+    })
+    void detectAudioConfirmed(String label, String json, boolean expectedFromProvider) {
+        var obj = JsonParser.parseString(json).getAsJsonObject();
+        var result = ModelCatalogParser.detectAudioSupport(obj);
+        assertTrue(result.confirmed());
+        assertEquals(expectedFromProvider, result.fromProvider());
+    }
+
+    @Test
+    void detectAudioUnknownModel() {
+        var obj = JsonParser.parseString("""
+                {"id": "vendor/text-only"}
+                """).getAsJsonObject();
+        var result = ModelCatalogParser.detectAudioSupport(obj);
+        assertFalse(result.confirmed());
+        assertFalse(result.fromProvider());
+    }
+
+    // --- detectVideoSupport (JCLAW-217) ---
+
+    /**
+     * Video support: provider modality array (OpenRouter advertises "video" for
+     * Qwen-VL routes, fromProvider=true) and the Qwen-VL id heuristic
+     * (fromProvider=false). Provider-awareness comes from the discovery routing —
+     * only the OpenAI-compatible path reaches this; Ollama/LM Studio use their
+     * own native paths, so a Qwen-VL model served there stays video=false.
+     */
+    @ParameterizedTest(name = "{0}")
+    @CsvSource(delimiter = '|', value = {
+            "OpenRouterModalities | {\"id\":\"qwen/qwen2.5-vl-72b-instruct\",\"architecture\":{\"input_modalities\":[\"text\",\"image\",\"video\"]}} | true",
+            "Qwen25VlIdHeuristic   | {\"id\":\"qwen/qwen2.5-vl-7b-instruct\"}                                                                       | false",
+            "Qwen3VlIdHeuristic    | {\"id\":\"qwen/qwen3-vl-30b-a3b-instruct\"}                                                                    | false"
+    })
+    void detectVideoConfirmed(String label, String json, boolean expectedFromProvider) {
+        var obj = JsonParser.parseString(json).getAsJsonObject();
+        var result = ModelCatalogParser.detectVideoSupport(obj);
+        assertTrue(result.confirmed());
+        assertEquals(expectedFromProvider, result.fromProvider());
+    }
+
+    @Test
+    void detectVideoUnknownModel() {
+        // A non-Qwen-VL model with no provider modality metadata is not video-native.
+        var obj = JsonParser.parseString("""
+                {"id": "openai/gpt-4o"}
+                """).getAsJsonObject();
+        var result = ModelCatalogParser.detectVideoSupport(obj);
+        assertFalse(result.confirmed());
+        assertFalse(result.fromProvider());
+    }
+
+    @Test
+    void detectAudioFallbackAudioPreviewSuffix() {
+        // JCLAW-160: OpenAI's /v1/models endpoint returns plain entries
+        // without modality metadata, so the id heuristic is the only
+        // signal. The "-audio-preview" suffix is OpenAI's stable naming
+        // convention for audio-capable models — match it generically so
+        // future variants (gpt-4o-mini-audio-preview, gpt-5-audio-preview)
+        // are flagged without per-version updates.
+        var obj = JsonParser.parseString("""
+                {"id": "gpt-4o-mini-audio-preview"}
+                """).getAsJsonObject();
+        var result = ModelCatalogParser.detectAudioSupport(obj);
+        assertTrue(result.confirmed(),
+                "audio-preview suffix must be detected even with -mini- in the middle");
+        assertFalse(result.fromProvider());
+    }
+
+    @Test
+    void detectAudioPreviewMatchRequiresLeadingDash() {
+        // JCLAW-160 review follow-up: the audio-preview match must be
+        // anchored on a leading dash. A hypothetical model whose id
+        // begins with "audio-preview" (no preceding dash) — e.g. an
+        // unrelated vendor naming a classifier with that prefix — must
+        // not false-positive. Pin the contract so a future maintainer
+        // can't quietly drop the dash and re-broaden the match.
+        var obj = JsonParser.parseString("""
+                {"id": "audio-preview-classifier"}
+                """).getAsJsonObject();
+        var result = ModelCatalogParser.detectAudioSupport(obj);
+        assertFalse(result.confirmed(),
+                "non-dash-prefixed audio-preview substring must not trip the detector");
+        assertFalse(result.fromProvider());
+    }
+
+    // --- inferPrice ---
+
+    @Test
+    void inferPriceWithValidPricing() {
+        var obj = JsonParser.parseString("""
+                {"pricing": {"prompt": "0.000003", "completion": "0.000015"}}
+                """).getAsJsonObject();
+        double price = ModelCatalogParser.inferPrice(obj, "prompt");
+        assertEquals(3.0, price, 0.001);
+    }
+
+    /**
+     * Three "absent price" inference paths all return -1: field missing
+     * from pricing, no pricing object at all, and explicit null field.
+     */
+    @ParameterizedTest(name = "{0}")
+    @CsvSource(delimiter = '|', value = {
+            "MissingField    | {\"pricing\": {\"prompt\": \"0.000003\"}} | completion",
+            "NoPricingObject | {\"id\": \"some-model\"}                  | prompt",
+            "NullField       | {\"pricing\": {\"prompt\": null}}         | prompt"
+    })
+    void inferPriceReturnsMinusOneForAbsentPrice(String label, String json, String field) {
+        var obj = JsonParser.parseString(json).getAsJsonObject();
+        double price = ModelCatalogParser.inferPrice(obj, field);
+        assertEquals(-1, price, 0.001);
+    }
+
+    @Test
+    void inferPriceReadsTogetherInputOutputShape() {
+        // Together AI quotes pricing.{input,output,cached_input} as JSON
+        // numbers in dollars-per-MILLION already — read as-is, NOT scaled by
+        // 1e6 like OpenRouter's per-token prompt/completion strings.
+        var obj = JsonParser.parseString("""
+                {"pricing": {"input": 0.32, "output": 1.28, "cached_input": 0.2}}
+                """).getAsJsonObject();
+        assertEquals(0.32, ModelCatalogParser.inferPrice(obj, "prompt"), 0.0001);
+        assertEquals(1.28, ModelCatalogParser.inferPrice(obj, "completion"), 0.0001);
+        assertEquals(0.2, ModelCatalogParser.inferPrice(obj, "input_cache_read"), 0.0001);
+    }
+
+    @Test
+    void inferPriceTogetherHasNoCacheWritePrice() {
+        // Together exposes no cache-write price → -1 (unknown), never a
+        // mis-mapped value from another field.
+        var obj = JsonParser.parseString("""
+                {"pricing": {"input": 0.32, "output": 1.28}}
+                """).getAsJsonObject();
+        assertEquals(-1, ModelCatalogParser.inferPrice(obj, "input_cache_write"), 0.0001);
+    }
+
+    @Test
+    void inferPricePrefersOpenRouterShapeWhenBothKeysPresent() {
+        // Defensive: if a payload somehow carried both shapes, the per-token
+        // prompt/completion (×1e6) wins — that's the established convention.
+        var obj = JsonParser.parseString("""
+                {"pricing": {"prompt": "0.000003", "input": 99}}
+                """).getAsJsonObject();
+        assertEquals(3.0, ModelCatalogParser.inferPrice(obj, "prompt"), 0.0001);
+    }
+
+    // --- parseModels ---
+
+    @Test
+    void parseModelsWithDataArray() {
+        var json = JsonParser.parseString("""
+                {"data": [
+                    {"id": "model-1", "name": "Model One", "context_length": 128000},
+                    {"id": "model-2", "name": "Model Two", "context_length": 32000}
+                ]}
+                """).getAsJsonObject();
+        var models = ModelCatalogParser.parseModels(json);
+        assertEquals(2, models.size());
+        assertEquals("model-1", models.get(0).get("id"));
+        assertEquals("Model One", models.get(0).get("name"));
+        assertEquals(128000, models.get(0).get("contextWindow"));
+    }
+
+    @Test
+    void parseModelsWithModelsArray() {
+        var json = JsonParser.parseString("""
+                {"models": [
+                    {"id": "alt-model", "context_window": 8000}
+                ]}
+                """).getAsJsonObject();
+        var models = ModelCatalogParser.parseModels(json);
+        assertEquals(1, models.size());
+        assertEquals("alt-model", models.get(0).get("id"));
+        assertEquals(8000, models.get(0).get("contextWindow"));
+    }
+
+    @Test
+    void parseModelsSkipsBlankIds() {
+        var json = JsonParser.parseString("""
+                {"data": [
+                    {"id": "", "name": "No ID"},
+                    {"id": "valid", "name": "Valid"}
+                ]}
+                """).getAsJsonObject();
+        var models = ModelCatalogParser.parseModels(json);
+        assertEquals(1, models.size());
+        assertEquals("valid", models.get(0).get("id"));
+    }
+
+    @Test
+    void parseModelsHandlesEmptyResponse() {
+        var json = JsonParser.parseString("""
+                {"data": []}
+                """).getAsJsonObject();
+        var models = ModelCatalogParser.parseModels(json);
+        assertTrue(models.isEmpty());
+    }
+
+    // Suppressed S125 (commented-out code) — the doc comment below is real
+    // documentation, but Sonar's heuristic misreads it as code because the
+    // prose contains method-call syntax (.getAsJsonObject()) and type names
+    // (JsonElement). Reword and you lose the explanation; suppress and keep
+    // the explanation. Localized to this method so other commented-out
+    // code in this file would still get flagged.
+    @SuppressWarnings("java:S125")
+    @Test
+    void parseModelsHandlesBareJsonArray() {
+        // Together AI returns /v1/models as a bare array (no {data: ...}
+        // wrapper). The OpenAI-compat discovery path used to throw
+        // IllegalStateException on .getAsJsonObject() and surface as a
+        // 502; parseModels now accepts JsonElement and routes both shapes.
+        var json = JsonParser.parseString("""
+                [
+                    {"id": "moonshotai/Kimi-K2.5", "context_length": 262144},
+                    {"id": "meta-llama/Llama-3.3-70B-Instruct-Turbo", "context_length": 131072}
+                ]
+                """);
+        var models = ModelCatalogParser.parseModels(json);
+        assertEquals(2, models.size());
+        assertEquals("moonshotai/Kimi-K2.5", models.get(0).get("id"));
+        assertEquals(262144, models.get(0).get("contextWindow"));
+        assertEquals("meta-llama/Llama-3.3-70B-Instruct-Turbo", models.get(1).get("id"));
+    }
+
+    @Test
+    void parseModelsHandlesNullInput() {
+        // Defensive: parseModels never throws on null/JsonNull, just returns
+        // empty so callers see "0 models" rather than crashing through a NPE.
+        assertTrue(ModelCatalogParser.parseModels(null).isEmpty());
+        assertTrue(ModelCatalogParser.parseModels(com.google.gson.JsonNull.INSTANCE).isEmpty());
+    }
+
+    @Test
+    void parseModelsHandlesMissingDataAndModels() {
+        var json = JsonParser.parseString("""
+                {"status": "ok"}
+                """).getAsJsonObject();
+        var models = ModelCatalogParser.parseModels(json);
+        assertTrue(models.isEmpty());
+    }
+
+    @Test
+    void parseModelsInfersNameFromId() {
+        var json = JsonParser.parseString("""
+                {"data": [{"id": "vendor/model-name"}]}
+                """).getAsJsonObject();
+        var models = ModelCatalogParser.parseModels(json);
+        assertEquals(1, models.size());
+        assertEquals("model-name", models.get(0).get("name"));
+    }
+
+    // ─── Ollama native discovery (JCLAW-118) ─────────────────────────
+
+    @Test
+    void stripV1SuffixRemovesTrailingV1() {
+        assertEquals("https://ollama.com", ModelCatalogParser.stripV1Suffix("https://ollama.com/v1"));
+        assertEquals("https://ollama.com", ModelCatalogParser.stripV1Suffix("https://ollama.com/v1/"));
+        assertEquals("http://localhost:11434", ModelCatalogParser.stripV1Suffix("http://localhost:11434/v1"));
+    }
+
+    @Test
+    void stripV1SuffixLeavesUrlsWithoutV1Untouched() {
+        assertEquals("https://ollama.com", ModelCatalogParser.stripV1Suffix("https://ollama.com"));
+        assertEquals("https://example.com/api", ModelCatalogParser.stripV1Suffix("https://example.com/api"));
+        assertEquals("", ModelCatalogParser.stripV1Suffix(null));
+    }
+
+    @Test
+    void extractTagIdsPullsNamesFromModelsArray() {
+        var json = JsonParser.parseString("""
+                {"models":[
+                  {"name":"kimi-k2.5","model":"kimi-k2.5"},
+                  {"name":"gpt-oss:20b","model":"gpt-oss:20b"},
+                  {"name":"glm-5"}
+                ]}
+                """).getAsJsonObject();
+        var ids = ModelCatalogParser.extractTagIds(json);
+        assertEquals(3, ids.size());
+        assertEquals("kimi-k2.5", ids.get(0));
+        assertEquals("gpt-oss:20b", ids.get(1));
+        assertEquals("glm-5", ids.get(2));
+    }
+
+    @Test
+    void extractTagIdsFallsBackToModelKey() {
+        // Malformed entry with only "model" and not "name" — still usable.
+        var json = JsonParser.parseString("""
+                {"models":[{"model":"qwen3-next:80b"}]}
+                """).getAsJsonObject();
+        var ids = ModelCatalogParser.extractTagIds(json);
+        assertEquals(1, ids.size());
+        assertEquals("qwen3-next:80b", ids.get(0));
+    }
+
+    @Test
+    void extractTagIdsReturnsEmptyWhenModelsKeyMissing() {
+        var json = JsonParser.parseString("{}").getAsJsonObject();
+        assertTrue(ModelCatalogParser.extractTagIds(json).isEmpty());
+    }
+
+    @Test
+    void extractOllamaContextLengthScansForFamilyPrefixedKey() {
+        // Real /api/show shape: family is "kimi-k2", context_length lives under "kimi-k2.context_length".
+        var json = JsonParser.parseString("""
+                {
+                  "model_info": {
+                    "general.architecture": "kimi-k2",
+                    "general.parameter_count": 1042000000000,
+                    "kimi-k2.context_length": 262144,
+                    "kimi-k2.embedding_length": 2048
+                  }
+                }
+                """).getAsJsonObject();
+        assertEquals(262144, ModelCatalogParser.extractOllamaContextLength(json));
+    }
+
+    @Test
+    void extractOllamaContextLengthHandlesDifferentFamilies() {
+        // Make sure the scan isn't hardcoded to kimi — any family prefix works.
+        var json = JsonParser.parseString("""
+                {"model_info": {"glm.context_length": 202752}}
+                """).getAsJsonObject();
+        assertEquals(202752, ModelCatalogParser.extractOllamaContextLength(json));
+    }
+
+    @Test
+    void extractOllamaContextLengthReturnsZeroWhenMissing() {
+        var json = JsonParser.parseString("""
+                {"model_info": {"general.architecture": "mystery"}}
+                """).getAsJsonObject();
+        assertEquals(0, ModelCatalogParser.extractOllamaContextLength(json));
+    }
+
+    @Test
+    void extractOllamaContextLengthReturnsZeroWhenNoModelInfo() {
+        assertEquals(0, ModelCatalogParser.extractOllamaContextLength(JsonParser.parseString("{}").getAsJsonObject()));
+    }
+
+    @Test
+    void parseOllamaShowPopulatesContextAndCapabilities() {
+        // Mirrors the live /api/show response for kimi-k2.5 as of 2026-04-22.
+        var json = JsonParser.parseString("""
+                {
+                  "details": {"family": "kimi-k2", "parameter_size": "1042000000000"},
+                  "model_info": {
+                    "general.architecture": "kimi-k2",
+                    "kimi-k2.context_length": 262144
+                  },
+                  "capabilities": ["vision", "thinking", "completion", "tools"]
+                }
+                """).getAsJsonObject();
+        var model = ModelCatalogParser.parseOllamaShow("kimi-k2.5", json);
+
+        assertEquals("kimi-k2.5", model.get("id"));
+        assertEquals("kimi-k2.5", model.get("name"));
+        assertEquals(262144, model.get("contextWindow"));
+        assertEquals(true, model.get("supportsThinking"));
+        assertEquals(true, model.get("thinkingDetectedFromProvider"));
+        assertEquals(true, model.get("supportsVision"));
+        assertEquals(true, model.get("visionDetectedFromProvider"));
+        assertEquals(false, model.get("supportsAudio"));
+        assertEquals(true, model.get("audioDetectedFromProvider"));
+    }
+
+    @Test
+    void parseOllamaShowHandlesAbsentCapabilities() {
+        // A model with no capabilities array — all flags fall back to
+        // detector defaults (id-based heuristic, or absent).
+        var json = JsonParser.parseString("""
+                {"model_info": {"mystery.context_length": 32768}}
+                """).getAsJsonObject();
+        var model = ModelCatalogParser.parseOllamaShow("mystery-model", json);
+        assertEquals(32768, model.get("contextWindow"));
+        assertEquals(false, model.get("supportsThinking"));
+        assertEquals(false, model.get("thinkingDetectedFromProvider"));
+    }
+
+    @Test
+    void parseOllamaShowReportsUnknownContextAsZero() {
+        var json = JsonParser.parseString("""
+                {"capabilities": ["completion"]}
+                """).getAsJsonObject();
+        var model = ModelCatalogParser.parseOllamaShow("unknown-model", json);
+        assertEquals(0, model.get("contextWindow"));
+    }
+
+    @Test
+    void detectThinkingSupportPicksUpOllamaCapabilities() {
+        // Regression guard: the Ollama capabilities path has to live
+        // alongside the OpenRouter supported_parameters path without
+        // stealing precedence.
+        var json = JsonParser.parseString("""
+                {"id": "glm-5", "capabilities": ["thinking", "completion"]}
+                """).getAsJsonObject();
+        var result = ModelCatalogParser.detectThinkingSupport(json);
+        assertTrue(result.confirmed(), "thinking should be detected from capabilities array");
+        assertTrue(result.fromProvider(), "detection should be marked as provider-confirmed");
+    }
+
+    // --- JCLAW-183: Ollama embedding-only filter via parseOllamaShow ---
+
+    @Test
+    void parseOllamaShowReturnsNullForEmbeddingOnlyModel() {
+        // Capabilities array contains "embedding" but not "completion" —
+        // the model can't serve chat. parseOllamaShow returns null so
+        // discoverOllamaNative drops the entry.
+        var json = JsonParser.parseString("""
+                {
+                  "model_info": {"nomic-bert.context_length": 2048},
+                  "capabilities": ["embedding"]
+                }
+                """).getAsJsonObject();
+        var model = ModelCatalogParser.parseOllamaShow("nomic-embed-text:latest", json);
+        assertNull(model, "embedding-only Ollama model should be filtered out");
+    }
+
+    @Test
+    void parseOllamaShowKeepsModelWithEmptyCapabilitiesArray() {
+        // Empty capabilities array = no signal. Treat as unknown and let
+        // the model through; downstream UI / id-heuristic decides what
+        // capabilities to mark.
+        var json = JsonParser.parseString("""
+                {"model_info": {"family.context_length": 8192}, "capabilities": []}
+                """).getAsJsonObject();
+        var model = ModelCatalogParser.parseOllamaShow("opaque-model", json);
+        assertNotNull(model, "empty capabilities array must not trigger the filter");
+        assertEquals(8192, model.get("contextWindow"));
+    }
+
+    // --- JCLAW-183: LM Studio native /api/v0/models parsing ---
+
+    @Test
+    void parseLmStudioNativeResponseFiltersOutNonChatTypes() {
+        // Mirrors the live /api/v0/models response shape. type field is
+        // authoritative — keep llm and vlm, drop embeddings/tts/stt.
+        var json = JsonParser.parseString("""
+                {
+                  "data": [
+                    {"id": "zai-org/glm-4.7-flash", "type": "llm", "max_context_length": 202752},
+                    {"id": "google/gemma-4-e4b", "type": "vlm", "max_context_length": 131072},
+                    {"id": "openai/gpt-oss-20b", "type": "llm", "max_context_length": 131072},
+                    {"id": "text-embedding-nomic-embed-text-v1.5", "type": "embeddings"},
+                    {"id": "kokoro-tts", "type": "tts"},
+                    {"id": "whisper-base", "type": "stt"}
+                  ]
+                }
+                """).getAsJsonObject();
+
+        var models = ModelCatalogParser.parseLmStudioNativeResponse(json);
+
+        assertEquals(3, models.size(), "should keep 3 chat-capable models, drop 3 non-chat");
+        var ids = models.stream().map(m -> m.get("id").toString()).toList();
+        assertTrue(ids.contains("zai-org/glm-4.7-flash"));
+        assertTrue(ids.contains("google/gemma-4-e4b"));
+        assertTrue(ids.contains("openai/gpt-oss-20b"));
+        assertFalse(ids.contains("text-embedding-nomic-embed-text-v1.5"));
+        assertFalse(ids.contains("kokoro-tts"));
+        assertFalse(ids.contains("whisper-base"));
+    }
+
+    @Test
+    void parseLmStudioNativeResponseMarksVlmAsVisionFromProvider() {
+        // type "vlm" is authoritative for vision support — both the boolean
+        // flag and the from-provider marker must reflect it so the UI can
+        // lock the vision checkbox without falling through to id heuristics.
+        var json = JsonParser.parseString("""
+                {"data": [{"id": "google/gemma-4-e4b", "type": "vlm", "max_context_length": 131072}]}
+                """).getAsJsonObject();
+
+        var models = ModelCatalogParser.parseLmStudioNativeResponse(json);
+
+        assertEquals(1, models.size());
+        var m = models.get(0);
+        assertEquals(true, m.get("supportsVision"));
+        assertEquals(true, m.get("visionDetectedFromProvider"));
+        assertEquals(131072, m.get("contextWindow"));
+    }
+
+    @Test
+    void parseLmStudioNativeResponseLeavesThinkingAndAudioToHeuristic() {
+        // type "llm" tells us nothing about thinking or audio — leave
+        // fromProvider=false so the existing id-based heuristic in
+        // detectThinkingSupport / detectAudioSupport can still kick in
+        // for known families (deepseek-r1, whisper, etc.) downstream.
+        var json = JsonParser.parseString("""
+                {"data": [{"id": "openai/gpt-oss-20b", "type": "llm"}]}
+                """).getAsJsonObject();
+
+        var models = ModelCatalogParser.parseLmStudioNativeResponse(json);
+
+        assertEquals(1, models.size());
+        var m = models.get(0);
+        assertEquals(false, m.get("supportsThinking"));
+        assertEquals(false, m.get("thinkingDetectedFromProvider"));
+        assertEquals(false, m.get("supportsAudio"));
+        assertEquals(false, m.get("audioDetectedFromProvider"));
+    }
+
+    @Test
+    void parseLmStudioNativeResponseSkipsEntriesWithBlankId() {
+        var json = JsonParser.parseString("""
+                {"data": [{"id": "", "type": "llm"}, {"type": "llm"}, {"id": "valid", "type": "llm"}]}
+                """).getAsJsonObject();
+        var models = ModelCatalogParser.parseLmStudioNativeResponse(json);
+        assertEquals(1, models.size());
+        assertEquals("valid", models.get(0).get("id"));
+    }
+
+    @Test
+    void parseLmStudioNativeResponseHandlesMissingDataArray() {
+        var json = JsonParser.parseString("{}").getAsJsonObject();
+        var models = ModelCatalogParser.parseLmStudioNativeResponse(json);
+        assertTrue(models.isEmpty());
+    }
+
+    // ─── JCLAW-324: discover() dispatcher + transport-side discovery ─────
+
+    private static MockResponse jsonResponse(int code, String body) {
+        return new MockResponse.Builder()
+                .code(code)
+                .addHeader("Content-Type", "application/json")
+                .body(body)
+                .build();
+    }
+
+    private static String baseUrlOf(MockWebServer server) {
+        var url = server.url("/").toString();
+        return url.endsWith("/") ? url.substring(0, url.length() - 1) : url;
+    }
+
+    @Test
+    void discoverOpenAiCompatHappyPathReturnsOk() throws Exception {
+        // Vanilla OpenAI-compat endpoint at /models — wrapped data shape.
+        // Picks up two chat models, drops the embedding one via the Tier 3
+        // id heuristic in EmbeddingModelFilter.
+        try (var server = new MockWebServer()) {
+            server.start();
+            server.enqueue(jsonResponse(200, """
+                    {"data": [
+                      {"id": "gpt-4.1", "context_length": 128000},
+                      {"id": "gpt-4.1-mini", "context_length": 128000},
+                      {"id": "text-embedding-3-small"}
+                    ]}
+                    """));
+            var result = ModelDiscoveryService.discover(
+                    "openai", baseUrlOf(server), "sk-test");
+            assertTrue(result instanceof DiscoveryResult.Ok,
+                    "happy path should produce Ok: " + result);
+            var ok = (DiscoveryResult.Ok) result;
+            // Embedding model dropped by the id heuristic.
+            assertEquals(2, ok.models().size(),
+                    "embedding-model entry must be filtered out by EmbeddingModelFilter");
+            // Sort is alphabetical when no rankings — gpt-4.1 before gpt-4.1-mini.
+            assertEquals("gpt-4.1", ok.models().get(0).get("id"));
+        }
+    }
+
+    @Test
+    void discoverOpenAiCompatBareArrayShape() throws Exception {
+        // Together AI shape — bare top-level JSON array.
+        try (var server = new MockWebServer()) {
+            server.start();
+            server.enqueue(jsonResponse(200, """
+                    [{"id": "moonshotai/Kimi-K2.5", "context_length": 262144}]
+                    """));
+            var result = ModelDiscoveryService.discover(
+                    "togetherai", baseUrlOf(server), "sk-test");
+            var ok = (DiscoveryResult.Ok) result;
+            assertEquals(1, ok.models().size());
+            assertEquals("moonshotai/Kimi-K2.5", ok.models().get(0).get("id"));
+        }
+    }
+
+    @Test
+    void discoverOpenAiCompatSurfacesUpstreamHttpError() throws Exception {
+        try (var server = new MockWebServer()) {
+            server.start();
+            server.enqueue(jsonResponse(401, "{\"error\":\"bad key\"}"));
+            var result = ModelDiscoveryService.discover(
+                    "openai", baseUrlOf(server), "sk-bad");
+            assertTrue(result instanceof DiscoveryResult.Error,
+                    "upstream non-200 must surface as Error: " + result);
+            var err = (DiscoveryResult.Error) result;
+            assertEquals(502, err.statusCode());
+            assertTrue(err.message().contains("401"),
+                    "error message must echo the upstream status: " + err.message());
+        }
+    }
+
+    @Test
+    void discoverRejectsMetadataBaseUrlBeforeConnect() {
+        // JCLAW-778: an agent-settable base URL pointing at the cloud-metadata
+        // endpoint is rejected by the SSRF guard before any socket opens. No
+        // MockWebServer is needed — the rejection is synchronous.
+        var result = ModelDiscoveryService.discover(
+                "evil", "http://169.254.169.254/v1", "sk-test");
+        assertTrue(result instanceof DiscoveryResult.Error,
+                "metadata base URL must be rejected: " + result);
+        var err = (DiscoveryResult.Error) result;
+        assertEquals(400, err.statusCode());
+        assertTrue(err.message().contains("SSRF guard"),
+                "must identify the guard: " + err.message());
+    }
+
+    @Test
+    void discoverAllowsLoopbackBaseUrl() throws Exception {
+        // JCLAW-778: loopback stays allowed for local self-hosted inference —
+        // the guard must not break Ollama / LM Studio on 127.0.0.1.
+        try (var server = new MockWebServer()) {
+            server.start();
+            server.enqueue(jsonResponse(200, "{\"data\":[{\"id\":\"gpt-4.1\"}]}"));
+            var result = ModelDiscoveryService.discover(
+                    "local", baseUrlOf(server), "sk-test");
+            assertTrue(result instanceof DiscoveryResult.Ok,
+                    "loopback base URL must be allowed: " + result);
+        }
+    }
+
+    @Test
+    void discoverErrorDoesNotReflectUpstreamBody() throws Exception {
+        // JCLAW-778: on non-2xx the returned error carries the status only, never
+        // the attacker-influenced upstream body.
+        try (var server = new MockWebServer()) {
+            server.start();
+            server.enqueue(jsonResponse(403, "{\"leak\":\"SUPER_SECRET_UPSTREAM_BODY\"}"));
+            var result = ModelDiscoveryService.discover(
+                    "openai", baseUrlOf(server), "sk-bad");
+            var err = (DiscoveryResult.Error) result;
+            assertTrue(err.message().contains("403"), "must carry status: " + err.message());
+            assertFalse(err.message().contains("SUPER_SECRET_UPSTREAM_BODY"),
+                    "must NOT reflect the upstream body: " + err.message());
+        }
+    }
+
+    @Test
+    void discoverOpenAiCompatSurfacesMalformedJson() throws Exception {
+        try (var server = new MockWebServer()) {
+            server.start();
+            server.enqueue(jsonResponse(200, "not-json{"));
+            var result = ModelDiscoveryService.discover(
+                    "openai", baseUrlOf(server), "sk-test");
+            assertTrue(result instanceof DiscoveryResult.Error);
+            var err = (DiscoveryResult.Error) result;
+            assertEquals(502, err.statusCode());
+            assertTrue(err.message().toLowerCase().contains("invalid json"),
+                    "malformed body must produce 'Invalid JSON' message: " + err.message());
+        }
+    }
+
+    @Test
+    void discoverOpenAiCompatHandlesTrailingSlashBaseUrl() throws Exception {
+        // Branch in url construction: baseUrl.endsWith("/") vs not.
+        try (var server = new MockWebServer()) {
+            server.start();
+            server.enqueue(jsonResponse(200, "{\"data\":[]}"));
+            var url = baseUrlOf(server) + "/"; // force the trailing-slash branch
+            var result = ModelDiscoveryService.discover("openai", url, "sk-test");
+            assertTrue(result instanceof DiscoveryResult.Ok);
+        }
+    }
+
+    @Test
+    void discoverOllamaRoutesToNativePath() throws Exception {
+        // Name contains "ollama" → discoverOllamaNative.
+        // /api/tags must come first, then /api/show per model.
+        try (var server = new MockWebServer()) {
+            server.start();
+            server.enqueue(jsonResponse(200, """
+                    {"models":[{"name":"glm-5","model":"glm-5"}]}
+                    """));
+            server.enqueue(jsonResponse(200, """
+                    {
+                      "model_info": {"glm.context_length": 131072},
+                      "capabilities": ["completion", "thinking"]
+                    }
+                    """));
+            var result = ModelDiscoveryService.discover(
+                    "ollama-local", baseUrlOf(server), "sk-test");
+            assertTrue(result instanceof DiscoveryResult.Ok,
+                    "ollama happy path must be Ok: " + result);
+            var ok = (DiscoveryResult.Ok) result;
+            assertEquals(1, ok.models().size());
+            assertEquals("glm-5", ok.models().get(0).get("id"));
+            assertEquals(131072, ok.models().get(0).get("contextWindow"));
+            assertEquals(true, ok.models().get(0).get("supportsThinking"));
+        }
+    }
+
+    @Test
+    void discoverOllamaSurfaces5xxFromTagsEndpoint() throws Exception {
+        try (var server = new MockWebServer()) {
+            server.start();
+            server.enqueue(jsonResponse(503, "boom"));
+            var result = ModelDiscoveryService.discover(
+                    "ollama-local", baseUrlOf(server), null);
+            assertTrue(result instanceof DiscoveryResult.Error);
+            var err = (DiscoveryResult.Error) result;
+            assertEquals(502, err.statusCode());
+            assertTrue(err.message().contains("/api/tags"),
+                    "error message must identify the failing endpoint: " + err.message());
+        }
+    }
+
+    @Test
+    void discoverOllamaReturnsOkEmptyWhenTagsListIsEmpty() throws Exception {
+        try (var server = new MockWebServer()) {
+            server.start();
+            server.enqueue(jsonResponse(200, "{\"models\":[]}"));
+            var result = ModelDiscoveryService.discover(
+                    "ollama-cloud", baseUrlOf(server), null);
+            assertTrue(result instanceof DiscoveryResult.Ok);
+            assertTrue(((DiscoveryResult.Ok) result).models().isEmpty());
+        }
+    }
+
+    @Test
+    void discoverOllamaErrorWhenAllShowsFiltered() throws Exception {
+        // /api/tags lists one model; /api/show reports embedding-only capabilities;
+        // parseOllamaShow returns null → discoverOllamaNative returns Error.
+        try (var server = new MockWebServer()) {
+            server.start();
+            server.enqueue(jsonResponse(200, """
+                    {"models":[{"name":"nomic-embed-text:latest"}]}
+                    """));
+            server.enqueue(jsonResponse(200, """
+                    {
+                      "model_info": {"nomic-bert.context_length": 2048},
+                      "capabilities": ["embedding"]
+                    }
+                    """));
+            var result = ModelDiscoveryService.discover(
+                    "ollama-local", baseUrlOf(server), null);
+            assertTrue(result instanceof DiscoveryResult.Error);
+            var err = (DiscoveryResult.Error) result;
+            assertTrue(err.message().toLowerCase().contains("no chat-capable"),
+                    "expected 'No chat-capable models' tag, got: " + err.message());
+        }
+    }
+
+    @Test
+    void discoverLmStudioNativeHappyPath() throws Exception {
+        try (var server = new MockWebServer()) {
+            server.start();
+            server.enqueue(jsonResponse(200, """
+                    {"data": [
+                      {"id": "qwen3-32b", "type": "llm", "max_context_length": 131072},
+                      {"id": "llava", "type": "vlm", "max_context_length": 8192}
+                    ]}
+                    """));
+            var result = ModelDiscoveryService.discover(
+                    "lm-studio-local", baseUrlOf(server), null);
+            assertTrue(result instanceof DiscoveryResult.Ok,
+                    "lm-studio native path must be Ok: " + result);
+            var ok = (DiscoveryResult.Ok) result;
+            assertEquals(2, ok.models().size());
+        }
+    }
+
+    @Test
+    void discoverLmStudioFallsThroughToOpenAiCompatOn404() throws Exception {
+        // Native /api/v0/models returns 404 (older LM Studio) → fall through
+        // to the OpenAI-compat /models endpoint. The second enqueue must
+        // satisfy that follow-up request.
+        try (var server = new MockWebServer()) {
+            server.start();
+            server.enqueue(jsonResponse(404, "missing"));
+            server.enqueue(jsonResponse(200, """
+                    {"data":[{"id":"qwen3-32b","context_length":131072}]}
+                    """));
+            var result = ModelDiscoveryService.discover(
+                    "lm-studio-fallback", baseUrlOf(server), null);
+            assertTrue(result instanceof DiscoveryResult.Ok,
+                    "fallback path must yield Ok: " + result);
+            var ok = (DiscoveryResult.Ok) result;
+            assertEquals(1, ok.models().size());
+            assertEquals("qwen3-32b", ok.models().get(0).get("id"));
+        }
+    }
+
+    // ─── JCLAW-770: protocol dispatch is a registry lookup ───────────────
+
+    @Test
+    void protocolResolvesThroughTheStrategyRegistry() {
+        // discover() must not branch on provider-name substrings itself — the
+        // registry owns the mapping, so a new protocol is a new subtype.
+        assertInstanceOf(OllamaDiscoveryStrategy.class,
+                DiscoveryStrategy.forProvider("ollama-cloud"));
+        assertInstanceOf(OllamaDiscoveryStrategy.class,
+                DiscoveryStrategy.forProvider("Ollama-Local"),
+                "provider names match case-insensitively");
+        assertInstanceOf(LmStudioDiscoveryStrategy.class,
+                DiscoveryStrategy.forProvider("lm-studio-local"));
+        assertInstanceOf(OpenAiCompatDiscoveryStrategy.class,
+                DiscoveryStrategy.forProvider("groq"));
+        assertInstanceOf(OpenAiCompatDiscoveryStrategy.class,
+                DiscoveryStrategy.forProvider(null),
+                "a null provider name still resolves to the compat fallback");
+    }
+
+    // ─── JCLAW-324: leaderboard + ranking, exercised via discover() ──────
+    // (fetchLeaderboard / parseHtmlLeaderboard / applyRankings are package-
+    // private; tests live in the default package, so we drive them through
+    // the public discover() entry point with a configured leaderboardUrl.)
+
+    @Test
+    void discoverAppliesJsonLeaderboardRankings() throws Exception {
+        // /models returns three models in alphabetical order; the leaderboard
+        // overrides that ordering with gpt-5 first, then claude.
+        try (var modelsServer = new MockWebServer();
+             var boardServer = new MockWebServer()) {
+            modelsServer.start();
+            boardServer.start();
+            modelsServer.enqueue(jsonResponse(200, """
+                    {"data":[
+                      {"id":"anthropic/claude-opus-4-6"},
+                      {"id":"openai/gpt-5"},
+                      {"id":"unknown/model"}
+                    ]}
+                    """));
+            boardServer.enqueue(jsonResponse(200, """
+                    [{"id":"openai/gpt-5"},
+                     {"slug":"anthropic/claude-opus-4-6"}]
+                    """));
+
+            // Provider-keyed config plug. discoverOpenAiCompat reads
+            // "provider.<name>.leaderboardUrl" before sorting.
+            var providerName = "openai-ranked";
+            services.ConfigService.set(
+                    "provider." + providerName + ".leaderboardUrl",
+                    boardServer.url("/").toString());
+            try {
+                var result = ModelDiscoveryService.discover(
+                        providerName, baseUrlOf(modelsServer), "sk-test");
+                assertTrue(result instanceof DiscoveryResult.Ok);
+                var ok = (DiscoveryResult.Ok) result;
+                // gpt-5 ranked 1, claude ranked 2, unknown unranked (sorted last alphabetically).
+                assertEquals("openai/gpt-5", ok.models().get(0).get("id"));
+                assertEquals(1, ok.models().get(0).get("leaderboardRank"));
+                assertEquals("anthropic/claude-opus-4-6", ok.models().get(1).get("id"));
+                assertEquals(2, ok.models().get(1).get("leaderboardRank"));
+                assertEquals("unknown/model", ok.models().get(2).get("id"));
+                assertNull(ok.models().get(2).get("leaderboardRank"));
+            } finally {
+                services.ConfigService.set(
+                        "provider." + providerName + ".leaderboardUrl", "");
+            }
+        }
+    }
+
+    @Test
+    void discoverParsesHtmlLeaderboardFallback() throws Exception {
+        // Leaderboard endpoint returns HTML (not JSON); parseHtmlLeaderboard
+        // path picks the slugs out of href attributes.
+        try (var modelsServer = new MockWebServer();
+             var boardServer = new MockWebServer()) {
+            modelsServer.start();
+            boardServer.start();
+            modelsServer.enqueue(jsonResponse(200, """
+                    {"data":[
+                      {"id":"openai/gpt-5"},
+                      {"id":"anthropic/claude-opus-4-6"}
+                    ]}
+                    """));
+            boardServer.enqueue(new MockResponse.Builder()
+                    .code(200)
+                    .addHeader("Content-Type", "text/html")
+                    .body("""
+                        <html>
+                          <a href="/openai/gpt-5">A</a>
+                          <a href="/anthropic/claude-opus-4-6">B</a>
+                          <a href="/docs/quickstart">skip</a>
+                        </html>
+                        """)
+                    .build());
+
+            var providerName = "openrouter-html";
+            services.ConfigService.set(
+                    "provider." + providerName + ".leaderboardUrl",
+                    boardServer.url("/").toString());
+            try {
+                var result = ModelDiscoveryService.discover(
+                        providerName, baseUrlOf(modelsServer), "sk-test");
+                var ok = (DiscoveryResult.Ok) result;
+                // HTML leaderboard parsed → gpt-5 ranked first.
+                assertEquals("openai/gpt-5", ok.models().get(0).get("id"));
+                assertEquals(1, ok.models().get(0).get("leaderboardRank"));
+            } finally {
+                services.ConfigService.set(
+                        "provider." + providerName + ".leaderboardUrl", "");
+            }
+        }
+    }
+
+    @Test
+    void discoverToleratesLeaderboardNon200() throws Exception {
+        // Models endpoint succeeds, leaderboard returns 5xx → ranking simply
+        // skipped, models still sorted alphabetically. The leaderboard 5xx
+        // must not bubble up as a discovery error.
+        try (var modelsServer = new MockWebServer();
+             var boardServer = new MockWebServer()) {
+            modelsServer.start();
+            boardServer.start();
+            modelsServer.enqueue(jsonResponse(200, """
+                    {"data":[{"id":"openai/gpt-5"},{"id":"anthropic/claude-opus-4-6"}]}
+                    """));
+            boardServer.enqueue(jsonResponse(503, "unavailable"));
+
+            var providerName = "openai-board-down";
+            services.ConfigService.set(
+                    "provider." + providerName + ".leaderboardUrl",
+                    boardServer.url("/").toString());
+            try {
+                var result = ModelDiscoveryService.discover(
+                        providerName, baseUrlOf(modelsServer), "sk-test");
+                var ok = (DiscoveryResult.Ok) result;
+                assertEquals(2, ok.models().size());
+                // Alphabetical order, no rankings.
+                assertEquals("anthropic/claude-opus-4-6", ok.models().get(0).get("id"));
+                assertNull(ok.models().get(0).get("leaderboardRank"));
+            } finally {
+                services.ConfigService.set(
+                        "provider." + providerName + ".leaderboardUrl", "");
+            }
+        }
+    }
+
+    // ─── JCLAW-324: inferMaxTokens / inferIsFree / inferPrice edges ──────
+
+    @Test
+    void inferMaxTokensPrefersTopProviderField() {
+        // Branch order in inferMaxTokens: top_provider.max_completion_tokens wins.
+        // id field is mandatory — parseModels skips entries with blank id.
+        var json = JsonParser.parseString("""
+                {"data":[{"id":"x",
+                          "top_provider": {"max_completion_tokens": 4096},
+                          "max_completion_tokens": 8192,
+                          "max_tokens": 16384}]}
+                """).getAsJsonObject();
+        var models = ModelCatalogParser.parseModels(json);
+        assertEquals(4096, models.get(0).get("maxTokens"));
+    }
+
+    @Test
+    void inferMaxTokensFallsBackToMaxCompletionTokens() {
+        var json = JsonParser.parseString("""
+                {"data":[{"id":"x", "max_completion_tokens": 8192}]}
+                """).getAsJsonObject();
+        assertEquals(8192, ModelCatalogParser.parseModels(json).get(0).get("maxTokens"));
+    }
+
+    @Test
+    void inferMaxTokensFallsBackToMaxTokens() {
+        var json = JsonParser.parseString("""
+                {"data":[{"id":"x", "max_tokens": 16384}]}
+                """).getAsJsonObject();
+        assertEquals(16384, ModelCatalogParser.parseModels(json).get(0).get("maxTokens"));
+    }
+
+    @Test
+    void inferIsFreeTrueWhenBothPricesZero() {
+        var json = JsonParser.parseString("""
+                {"data":[{"id":"x",
+                          "pricing":{"prompt":"0","completion":"0"}}]}
+                """).getAsJsonObject();
+        assertEquals(true, ModelCatalogParser.parseModels(json).get(0).get("isFree"));
+    }
+
+    @Test
+    void inferIsFreeFalseWhenPromptNonZero() {
+        var json = JsonParser.parseString("""
+                {"data":[{"id":"x",
+                          "pricing":{"prompt":"0.000001","completion":"0"}}]}
+                """).getAsJsonObject();
+        assertEquals(false, ModelCatalogParser.parseModels(json).get(0).get("isFree"));
+    }
+
+    @Test
+    void inferIsFreeFalseOnMalformedPriceString() {
+        var json = JsonParser.parseString("""
+                {"data":[{"id":"x",
+                          "pricing":{"prompt":"NaN","completion":"0"}}]}
+                """).getAsJsonObject();
+        // NumberFormatException short-circuits to false in inferIsFree.
+        assertEquals(false, ModelCatalogParser.parseModels(json).get(0).get("isFree"));
+    }
+
+    @Test
+    void parseModelsCapturesTogetherBareArrayPricing() {
+        // End-to-end regression for the unpriced-Together bug: Together's
+        // bare-array /v1/models shape with input/output pricing must land in
+        // promptPrice/completionPrice at per-million units (no 1e6 blowup).
+        var json = JsonParser.parseString("""
+                [{"id":"Qwen/Qwen3.7-Plus","pricing":{"input":0.32,"output":1.28}}]
+                """);
+        var model = ModelCatalogParser.parseModels(json).get(0);
+        assertEquals(0.32, ((Number) model.get("promptPrice")).doubleValue(), 0.0001);
+        assertEquals(1.28, ((Number) model.get("completionPrice")).doubleValue(), 0.0001);
+    }
+
+    @Test
+    void inferIsFreeTrueForTogetherZeroPricing() {
+        // Together free model (input:0, output:0) is recognized as free now
+        // that inferIsFree understands the input/output shape.
+        var json = JsonParser.parseString("""
+                [{"id":"free/model","pricing":{"input":0,"output":0}}]
+                """);
+        assertEquals(true, ModelCatalogParser.parseModels(json).get(0).get("isFree"));
+    }
+
+    @Test
+    void inferPriceReturnsMinusOneOnMalformedValue() {
+        // "NaN" parses as Double.NaN (Java accepts it) — use a string that
+        // genuinely fails Double.parseDouble so the catch branch runs.
+        var obj = JsonParser.parseString("""
+                {"pricing":{"prompt":"not-a-number"}}
+                """).getAsJsonObject();
+        // NumberFormatException swallowed → fall through to -1.
+        assertEquals(-1, ModelCatalogParser.inferPrice(obj, "prompt"), 0.001);
+    }
+
+    @Test
+    void detectVisionFromOllamaCapabilitiesVisionTrue() {
+        // The capabilities array → "vision" string match path.
+        var obj = JsonParser.parseString("""
+                {"id":"local/vl-model","capabilities":["completion","vision"]}
+                """).getAsJsonObject();
+        var result = ModelCatalogParser.detectVisionSupport(obj);
+        assertTrue(result.confirmed());
+        assertTrue(result.fromProvider(),
+                "capabilities array is a provider-confirmed signal");
+    }
+
+    @Test
+    void detectVisionFromOllamaCapabilitiesNoVision() {
+        // capabilities present but lacks "vision" → confirmed text-only.
+        var obj = JsonParser.parseString("""
+                {"id":"local/text-only","capabilities":["completion"]}
+                """).getAsJsonObject();
+        var result = ModelCatalogParser.detectVisionSupport(obj);
+        assertFalse(result.confirmed());
+        assertTrue(result.fromProvider());
+    }
+
+    @Test
+    void detectVisionFromKnownVisionFamilyId() {
+        // No modality info or capabilities — the id-heuristic kicks in for
+        // well-known vision-capable families. fromProvider=false marks the
+        // result as a heuristic guess.
+        var obj = JsonParser.parseString("""
+                {"id":"openai/gpt-4o"}
+                """).getAsJsonObject();
+        var result = ModelCatalogParser.detectVisionSupport(obj);
+        assertTrue(result.confirmed());
+        assertFalse(result.fromProvider(),
+                "id-heuristic is not a provider-confirmed signal");
+    }
+
+    @Test
+    void detectVisionFromUnknownIdAndNoMetadata() {
+        // No modality, no capabilities, id doesn't match the vision-family
+        // heuristic → falls all the way through to false/false.
+        var obj = JsonParser.parseString("""
+                {"id":"vendor/totally-unknown-model"}
+                """).getAsJsonObject();
+        var result = ModelCatalogParser.detectVisionSupport(obj);
+        assertFalse(result.confirmed());
+        assertFalse(result.fromProvider());
+    }
+
+    @Test
+    void detectAudioFromCapabilities() {
+        var obj = JsonParser.parseString("""
+                {"id":"local/voice","capabilities":["audio","completion"]}
+                """).getAsJsonObject();
+        var result = ModelCatalogParser.detectAudioSupport(obj);
+        assertTrue(result.confirmed());
+        assertTrue(result.fromProvider());
+    }
+
+    @Test
+    void detectAudioCapabilitiesPresentNoAudio() {
+        var obj = JsonParser.parseString("""
+                {"id":"local/text","capabilities":["completion"]}
+                """).getAsJsonObject();
+        var result = ModelCatalogParser.detectAudioSupport(obj);
+        assertFalse(result.confirmed());
+        assertTrue(result.fromProvider());
+    }
+
+    @Test
+    void detectAudioFromUnknownModelReturnsAllFalse() {
+        var obj = JsonParser.parseString("""
+                {"id":"vendor/text-only"}
+                """).getAsJsonObject();
+        var result = ModelCatalogParser.detectAudioSupport(obj);
+        assertFalse(result.confirmed());
+        assertFalse(result.fromProvider());
+    }
+
+    @Test
+    void detectThinkingFromCapabilitiesReasoning() {
+        var obj = JsonParser.parseString("""
+                {"id":"local/think","capabilities":["thinking"]}
+                """).getAsJsonObject();
+        var result = ModelCatalogParser.detectThinkingSupport(obj);
+        assertTrue(result.confirmed());
+        assertTrue(result.fromProvider());
+    }
+
+    @Test
+    void detectThinkingFromUnknownIdFallsThrough() {
+        var obj = JsonParser.parseString("""
+                {"id":"vendor/no-thinking"}
+                """).getAsJsonObject();
+        var result = ModelCatalogParser.detectThinkingSupport(obj);
+        assertFalse(result.confirmed());
+        assertFalse(result.fromProvider());
+    }
+
+    @Test
+    void detectVisionFromLegacyModalityStringNegative() {
+        // architecture.modality is a single string that doesn't contain "image"
+        // — confirmed text-only via the legacy shape.
+        var obj = JsonParser.parseString("""
+                {"id":"vendor/legacy",
+                 "architecture":{"modality":"text->text"}}
+                """).getAsJsonObject();
+        var result = ModelCatalogParser.detectVisionSupport(obj);
+        assertFalse(result.confirmed());
+        assertTrue(result.fromProvider(),
+                "legacy modality string is still a provider-confirmed signal");
+    }
+}

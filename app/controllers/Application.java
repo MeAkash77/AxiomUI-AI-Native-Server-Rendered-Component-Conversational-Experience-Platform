@@ -1,0 +1,158 @@
+package controllers;
+
+import org.jspecify.annotations.Nullable;
+import play.Play;
+import play.mvc.Controller;
+
+import java.io.File;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+
+public class Application extends Controller {
+
+    private static final String HTML_CONTENT_TYPE_PREFIX = "text/html; charset=";
+    private static final String CACHE_CONTROL = "Cache-Control";
+    private static final String NO_CACHE = "no-cache";
+    private static final String INDEX_HTML = "index.html";
+
+    public static void index() {
+        File spaIndex = Play.getFile("public/spa/" + INDEX_HTML);
+        if (spaIndex.exists()) {
+            // The SPA shell references content-hashed _nuxt/ chunks, so it MUST always
+            // revalidate — otherwise the browser keeps a cached index.html pointing at
+            // stale chunk hashes and a new frontend build never reaches users (Play's
+            // PlayHandler.addEtag would otherwise apply http.cacheControl=3600 here).
+            // The hashed chunks themselves stay long-cached via their own static route.
+            response.setHeader(CACHE_CONTROL, NO_CACHE);
+            renderBinary(spaIndex);
+        }
+        // SPA not built — return a simple HTML page instead of the legacy Groovy template
+        response.setContentTypeIfNotSet(HTML_CONTENT_TYPE_PREFIX + Play.defaultWebEncoding);
+        renderHtml("<html><body><h1>JClaw</h1><p>SPA not built. Run: cd frontend &amp;&amp; pnpm generate</p></body></html>");
+    }
+
+    /**
+     * Serve a Nuxt build asset from {@code public/spa/_nuxt} with a cache policy
+     * matched to the file's mutability (see {@link #nuxtCacheControl}).
+     *
+     * <p>Replaces a bare {@code staticDir} route. {@code staticDir} is resolved by
+     * the router before any controller runs, so it can only apply Play's single
+     * {@code http.cacheControl} (1 h) to every file — forcing an hourly
+     * revalidation of chunks whose content-hashed names already make them
+     * permanently immutable. Routing through an action is the only way to set the
+     * per-file header {@code staticDir} can't.
+     */
+    @SuppressWarnings("java:S2259")
+    public static void nuxtAsset(String path) {
+        File nuxtRoot = Play.getFile("public/spa/_nuxt");
+        try {
+            if (path != null && !path.contains("..")) {
+                File asset = new File(nuxtRoot, path);
+                if (asset.exists() && asset.isFile()
+                        && asset.getCanonicalPath().startsWith(nuxtRoot.getCanonicalPath() + File.separator)) {
+                    response.setHeader(CACHE_CONTROL, nuxtCacheControl(path));
+                    renderBinary(asset);
+                }
+            }
+        } catch (IOException _) {}
+        notFound();
+    }
+
+    /**
+     * Cache-Control for a {@code _nuxt/}-relative asset path. Vite content-hashes
+     * every chunk and font filename, so those are immutable and cached for a year
+     * with no revalidation. The two exceptions carry no hash in their own name:
+     * {@code builds/latest.json} advertises the current build id and MUST
+     * revalidate (else a fresh deploy is never detected), while
+     * {@code builds/meta/<id>.json} embeds the id in its path and is immutable
+     * like the chunks. Mirrors Nitro's own default asset route rules.
+     */
+    public static String nuxtCacheControl(String relPath) {
+        boolean revalidate = relPath.startsWith("builds/") && !relPath.startsWith("builds/meta/");
+        return revalidate ? NO_CACHE : "public, max-age=31536000, immutable";
+    }
+
+    /**
+     * Serve a hosted-app file from {@code public/apps/<slug>/…} with a
+     * {@code no-cache} policy so an operator's edit surfaces on the next load.
+     *
+     * <p>Replaces a bare {@code staticDir:public/apps} route. As with
+     * {@link #nuxtAsset}, {@code staticDir} is resolved by the router before any
+     * controller runs, so it can only apply Play's single {@code http.cacheControl}
+     * (1 h) to every file — which pinned each app's stable-named {@code index.html}
+     * and scripts for an hour, so edits only appeared after a hard refresh. Unlike
+     * the content-hashed SPA chunks (immutable, see {@link #nuxtCacheControl}), these
+     * mini-apps keep stable filenames, so <em>every</em> file must revalidate — hence
+     * {@code no-cache} across the board. A directory request serves its
+     * {@code index.html}, matching the old {@code staticDir} behavior. A registered
+     * app's {@code index.html} and {@code manifest.webmanifest} go through {@link AppPwa}.
+     */
+    @SuppressWarnings("java:S2259")
+    public static void appAsset(String path) {
+        File appsRoot = Play.getFile("public/apps");
+        try {
+            if (path != null && !path.contains("..")) {
+                File target = new File(appsRoot, path);
+                if (target.isDirectory()) {
+                    target = new File(target, INDEX_HTML);
+                }
+                var app = registeredApp(appsRoot, target.getParentFile());
+                if (target.exists() && target.isFile()
+                        && target.getCanonicalPath().startsWith(appsRoot.getCanonicalPath() + File.separator)) {
+                    response.setHeader(CACHE_CONTROL, NO_CACHE);
+                    if (app != null && target.getName().equals(INDEX_HTML)) {
+                        // Lenient decode: a stray invalid byte must not turn the app into a 404.
+                        var html = new String(Files.readAllBytes(target.toPath()), StandardCharsets.UTF_8);
+                        renderHtml(AppPwa.inject(html, app, params.get("install") != null));
+                    }
+                    renderBinary(target);
+                }
+                if (app != null && target.getName().equals(AppPwa.MANIFEST_FILE)) {
+                    response.setHeader(CACHE_CONTROL, NO_CACHE);
+                    response.contentType = AppPwa.MANIFEST_CONTENT_TYPE;
+                    renderText(AppPwa.manifestJson(app));
+                }
+            }
+        } catch (IOException _) {}
+        notFound();
+    }
+
+    // The slug check keeps a hand-made directory name out of the HTML AppPwa injects.
+    private static ApiAppsController.@Nullable AppEntry registeredApp(File appsRoot, File appDir) throws IOException {
+        return appDir.getParentFile().getCanonicalPath().equals(appsRoot.getCanonicalPath())
+                && ApiAppsController.SLUG.matcher(appDir.getName()).matches()
+                ? ApiAppsController.readApp(appDir.toPath()) : null;
+    }
+
+    /**
+     * SPA catch-all: serves static files from the Nuxt build if they exist,
+     * otherwise falls back to index.html for client-side routing.
+     * Production build lives in public/spa/ (output of: nuxi generate).
+     */
+    @SuppressWarnings("java:S2259")
+    public static void spa(String path) {
+        File spaRoot = Play.getFile("public/spa");
+
+        try {
+            if (path != null && !path.contains("..")) {
+                File staticFile = new File(spaRoot, path);
+                if (staticFile.exists() && staticFile.isFile()
+                        && staticFile.getCanonicalPath().startsWith(spaRoot.getCanonicalPath() + File.separator)) {
+                    renderBinary(staticFile);
+                }
+            }
+        } catch (IOException _) {}
+
+        File index = new File(spaRoot, INDEX_HTML);
+        if (!index.exists()) {
+            notFound("SPA not built. Run: cd frontend && pnpm generate, then copy .output/public/* to public/spa/");
+        }
+        response.setContentTypeIfNotSet(HTML_CONTENT_TYPE_PREFIX + Play.defaultWebEncoding);
+        // Always revalidate the SPA shell so a new build's chunk hashes are picked up
+        // immediately (see index() above). Hashed _nuxt/ assets keep their long cache.
+        response.setHeader(CACHE_CONTROL, NO_CACHE);
+        renderBinary(index);
+    }
+
+}

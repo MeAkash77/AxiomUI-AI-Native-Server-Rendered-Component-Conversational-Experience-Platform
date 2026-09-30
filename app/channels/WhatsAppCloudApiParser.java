@@ -1,0 +1,276 @@
+package channels;
+
+import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
+import org.jspecify.annotations.Nullable;
+import utils.JsonArgs;
+
+import java.util.List;
+
+import static channels.WhatsAppInboundMessage.MessageType;
+
+/**
+ * Pure data translation of a WhatsApp Cloud-API webhook payload into a normalized
+ * {@link WhatsAppInboundMessage} (JCLAW-446). It makes ZERO business decisions —
+ * no dedup, no access gate, no media download, no attribution. Every rule lives in
+ * {@link WhatsAppInbound}; this class only reshapes the Graph JSON into the
+ * transport-agnostic record both transports share.
+ *
+ * <p>It reads {@code entry[0].changes[0].value.messages[0]} and maps each Cloud-API
+ * message type:
+ * <ul>
+ *   <li>{@code text} → {@link MessageType#TEXT} ({@code text.body}).</li>
+ *   <li>{@code image}/{@code video}/{@code audio}/{@code document}/{@code sticker}
+ *       → the matching media type, with the Graph media {@code id} + {@code mime_type}
+ *       (+ {@code filename} for documents) captured into a {@link WhatsAppInboundMessage.PendingMedia};
+ *       bytes are NOT downloaded here. A {@code caption} (image/video/document)
+ *       becomes the message text. Voice/PTT audio ({@code audio.voice == true})
+ *       sets {@link WhatsAppInboundMessage.PendingMedia#voiceNote()}.</li>
+ *   <li>{@code location} → {@link MessageType#LOCATION} with
+ *       {@link WhatsAppInboundMessage.Location}.</li>
+ *   <li>{@code reaction} → {@link MessageType#REACTION} with
+ *       {@link WhatsAppInboundMessage.Reaction} ({@code message_id} + {@code emoji}).</li>
+ *   <li>{@code interactive} button/list replies → {@link MessageType#TEXT} carrying
+ *       the reply title (so the agent sees what the user tapped as plain text).</li>
+ * </ul>
+ *
+ * <p>The Cloud API has no group chats, so {@code chatType} is always
+ * {@link WhatsAppInboundMessage#CHAT_DIRECT} and {@code botMentioned} is always
+ * {@code true} (a DM to a business number is implicitly addressed). The
+ * {@code phoneNumberId} comes from {@code value.metadata.phone_number_id}; the
+ * sender display name from {@code value.contacts[0].profile.name}; the quoted
+ * message id from {@code message.context.id}.
+ */
+public final class WhatsAppCloudApiParser {
+
+    private WhatsAppCloudApiParser() {}
+
+    // WhatsApp Cloud-API message-type discriminators (the {@code message.type} value
+    // and the matching sub-object key share the same string).
+    private static final String TYPE_AUDIO = "audio";
+    private static final String TYPE_LOCATION = "location";
+    private static final String TYPE_REACTION = "reaction";
+    private static final String TYPE_INTERACTIVE = "interactive";
+    private static final String FIELD_VOICE = "voice";
+
+    /**
+     * The per-message envelope fields shared by every per-type builder — the
+     * sender/routing identity carried unchanged onto the normalized record.
+     * Grouped so each builder stays under the 7-param limit.
+     */
+    private record Envelope(String messageId, String from, @Nullable String phoneNumberId,
+                            @Nullable String senderName, @Nullable String quotedId) {}
+
+    /**
+     * Parse the first user message out of a Cloud-API webhook payload, or
+     * {@code null} when the payload carries no parseable user message (status
+     * updates, empty changes, unsupported types). Never throws on a malformed
+     * payload — a missing/odd field yields {@code null} rather than an exception.
+     */
+    public static @Nullable WhatsAppInboundMessage parse(JsonObject payload) {
+        try {
+            return parseInternal(payload);
+        } catch (RuntimeException _) {
+            // Defensive: any unexpected shape collapses to "no message" rather
+            // than propagating — the webhook must still fast-ack.
+            return null;
+        }
+    }
+
+    private static @Nullable WhatsAppInboundMessage parseInternal(JsonObject payload) {
+        var value = firstValue(payload);
+        if (value == null) return null;
+
+        var messages = value.has("messages") ? value.getAsJsonArray("messages") : null;
+        if (messages == null || messages.isEmpty()) return null;
+
+        var msg = messages.get(0).getAsJsonObject();
+        var type = JsonArgs.optNonBlankString(msg, "type");
+        if (type == null) return null;
+
+        var messageId = JsonArgs.optNonBlankString(msg, "id");
+        var from = JsonArgs.optNonBlankString(msg, "from");
+        if (messageId == null || from == null) return null;
+
+        var phoneNumberId = metadataPhoneNumberId(value);
+        var senderName = contactName(value);
+        var quotedId = quotedMessageId(msg);
+        var envelope = new Envelope(messageId, from, phoneNumberId, senderName, quotedId);
+
+        return switch (type) {
+            case "text" -> text(msg, envelope);
+            case "image" -> media(msg, "image", MessageType.IMAGE, false, envelope);
+            case "video" -> media(msg, "video", MessageType.VIDEO, false, envelope);
+            case TYPE_AUDIO -> audio(msg, envelope);
+            case "document" -> media(msg, "document", MessageType.DOCUMENT, false, envelope);
+            case "sticker" -> media(msg, "sticker", MessageType.STICKER, false, envelope);
+            case TYPE_LOCATION -> location(msg, envelope);
+            case TYPE_REACTION -> reaction(msg, envelope);
+            case TYPE_INTERACTIVE -> interactive(msg, envelope);
+            // button (template-reply), contacts, order, system, unsupported, etc.
+            // have no normalized mapping — drop them (the webhook still fast-acks).
+            default -> null;
+        };
+    }
+
+    // ── per-type builders ──
+
+    private static @Nullable WhatsAppInboundMessage text(JsonObject msg, Envelope envelope) {
+        var body = msg.has("text") ? JsonArgs.optNonBlankString(msg.getAsJsonObject("text"), "body") : null;
+        if (body == null) return null;
+        return base(MessageType.TEXT, body, null, null, List.of(), envelope);
+    }
+
+    /**
+     * image / video / document / sticker. The media sub-object carries the Graph
+     * {@code id} + {@code mime_type} (+ {@code filename} for documents). A
+     * {@code caption} becomes the message text.
+     */
+    private static @Nullable WhatsAppInboundMessage media(JsonObject msg, String key, MessageType type,
+                                                boolean voiceNote, Envelope envelope) {
+        if (!msg.has(key)) return null;
+        var obj = msg.getAsJsonObject(key);
+        var mediaId = JsonArgs.optNonBlankString(obj, "id");
+        if (mediaId == null) return null;
+        var mime = JsonArgs.optNonBlankString(obj, "mime_type");
+        var filename = JsonArgs.optNonBlankString(obj, "filename");
+        var caption = JsonArgs.optNonBlankString(obj, "caption");
+        var pending = new WhatsAppInboundMessage.PendingMedia(mediaId, mime, 0L, filename, voiceNote);
+        return base(type, caption, null, null, List.of(pending), envelope);
+    }
+
+    /** audio — same as {@link #media} but flags voice/PTT clips
+     *  ({@code audio.voice == true}). Audio carries no caption. */
+    private static @Nullable WhatsAppInboundMessage audio(JsonObject msg, Envelope envelope) {
+        if (!msg.has(TYPE_AUDIO)) return null;
+        var obj = msg.getAsJsonObject(TYPE_AUDIO);
+        var mediaId = JsonArgs.optNonBlankString(obj, "id");
+        if (mediaId == null) return null;
+        var mime = JsonArgs.optNonBlankString(obj, "mime_type");
+        var voice = obj.has(FIELD_VOICE) && !obj.get(FIELD_VOICE).isJsonNull() && obj.get(FIELD_VOICE).getAsBoolean();
+        var pending = new WhatsAppInboundMessage.PendingMedia(mediaId, mime, 0L, null, voice);
+        return base(MessageType.AUDIO, null, null, null, List.of(pending), envelope);
+    }
+
+    private static @Nullable WhatsAppInboundMessage location(JsonObject msg, Envelope envelope) {
+        if (!msg.has(TYPE_LOCATION)) return null;
+        var obj = msg.getAsJsonObject(TYPE_LOCATION);
+        if (!obj.has("latitude") || !obj.has("longitude")) return null;
+        var loc = new WhatsAppInboundMessage.Location(
+                obj.get("latitude").getAsDouble(),
+                obj.get("longitude").getAsDouble(),
+                JsonArgs.optNonBlankString(obj, "name"),
+                JsonArgs.optNonBlankString(obj, "address"));
+        return base(MessageType.LOCATION, null, loc, null, List.of(), envelope);
+    }
+
+    private static @Nullable WhatsAppInboundMessage reaction(JsonObject msg, Envelope envelope) {
+        if (!msg.has(TYPE_REACTION)) return null;
+        var obj = msg.getAsJsonObject(TYPE_REACTION);
+        var targetId = JsonArgs.optNonBlankString(obj, "message_id");
+        if (targetId == null) return null;
+        // emoji is omitted when a reaction is REMOVED — normalize to "" (blank).
+        var emoji = JsonArgs.optNonBlankString(obj, "emoji");
+        var r = new WhatsAppInboundMessage.Reaction(targetId, emoji != null ? emoji : "");
+        return base(MessageType.REACTION, null, null, r, List.of(), envelope);
+    }
+
+    /**
+     * Interactive button/list reply. Maps to {@link MessageType#TEXT} carrying the
+     * reply title — the agent sees the human-readable label the user tapped. The
+     * reply {@code id} is the developer-defined payload; the title is what the user
+     * read, so it's the natural text. Falls back to the id when no title is present.
+     */
+    private static @Nullable WhatsAppInboundMessage interactive(JsonObject msg, Envelope envelope) {
+        if (!msg.has(TYPE_INTERACTIVE)) return null;
+        var obj = msg.getAsJsonObject(TYPE_INTERACTIVE);
+        JsonObject reply = null;
+        if (obj.has("button_reply")) {
+            reply = obj.getAsJsonObject("button_reply");
+        } else if (obj.has("list_reply")) {
+            reply = obj.getAsJsonObject("list_reply");
+        }
+        if (reply == null) return null;
+        var title = JsonArgs.optNonBlankString(reply, "title");
+        var id = JsonArgs.optNonBlankString(reply, "id");
+        var body = title != null ? title : id;
+        if (body == null) return null;
+        return base(MessageType.TEXT, body, null, null, List.of(), envelope);
+    }
+
+    // ── shared assembly ──
+
+    /**
+     * Build the normalized record with the Cloud-API invariants baked in:
+     * {@code chatId == from} (no groups), {@code chatType == direct},
+     * {@code botMentioned == true}.
+     */
+    private static WhatsAppInboundMessage base(MessageType type, @Nullable String text,
+                                               WhatsAppInboundMessage.@Nullable Location location,
+                                               WhatsAppInboundMessage.@Nullable Reaction reaction,
+                                               List<WhatsAppInboundMessage.PendingMedia> media,
+                                               Envelope envelope) {
+        return new WhatsAppInboundMessage(
+                envelope.messageId(),
+                envelope.from(),
+                envelope.from(),                        // chatId == from for a 1:1
+                WhatsAppInboundMessage.CHAT_DIRECT,     // Cloud API has no groups
+                envelope.phoneNumberId(),
+                type,
+                text,
+                location,
+                reaction,
+                media,
+                true,                                   // DM to a business number is implicitly addressed
+                envelope.quotedId(),
+                envelope.senderName());
+    }
+
+    // ── payload navigation helpers ──
+
+    /** {@code entry[0].changes[0].value}, or null when absent. */
+    private static @Nullable JsonObject firstValue(JsonObject payload) {
+        if (payload == null || !payload.has("entry")) return null;
+        JsonArray entries = payload.getAsJsonArray("entry");
+        if (entries.isEmpty()) return null;
+        var entry = entries.get(0).getAsJsonObject();
+        if (!entry.has("changes")) return null;
+        JsonArray changes = entry.getAsJsonArray("changes");
+        if (changes.isEmpty()) return null;
+        var change = changes.get(0).getAsJsonObject();
+        return change.has("value") ? change.getAsJsonObject("value") : null;
+    }
+
+    /** {@code value.metadata.phone_number_id}, used to route to a binding. */
+    static @Nullable String metadataPhoneNumberId(JsonObject value) {
+        if (!value.has("metadata")) return null;
+        return JsonArgs.optNonBlankString(value.getAsJsonObject("metadata"), "phone_number_id");
+    }
+
+    /** {@code value.contacts[0].profile.name} — the sender's display name. */
+    private static @Nullable String contactName(JsonObject value) {
+        if (!value.has("contacts")) return null;
+        var contacts = value.getAsJsonArray("contacts");
+        if (contacts.isEmpty()) return null;
+        var contact = contacts.get(0).getAsJsonObject();
+        if (!contact.has("profile")) return null;
+        return JsonArgs.optNonBlankString(contact.getAsJsonObject("profile"), "name");
+    }
+
+    /** {@code message.context.id} — the quoted message id when this is a reply. */
+    private static @Nullable String quotedMessageId(JsonObject msg) {
+        if (!msg.has("context")) return null;
+        return JsonArgs.optNonBlankString(msg.getAsJsonObject("context"), "id");
+    }
+
+    /**
+     * Convenience exposed for the webhook controller: pull the
+     * {@code phone_number_id} out of a raw payload to route to a binding before
+     * full parse. Returns null when the payload has no metadata. Public because
+     * the controller lives in a different package.
+     */
+    public static @Nullable String extractPhoneNumberId(JsonObject payload) {
+        var value = firstValue(payload);
+        return value == null ? null : metadataPhoneNumberId(value);
+    }
+}

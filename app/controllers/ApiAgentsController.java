@@ -1,0 +1,855 @@
+package controllers;
+
+import agents.SystemPromptAssembler;
+import agents.SystemPromptAssembler.PromptBreakdown;
+import com.google.gson.Gson;
+import com.google.gson.JsonObject;
+import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.media.ArraySchema;
+import io.swagger.v3.oas.annotations.media.Content;
+import io.swagger.v3.oas.annotations.media.Schema;
+import io.swagger.v3.oas.annotations.parameters.RequestBody;
+import io.swagger.v3.oas.annotations.responses.ApiResponse;
+import models.Agent;
+import models.AgentSkillAllowedTool;
+import models.AgentSkillConfig;
+import org.jspecify.annotations.Nullable;
+import play.libs.MimeTypes;
+import play.mvc.Controller;
+import play.mvc.Http;
+import play.mvc.With;
+import services.AgentService;
+import services.ConfigService;
+import services.LoadTestRunner;
+import services.WorkspaceFiles;
+import services.compression.TextCompressor;
+import tools.ShellExecTool;
+import utils.ApiResponses;
+import utils.HttpKeys;
+import utils.JsonArgs;
+
+import java.io.BufferedOutputStream;
+import java.io.IOException;
+import java.io.OutputStream;
+import java.nio.file.Files;
+import java.nio.file.LinkOption;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.TreeMap;
+import java.util.regex.Pattern;
+
+import static controllers.AgentAccess.Level.OPEN;
+import static controllers.AgentAccess.Level.OPERATOR_ONLY;
+import static utils.GsonHolder.GSON;
+
+@With(AuthCheck.class)
+public class ApiAgentsController extends Controller {
+
+    private static final Gson gson = GSON;
+
+    // JSON body keys reused across create/update/serve paths.
+    private static final String KEY_MODEL_PROVIDER = "modelProvider";
+    private static final String KEY_MODEL_ID = "modelId";
+    private static final String KEY_THINKING_MODE = "thinkingMode";
+    private static final String KEY_DESCRIPTION = "description";
+    private static final String KEY_CONTENT = "content";
+    private static final String KEY_COMPRESSION_ENABLED = "compressionEnabled";
+    private static final String KEY_COMPRESSION_JSON = "compressionJson";
+    private static final String KEY_COMPRESSION_CODE = "compressionCode";
+    private static final String KEY_COMPRESSION_TEXT = "compressionText";
+    private static final String KEY_COMPRESSION_TARGET_RATIO = "compressionTargetRatio";
+    private static final String KEY_ACP_ALLOWED = "acpAllowed";
+    private static final String KEY_MEMORY_AUTOCAPTURE_ENABLED = "memoryAutocaptureEnabled";
+    private static final String KEY_MEMORY_AUTOCAPTURE_PROVIDER = "memoryAutocaptureProvider";
+    private static final String KEY_MEMORY_AUTOCAPTURE_MODEL = "memoryAutocaptureModel";
+    private static final String KEY_FALLBACK_PROVIDER = "fallbackProvider";
+    private static final String KEY_FALLBACK_MODEL_ID = "fallbackModelId";
+
+    /**
+     * Slug regex enforced on every {@code name} received from the public
+     * API (JCLAW-115). Must begin with an alphanumeric character or
+     * underscore (existing reserved-pattern rows like {@code __loadtest__}
+     * qualify) and use only alphanumerics, hyphens, or underscores
+     * thereafter. Max length 64 chars. Deliberately excludes path
+     * separators, dot segments, whitespace, and absolute-path leading
+     * slashes — names flow through {@code AgentService.workspacePath}
+     * which does a {@code Path.resolve} that would otherwise happily
+     * escape the workspace root.
+     */
+    private static final Pattern AGENT_NAME_RE =
+            Pattern.compile("^\\w[\\w-]{0,63}$");
+
+    /**
+     * Reject any name that fails the slug regex with 400. Called from
+     * {@code create} and {@code update} before we touch the service layer.
+     * Returning {@code badRequest()} halts the controller action — the
+     * {@code notFound}-style flow Play uses.
+     */
+    private static void validateAgentName(String name) {
+        if (name == null || !AGENT_NAME_RE.matcher(name).matches()) {
+            ApiResponses.error(400, ApiResponses.INVALID_REQUEST, "Agent name must match " + AGENT_NAME_RE.pattern()
+                    + " (letters, digits, hyphen, underscore; 1-64 chars; starts with alphanumeric)");
+        }
+    }
+
+    /**
+     * Reserved agent names that no user-facing API surface can create, read,
+     * update, or delete. Internal harnesses write these rows via JPA directly
+     * and are unaffected. Case-insensitive match — spelling variations like
+     * {@code __LoadTest__} are also rejected.
+     */
+    private static boolean isReservedName(String name) {
+        return (LoadTestRunner.LOADTEST_AGENT_NAME.equalsIgnoreCase(name)
+                || LoadTestRunner.LOADTEST_TOOLS_AGENT_NAME.equalsIgnoreCase(name));
+    }
+
+    /**
+     * Names hidden from the user-facing agent list. A superset of
+     * {@link #isReservedName}: the eval agent is harness infrastructure and has no
+     * business in the chat page's Agent selector, but it is deliberately NOT
+     * reserved.
+     *
+     * <p>The difference is deletion. Reserved names 404 through
+     * {@link #requireAgent}, which would break the documented cleanup for an eval
+     * sweep — both AGENTS.md and {@code ./jclaw.sh evals --help} tell the operator
+     * to DELETE {@code __evaltest__} to clear what a sweep created, and that is the
+     * supported way to remove the tasks a suite's cases leave behind. Hiding it
+     * from a dropdown must not take that away.
+     */
+    private static boolean isHiddenFromList(String name) {
+        return isReservedName(name)
+                || (Agent.EVALTEST_AGENT_NAME.equalsIgnoreCase(name));
+    }
+
+    @SuppressWarnings("java:S2259")
+    private static Agent requireAgent(Long id) {
+        var agent = AgentService.findById(id);
+        if (agent == null || isReservedName(agent.name)) {
+            notFound();
+            throw ApiResponses.unreachable();
+        }
+        return agent;
+    }
+
+    public record AgentRequest(String name, String modelProvider, String modelId,
+                               String thinkingMode, String description, Boolean enabled) {}
+
+    public record WorkspaceFileRequest(String content) {}
+
+    private record EffectiveAllowlistResponse(List<String> global,
+                                              Map<String, List<String>> bySkill) {}
+
+    private record WorkspaceFileResponse(String filename, String content) {}
+
+    private record AgentView(Long id, String name, String description,
+                             String modelProvider, String modelId,
+                             boolean enabled, boolean isMain, String thinkingMode,
+                             String createdAt, String updatedAt, boolean providerConfigured,
+                             boolean compressionEnabled,
+                             boolean compressionJson, boolean compressionCode,
+                             boolean compressionText, double compressionTargetRatio,
+                             boolean acpAllowed,
+                             boolean memoryAutocaptureEnabled,
+                             boolean memoryAutocaptureModelInherited,
+                             String memoryAutocaptureProvider,
+                             String memoryAutocaptureModel,
+                             @Nullable String fallbackProvider,
+                             @Nullable String fallbackModelId) {
+        static AgentView of(Agent a) {
+            return of(a, AgentService.isProviderConfigured(a.modelProvider, a.modelId));
+        }
+
+        /**
+         * Bulk path: callers that map many agents pre-build a set of
+         * configured keys via {@link AgentService#configuredModelKeys} and
+         * pass per-agent O(1) lookups in here. Avoids the per-agent
+         * {@code Stream.anyMatch} over the provider's full model list,
+         * which was O(N*M) on the {@code GET /api/agents} hot path.
+         */
+        static AgentView of(Agent a, Set<String> configuredKeys) {
+            return of(a, configuredKeys.contains(a.modelProvider + ":" + a.modelId));
+        }
+
+        private static AgentView of(Agent a, boolean configured) {
+            return new AgentView(a.id, a.name, a.description, a.modelProvider, a.modelId,
+                    a.enabled, a.isMain(), a.thinkingMode,
+                    a.createdAt.toString(), a.updatedAt.toString(), configured,
+                    a.compressionEffective(),
+                    a.compressionJsonEffective(), a.compressionCodeEffective(),
+                    a.compressionTextEffective(),
+                    a.compressionTargetRatio != null
+                            ? a.compressionTargetRatio
+                            : TextCompressor.DEFAULT_TARGET_RATIO,
+                    a.acpAllowed,
+                    a.memoryAutocaptureEnabled,
+                    a.memoryAutocaptureProvider == null && a.memoryAutocaptureModel == null,
+                    a.autocaptureProviderEffective(),
+                    a.autocaptureModelEffective(),
+                    a.fallbackProvider,
+                    a.fallbackModelId);
+        }
+    }
+
+    @ApiResponse(responseCode = "200", content = @Content(array = @ArraySchema(schema = @Schema(implementation = AgentView.class))))
+    @Operation(summary = "List agents (id, name, modelProvider, modelId, enabled, isMain)")
+    @AgentAccess(OPEN)
+    public static void list() {
+        var configuredKeys = AgentService.configuredModelKeys();
+        var result = listedAgents().stream()
+                .map(a -> AgentView.of(a, configuredKeys))
+                .toList();
+        renderJSON(gson.toJson(result));
+    }
+
+    /**
+     * The agents this endpoint exposes. Subagents (parentAgent != null) are scoped to
+     * their parent's spawn tree and don't belong in the user-facing dropdown — they
+     * appear on the /subagents admin page, where their transcripts are viewable.
+     *
+     * <p>Package-visible because {@code ApiSkillsController.listByAgent} must report on
+     * exactly this set; selecting from {@code listAll()} there walked 73 agent
+     * workspaces to render 4 rows.
+     */
+    static List<Agent> listedAgents() {
+        return AgentService.listAll().stream()
+                .filter(a -> !isHiddenFromList(a.name))
+                .filter(a -> a.parentAgent == null)
+                .toList();
+    }
+
+    @ApiResponse(responseCode = "200", content = @Content(schema = @Schema(implementation = AgentView.class)))
+    @Operation(summary = "Get one agent's full details by id")
+    @AgentAccess(OPEN)
+    public static void get(Long id) {
+        var agent = requireAgent(id);
+        renderJSON(gson.toJson(AgentView.of(agent)));
+    }
+
+    /**
+     * Return a per-section breakdown of the system prompt this agent would receive
+     * on its next turn. Feeds the Settings UI introspection dialog. Memory recall is
+     * skipped (null user message) so the breakdown is deterministic for a given
+     * agent state and doesn't depend on a hypothetical user query.
+     */
+    @SuppressWarnings("java:S2259")
+    @ApiResponse(responseCode = "200", content = @Content(schema = @Schema(implementation = PromptBreakdown.class)))
+    @Operation(summary = "Per-section breakdown of the system prompt this agent would receive next turn")
+    @AgentAccess(OPEN)
+    public static void promptBreakdown(Long id) {
+        var agent = requireAgent(id);
+        var breakdown = SystemPromptAssembler.breakdown(agent, null, requireBreakdownChannel());
+        renderJSON(gson.toJson(breakdown));
+    }
+
+    /**
+     * Return the full assembled system prompt text for this agent — the same string
+     * {@link #promptBreakdown} measures, so the operator can read what the numbers
+     * describe. Kept as its own endpoint rather than a field on the breakdown because
+     * the text runs to tens of kilobytes and the breakdown dialog opens far more often
+     * than the operator asks to read the prompt.
+     *
+     * <p>Memory recall is skipped (null user message) for the same reason as the
+     * breakdown: a deterministic snapshot of the agent's standing prompt, not one
+     * conditioned on a hypothetical query.
+     */
+    @SuppressWarnings("java:S2259")
+    @Operation(summary = "Full assembled system prompt text this agent would receive next turn")
+    @AgentAccess(OPEN)
+    public static void promptText(Long id) {
+        var agent = requireAgent(id);
+        var assembled = SystemPromptAssembler.assemble(agent, null, null, requireBreakdownChannel());
+        renderJSON(gson.toJson(Map.of("text", assembled.systemPrompt())));
+    }
+
+    /**
+     * Read and validate the {@code channelType} query param shared by the two prompt
+     * introspection endpoints. Required: every real chat lives on a channel, so the UI
+     * always sends one — reject missing/unknown values up-front rather than silently
+     * assembling a prompt that matches no runtime path. Halts via {@code badRequest()}
+     * on a bad value, so callers can use the return value directly.
+     */
+    private static String requireBreakdownChannel() {
+        var rawChannel = params.get("channelType");
+        if (rawChannel == null || rawChannel.isBlank()) badRequest();
+        var channelType = rawChannel.trim().toLowerCase();
+        if (!VALID_BREAKDOWN_CHANNELS.contains(channelType)) badRequest();
+        return channelType;
+    }
+
+    private static final Set<String> VALID_BREAKDOWN_CHANNELS =
+            Set.of("web", "telegram", "slack", "whatsapp");
+
+    /**
+     * GET /api/agents/{id}/shell/effective-allowlist — Derived view of the
+     * effective shell allowlist this agent would be checked against at exec
+     * time: the global {@code shell.allowlist} unioned with every command
+     * contributed by the agent's currently-enabled skills. Response shape:
+     * {@code { global: string[], bySkill: { <skill>: string[] } }} so the UI
+     * can render provenance without recomputing the join on the client.
+     *
+     * <p>Read-only: nothing about the allowlist is mutable from this page —
+     * global is edited via Settings; per-skill contributions are set at skill
+     * install time. Operators who need to remove a per-skill grant do so by
+     * disabling or removing the skill.
+     */
+    @Operation(summary = "Effective shell allowlist for an agent: global config unioned with enabled-skill commands")
+    @AgentAccess(OPEN)
+    public static void effectiveShellAllowlist(Long id) {
+        var agent = requireAgent(id);
+
+        // Global portion: reparse the raw config string rather than call
+        // parsedAllowlist() directly, which lives on a tool instance. The parse
+        // is cheap (bounded length, split-and-trim).
+        var rawGlobal = ConfigService.get("shell.allowlist",
+                ShellExecTool.DEFAULT_ALLOWLIST);
+        var global = Arrays.stream(rawGlobal.split(","))
+                .map(String::strip)
+                .filter(s -> !s.isEmpty())
+                .sorted()
+                .toList();
+
+        // Per-skill contributions: only surface skills that are currently
+        // enabled for this agent (enabled-by-default when no config row).
+        var configs = AgentSkillConfig.findByAgent(agent);
+        var disabledSkills = new HashSet<String>();
+        for (var c : configs) {
+            if (!c.enabled) disabledSkills.add(c.skillName);
+        }
+        var bySkill = new TreeMap<String, List<String>>();
+        for (var row : AgentSkillAllowedTool.findByAgent(agent)) {
+            if (disabledSkills.contains(row.skillName)) continue;
+            bySkill.computeIfAbsent(row.skillName, _ -> new ArrayList<>()).add(row.toolName);
+        }
+        for (var entry : bySkill.entrySet()) {
+            entry.getValue().sort(String::compareTo);
+        }
+
+        renderJSON(gson.toJson(new EffectiveAllowlistResponse(global, bySkill)));
+    }
+
+    @SuppressWarnings("java:S2259")
+    @ApiResponse(responseCode = "200", content = @Content(schema = @Schema(implementation = AgentView.class)))
+    @RequestBody(required = true, content = @Content(schema = @Schema(implementation = AgentRequest.class)))
+    @Operation(summary = "Create an agent")
+    @AgentAccess(value = OPEN,
+            reason = "creates a model-config-only agent; tool grants and acpAllowed stay on operator-only routes")
+    public static void create() {
+        var body = JsonBodyReader.readJsonBody();
+        if (body == null) {
+            badRequest();
+            throw ApiResponses.unreachable();
+        }
+
+        var name = requireString(body, "name");
+        validateAgentName(name);
+        if (Agent.MAIN_AGENT_NAME.equalsIgnoreCase(name)) {
+            ApiResponses.error(409, ApiResponses.CONFLICT, "The agent name 'main' is reserved for the built-in agent");
+        }
+        if (isReservedName(name)) {
+            ApiResponses.error(409, ApiResponses.CONFLICT, "The agent name '%s' is reserved for internal use"
+                    .formatted(LoadTestRunner.LOADTEST_AGENT_NAME));
+        }
+        // Agent.name carries a unique constraint at the DB level. Without this
+        // pre-check the duplicate surfaces only at JPA flush time as an
+        // unhandled JdbcSQLIntegrityConstraintViolationException → HTTP 500,
+        // which the operator sees as an opaque error toast. 409 with the
+        // taken name makes the conflict actionable.
+        if (Agent.findByName(name) != null) {
+            ApiResponses.error(409, ApiResponses.CONFLICT, "An agent named '" + name + "' already exists");
+        }
+        var modelProvider = requireString(body, KEY_MODEL_PROVIDER);
+        var modelId = requireString(body, KEY_MODEL_ID);
+        var thinkingMode = readOptionalString(body, KEY_THINKING_MODE);
+        var description = readOptionalString(body, KEY_DESCRIPTION);
+        var fallbackProvider = readOptionalString(body, KEY_FALLBACK_PROVIDER);
+        var fallbackModelId = readOptionalString(body, KEY_FALLBACK_MODEL_ID);
+        validateFallback(modelProvider, fallbackProvider, fallbackModelId);
+
+        var agent = AgentService.create(name, modelProvider, modelId, thinkingMode, description);
+        if (fallbackProvider != null) {
+            agent.fallbackProvider = fallbackProvider;
+            agent.fallbackModelId = fallbackModelId;
+            agent.save();
+        }
+        renderJSON(gson.toJson(AgentView.of(agent)));
+    }
+
+    /**
+     * JCLAW-1190: a fallback is optional, but when set it is a pair — a provider that is not the
+     * agent's own, and a model registered on it. Checked before anything is applied so a 400
+     * never leaves a half-written agent behind.
+     */
+    private static void validateFallback(String modelProvider, @Nullable String fallbackProvider,
+                                         @Nullable String fallbackModelId) {
+        if (fallbackProvider == null && fallbackModelId == null) return;
+        if (fallbackProvider == null || fallbackModelId == null) {
+            ApiResponses.error(400, ApiResponses.INVALID_REQUEST,
+                    "'fallbackProvider' and 'fallbackModelId' go together: set both or neither");
+            throw ApiResponses.unreachable();
+        }
+        if (fallbackProvider.equals(modelProvider)) {
+            ApiResponses.error(400, ApiResponses.INVALID_REQUEST,
+                    "The fallback provider must differ from the agent's provider '" + modelProvider + "'");
+            throw ApiResponses.unreachable();
+        }
+        if (!AgentService.isProviderConfigured(fallbackProvider, fallbackModelId)) {
+            ApiResponses.error(400, ApiResponses.INVALID_REQUEST,
+                    "Model '%s' is not registered on provider '%s'".formatted(fallbackModelId, fallbackProvider));
+            throw ApiResponses.unreachable();
+        }
+    }
+
+    /**
+     * JCLAW-1190: apply the fallback pair present in {@code body} under the partial-PUT
+     * convention. Clearing either half clears both; a body that names neither still has the
+     * stored pair re-checked against the (possibly new) primary.
+     */
+    private static void applyFallbackSettings(Agent agent, JsonObject body, String modelProvider) {
+        if (!body.has(KEY_FALLBACK_PROVIDER) && !body.has(KEY_FALLBACK_MODEL_ID)) {
+            validateFallback(modelProvider, agent.fallbackProvider, agent.fallbackModelId);
+            return;
+        }
+        var provider = body.has(KEY_FALLBACK_PROVIDER)
+                ? readOptionalString(body, KEY_FALLBACK_PROVIDER) : agent.fallbackProvider;
+        var modelId = body.has(KEY_FALLBACK_MODEL_ID)
+                ? readOptionalString(body, KEY_FALLBACK_MODEL_ID) : agent.fallbackModelId;
+        if (provider == null || modelId == null) {
+            provider = null;
+            modelId = null;
+        }
+        validateFallback(modelProvider, provider, modelId);
+        agent.fallbackProvider = provider;
+        agent.fallbackModelId = modelId;
+    }
+
+    /**
+     * Read a JSON string field that may be missing, null, or blank, returning
+     * {@code null} in all of those cases. Used for optional nullable fields
+     * like {@code thinkingMode} where the frontend sends {@code null} to clear.
+     */
+    private static @Nullable String readOptionalString(JsonObject body, String key) {
+        return JsonArgs.optNonBlankString(body, key);
+    }
+
+    /**
+     * Read a REQUIRED string field. Returns 400 — not a 500 NPE — when the field
+     * is absent, JSON null, or blank. Matters on the agent-facing jclaw_api path:
+     * a missing field should surface as an actionable error, not a stack trace.
+     */
+    @SuppressWarnings("java:S2259")
+    private static String requireString(JsonObject body, String key) {
+        var v = readOptionalString(body, key);
+        if (v == null) {
+            ApiResponses.error(400, ApiResponses.INVALID_REQUEST, "'" + key + "' is required");
+            throw ApiResponses.unreachable();
+        }
+        return v;
+    }
+
+    /** Read an optional string, falling back when absent OR JSON null (no NPE on a present-but-null field). */
+    private static String optStringOr(JsonObject body, String key, String fallback) {
+        return JsonArgs.optString(body, key, fallback);
+    }
+
+    @SuppressWarnings("java:S2259")
+    @ApiResponse(responseCode = "200", content = @Content(schema = @Schema(implementation = AgentView.class)))
+    @RequestBody(required = true, content = @Content(schema = @Schema(implementation = AgentRequest.class)))
+    @Operation(summary = "Update an agent by id")
+    @AgentAccess(value = OPEN, reason = "model config only; acpAllowed is refused per-field for the agent principal (JCLAW-1023) and tool grants live on operator-only routes")
+    public static void update(Long id) {
+        var agent = requireAgent(id);
+
+        var body = JsonBodyReader.readJsonBody();
+        if (body == null) {
+            badRequest();
+            throw ApiResponses.unreachable();
+        }
+
+        // Checked before any field is applied: `agent` is managed, so a 403 thrown after a
+        // partial apply would still flush the earlier fields on the request's commit.
+        requireOperatorForAcpChange(agent, body);
+
+        var name = optStringOr(body, "name", agent.name);
+        validateRenameRules(agent, name);
+
+        var modelProvider = optStringOr(body, KEY_MODEL_PROVIDER, agent.modelProvider);
+        var modelId = optStringOr(body, KEY_MODEL_ID, agent.modelId);
+        var enabled = body.has("enabled") ? body.get("enabled").getAsBoolean() : agent.enabled;
+        // The main agent cannot be disabled. Service-layer enforcement would also
+        // catch this, but we reject at the API boundary so the operator sees an
+        // explicit error instead of a silently-ignored toggle.
+        if (agent.isMain() && !enabled) {
+            ApiResponses.error(409, ApiResponses.CONFLICT, "The main agent cannot be disabled");
+        }
+
+        // thinkingMode is optional on update: absent key leaves the stored value
+        // untouched, explicit null/blank clears it, any other string is validated
+        // downstream against the model's advertised levels.
+        var thinkingMode = body.has(KEY_THINKING_MODE)
+                ? readOptionalString(body, KEY_THINKING_MODE)
+                : agent.thinkingMode;
+
+        // description follows the same absent-leaves-untouched convention; an
+        // explicit null or blank clears the field.
+        var description = body.has(KEY_DESCRIPTION)
+                ? readOptionalString(body, KEY_DESCRIPTION)
+                : agent.description;
+
+        applyCompressionSettings(agent, body);
+
+        // JCLAW-500: per-agent acp-runtime grant. Absent/null key leaves it
+        // unchanged (partial-PUT convention, same as the compression fields).
+        if (body.has(KEY_ACP_ALLOWED) && !body.get(KEY_ACP_ALLOWED).isJsonNull()) {
+            agent.acpAllowed = body.get(KEY_ACP_ALLOWED).getAsBoolean();
+        }
+
+        applyMemorySettings(agent, body);
+        applyFallbackSettings(agent, body, modelProvider);
+
+        agent = AgentService.update(agent, name, modelProvider, modelId, enabled, thinkingMode,
+                description);
+        renderJSON(gson.toJson(AgentView.of(agent)));
+    }
+
+    /** Refuse an agent-originated flip of {@code acpAllowed}: {@code SubagentAcpRunner}
+     *  treats that flag as its entire security boundary, and the harness subprocess it unlocks
+     *  runs commands outside the shell allowlist. An unchanged echo is not a grant, so a
+     *  read-modify-write of the whole agent JSON keeps working for both principals. */
+    private static void requireOperatorForAcpChange(Agent agent, JsonObject body) {
+        if (!body.has(KEY_ACP_ALLOWED) || body.get(KEY_ACP_ALLOWED).isJsonNull()) return;
+        if (body.get(KEY_ACP_ALLOWED).getAsBoolean() == agent.acpAllowed) return;
+        if (RequestPrincipal.isAgentOriginated()) {
+            ApiResponses.error(403, ApiResponses.OPERATOR_ONLY,
+                    "acpAllowed is operator-only; an agent cannot grant itself or another agent the ACP runtime.");
+        }
+    }
+
+    /**
+     * JCLAW-463/464/465: apply the per-agent compression fields present in {@code body}
+     * onto {@code agent}. Absent or explicit-null keys leave the stored value untouched;
+     * the master toggle gates the per-type sub-toggles downstream. Values are set directly
+     * on the entity so {@link AgentService#update}'s save() persists them with the rest.
+     */
+    private static void applyCompressionSettings(Agent agent, JsonObject body) {
+        if (body.has(KEY_COMPRESSION_ENABLED) && !body.get(KEY_COMPRESSION_ENABLED).isJsonNull()) {
+            agent.compressionEnabled = body.get(KEY_COMPRESSION_ENABLED).getAsBoolean();
+        }
+        if (body.has(KEY_COMPRESSION_JSON) && !body.get(KEY_COMPRESSION_JSON).isJsonNull()) {
+            agent.compressionJson = body.get(KEY_COMPRESSION_JSON).getAsBoolean();
+        }
+        if (body.has(KEY_COMPRESSION_CODE) && !body.get(KEY_COMPRESSION_CODE).isJsonNull()) {
+            agent.compressionCode = body.get(KEY_COMPRESSION_CODE).getAsBoolean();
+        }
+        if (body.has(KEY_COMPRESSION_TEXT) && !body.get(KEY_COMPRESSION_TEXT).isJsonNull()) {
+            agent.compressionText = body.get(KEY_COMPRESSION_TEXT).getAsBoolean();
+        }
+        // JCLAW-464: clamp lives in TextCompressor; persist the operator's raw value.
+        if (body.has(KEY_COMPRESSION_TARGET_RATIO) && !body.get(KEY_COMPRESSION_TARGET_RATIO).isJsonNull()) {
+            agent.compressionTargetRatio = body.get(KEY_COMPRESSION_TARGET_RATIO).getAsDouble();
+        }
+    }
+
+    /**
+     * JCLAW-534: apply the per-agent memory auto-capture settings present in
+     * {@code body}. Absent keys leave the stored value untouched (partial-PUT).
+     * For the model override an explicit null/blank means "inherit the agent's
+     * default model"; a concrete value is an explicit override. Set directly on
+     * the entity so {@link AgentService#update}'s save() persists them.
+     */
+    private static void applyMemorySettings(Agent agent, JsonObject body) {
+        if (body.has(KEY_MEMORY_AUTOCAPTURE_ENABLED) && !body.get(KEY_MEMORY_AUTOCAPTURE_ENABLED).isJsonNull()) {
+            agent.memoryAutocaptureEnabled = body.get(KEY_MEMORY_AUTOCAPTURE_ENABLED).getAsBoolean();
+        }
+        if (body.has(KEY_MEMORY_AUTOCAPTURE_PROVIDER)) {
+            agent.memoryAutocaptureProvider = readOptionalString(body, KEY_MEMORY_AUTOCAPTURE_PROVIDER);
+        }
+        if (body.has(KEY_MEMORY_AUTOCAPTURE_MODEL)) {
+            agent.memoryAutocaptureModel = readOptionalString(body, KEY_MEMORY_AUTOCAPTURE_MODEL);
+        }
+    }
+
+    /**
+     * Enforce the full rename ruleset on a proposed {@code name} against the
+     * current {@code agent}: slug format, "main" singleton rules, reserved-name
+     * gate, and unique-name collision. Each rule short-circuits via
+     * {@code error(...)} which throws a Result.
+     */
+    @SuppressWarnings("java:S2259")
+    private static void validateRenameRules(Agent agent, String name) {
+        // JCLAW-115: only validate when the name actually changes. Existing
+        // agents grandfathered in — rejecting their current name on an
+        // unrelated PUT (thinking-mode toggle, etc.) would break workflows.
+        if (!name.equals(agent.name)) validateAgentName(name);
+        // The reserved name "main" is a singleton: no other agent may take the name,
+        // and the main agent may not be renamed away from it.
+        if (!agent.isMain() && Agent.MAIN_AGENT_NAME.equalsIgnoreCase(name)) {
+            ApiResponses.error(409, ApiResponses.CONFLICT, "The agent name 'main' is reserved for the built-in agent");
+        }
+        if (agent.isMain() && !Agent.MAIN_AGENT_NAME.equalsIgnoreCase(name)) {
+            ApiResponses.error(409, ApiResponses.CONFLICT, "The main agent cannot be renamed");
+        }
+        if (isReservedName(name)) {
+            ApiResponses.error(409, ApiResponses.CONFLICT, "The agent name '%s' is reserved for internal use"
+                    .formatted(LoadTestRunner.LOADTEST_AGENT_NAME));
+        }
+        // Rename collision: another agent already owns this name. Skip the
+        // check when the name is unchanged so a PUT that only updates
+        // unrelated fields (thinking-mode, enabled, ...) doesn't false-
+        // positive on its own row.
+        if (!name.equals(agent.name)) {
+            var conflicting = Agent.findByName(name);
+            if (conflicting != null && !conflicting.id.equals(agent.id)) {
+                ApiResponses.error(409, ApiResponses.CONFLICT, "An agent named '" + name + "' already exists");
+            }
+        }
+    }
+
+    @SuppressWarnings("java:S2259")
+    @Operation(summary = "Delete an agent by id (the built-in 'main' agent cannot be deleted)")
+    @AgentAccess(value = OPERATOR_ONLY, reason = "deletes any agent together with its workspace (JCLAW-1058)")
+    public static void delete(Long id) {
+        var agent = requireAgent(id);
+        if (agent.isMain()) {
+            ApiResponses.error(409, ApiResponses.CONFLICT, "The built-in 'main' agent cannot be deleted");
+        }
+        AgentService.delete(agent);
+        ApiResponses.ok();
+    }
+
+    // --- Workspace file endpoints ---
+
+    /**
+     * GET /api/agents/{id}/files/{filePath} — Serve a workspace file with proper content type.
+     * Supports images, PDFs, and other binary files for inline rendering or download.
+     *
+     * @param filePath path inside the agent's workspace
+     */
+    @SuppressWarnings("java:S2259")
+    @Operation(summary = "Serve a binary workspace file with its content type for inline rendering or download")
+    @AgentAccess(value = OPERATOR_ONLY,
+            reason = "serves any agent's workspace, including another agent's persona files")
+    public static void serveWorkspaceFile(Long id, String filePath) {
+
+        var agent = requireAgent(id);
+
+        // acquireWorkspacePath normalizes, compares against the workspace root, and
+        // realpath-resolves, so a `..` segment or an in-workspace symlink pointing
+        // outside is rejected — a substring check for ".." caught neither.
+        Path path;
+        try {
+            path = AgentService.acquireWorkspacePath(agent.name, filePath);
+        } catch (SecurityException _) {
+            forbidden();
+            return;  // javac definite-assignment: path is unassigned on this catch path
+        }
+        var file = path.toFile();
+        if (!file.exists() || !file.isFile()) notFound();
+
+        // Content type: Play's MimeTypes resolver covers the bundled database plus
+        // any custom mimetype.* entries declared in application.conf.
+        var contentType = MimeTypes.getContentType(filePath);
+
+        response.setHeader("Cache-Control", "private, max-age=300");
+
+        // A workspace file is agent-writable, so it is served as an attachment unless the type
+        // renders without executing: SVG carries script and text/html is a same-origin XSS with
+        // the operator's session.
+        var inline = isRasterImage(contentType)
+                || contentType.startsWith("audio/")
+                || contentType.startsWith("application/pdf");
+        response.setHeader(HttpKeys.CONTENT_TYPE, contentType);
+        response.setHeader("Content-Disposition",
+                (inline ? "inline" : "attachment") + "; filename=\"%s\"".formatted(file.getName()));
+        // The app declares no global CSP (http.headers.contentSecurityPolicy is empty by design),
+        // so this response carries its own: `sandbox` alone drops the unique origin's scripts,
+        // forms and plugins even if the type sniffs as something executable.
+        response.setHeader("Content-Security-Policy", "sandbox");
+        renderBinary(file);
+    }
+
+    /** {@code image/*} minus the vector types a browser executes: SVG runs script inline, and
+     *  {@code image/svg+xml-compressed} is the same document gzipped. */
+    private static boolean isRasterImage(String contentType) {
+        return contentType.startsWith("image/") && !contentType.startsWith("image/svg");
+    }
+
+
+    @SuppressWarnings("java:S2259")
+    @Operation(summary = "Read a text workspace file's contents by filename")
+    @AgentAccess(value = OPERATOR_ONLY,
+            reason = "reads any agent's workspace, including another agent's persona files")
+    public static void getWorkspaceFile(Long id, String filename) {
+
+        var agent = requireAgent(id);
+        var content = AgentService.readWorkspaceFile(agent.name, filename);
+        if (content == null) {
+            notFound();
+            throw ApiResponses.unreachable();
+        }
+        renderJSON(gson.toJson(new WorkspaceFileResponse(filename, content)));
+    }
+
+    @SuppressWarnings("java:S2259")
+    @RequestBody(required = true, content = @Content(schema = @Schema(implementation = WorkspaceFileRequest.class)))
+    @Operation(summary = "Write a text workspace file's contents by filename")
+    @AgentAccess(value = OPERATOR_ONLY,
+            reason = "workspace files are injected as authoritative standing instructions")
+    public static void saveWorkspaceFile(Long id, String filename) {
+
+        var agent = requireAgent(id);
+        var body = JsonBodyReader.readJsonBody();
+        if (body == null || !body.has(KEY_CONTENT) || body.get(KEY_CONTENT).isJsonNull()) {
+            badRequest();
+            throw ApiResponses.unreachable();
+        }
+        AgentService.writeWorkspaceFile(agent.name, filename, body.get(KEY_CONTENT).getAsString());
+        ApiResponses.ok("filename", filename);
+    }
+
+    // --- Workspace manager endpoints ---
+
+    /**
+     * GET /api/agents/{id}/workspace-tree — the agent's workspace as a tree of attribute-only
+     * entries with aggregate folder sizes and a total (JCLAW-1247). A sub-agent lists its root
+     * agent's shared workspace.
+     */
+    @Operation(summary = "List an agent's workspace tree with sizes, protected markers and a total")
+    @AgentAccess(value = OPERATOR_ONLY,
+            reason = "lists any agent's workspace, including another agent's persona files")
+    public static void listWorkspaceTree(Long id) {
+
+        var agent = requireAgent(id);
+        WorkspaceFiles.WorkspaceListing listing;
+        try {
+            listing = WorkspaceFiles.listWorkspace(agent.name);
+        } catch (SecurityException _) {
+            forbidden();
+            throw ApiResponses.unreachable();
+        } catch (IOException e) {
+            ApiResponses.error(500, ApiResponses.INTERNAL_ERROR,
+                    "Could not read the workspace: " + e.getMessage());
+            throw ApiResponses.unreachable();
+        }
+        renderJSON(gson.toJson(listing));
+    }
+
+    /**
+     * GET /api/agents/{id}/workspace-download/{path} — one workspace entry as a download
+     * (JCLAW-1248): a file with its own name and bytes, a folder as {@code <name>.zip}.
+     */
+    @Operation(summary = "Download a workspace file as an attachment, or a workspace folder as a zip")
+    @AgentAccess(value = OPERATOR_ONLY,
+            reason = "downloads any agent's workspace, including another agent's persona files")
+    public static void downloadWorkspaceEntry(Long id, String path) {
+
+        var agent = requireAgent(id);
+        var target = acquireWorkspaceTarget(agent.name, path);
+        if (Files.isDirectory(target, LinkOption.NOFOLLOW_LINKS)) {
+            streamWorkspaceZip(agent.name, path, target.getFileName() + ".zip");
+            return;
+        }
+        var file = target.toFile();
+        if (!file.isFile()) notFound();
+        // The two-argument overload renders an attachment; renderBinary(file) would say inline.
+        renderBinary(file, file.getName());
+    }
+
+    /**
+     * GET /api/agents/{id}/workspace-backup — the whole workspace as one zip named
+     * {@code <agent>-workspace.zip}, Standing Orders files included (JCLAW-1251).
+     */
+    @Operation(summary = "Download an agent's entire workspace as a zip backup")
+    @AgentAccess(value = OPERATOR_ONLY,
+            reason = "downloads any agent's whole workspace, including another agent's persona files")
+    public static void backupWorkspace(Long id) {
+
+        var agent = requireAgent(id);
+        var root = acquireWorkspaceTarget(agent.name, "");
+        if (!Files.isDirectory(root, LinkOption.NOFOLLOW_LINKS)) notFound();
+        streamWorkspaceZip(agent.name, "", agent.name + "-workspace.zip");
+    }
+
+    /** The guarded on-disk path for a workspace-relative argument; any escape is a 403. */
+    private static Path acquireWorkspaceTarget(String agentName, String relative) {
+        try {
+            return AgentService.acquireWorkspacePath(agentName, relative);
+        }
+        catch (SecurityException _) {
+            forbidden();
+            throw ApiResponses.unreachable();
+        }
+    }
+
+    /** Big enough that a deflated file costs a few chunks rather than dozens of tiny ones. */
+    private static final int ZIP_CHUNK_BYTES = 32 * 1024;
+
+    /**
+     * Stream a workspace zip as the walk builds it: Play's chunked writer backpressures against
+     * the socket, so neither the disk nor {@code response.out} ever holds the whole archive.
+     */
+    private static void streamWorkspaceZip(String agentName, String relative, String zipName) {
+        response.contentType = "application/zip";
+        response.setHeader("Content-Disposition", "attachment; filename=\"%s\"".formatted(zipName));
+        try (var out = new BufferedOutputStream(chunkedSink(response), ZIP_CHUNK_BYTES)) {
+            WorkspaceFiles.zipDirectory(agentName, relative, out);
+        }
+        catch (IOException e) {
+            ApiResponses.error(500, ApiResponses.INTERNAL_ERROR, "Could not archive the workspace: " + e.getMessage());
+        }
+    }
+
+    /** Play's chunked writer as an {@link OutputStream}. The response is a parameter because the
+     *  enhancer rewrites the controller's static {@code response} only inside the controller class,
+     *  never inside an anonymous one. */
+    private static OutputStream chunkedSink(Http.Response target) {
+        return new OutputStream() {
+            @Override
+            public void write(int b) {
+                write(new byte[] {(byte) b}, 0, 1);
+            }
+
+            @Override
+            public void write(byte[] bytes, int off, int len) {
+                // writeChunk queues the array without copying it, so a reused buffer must be copied.
+                if (len > 0) target.writeChunk(Arrays.copyOfRange(bytes, off, off + len));
+            }
+        };
+    }
+
+    /**
+     * DELETE /api/agents/{id}/workspace-tree/{path} — remove a workspace file, or a folder with
+     * its whole subtree (JCLAW-1249). An empty path targets the root. The root and the five
+     * Standing Orders files are refused here, not in the UI: hiding the control is a courtesy.
+     */
+    @Operation(summary = "Delete a workspace file or folder subtree; the root and Standing Orders files are refused")
+    @AgentAccess(value = OPERATOR_ONLY,
+            reason = "deletes files from any agent's workspace, including another agent's persona files")
+    public static void deleteWorkspaceEntry(Long id, @Nullable String path) {
+
+        var agent = requireAgent(id);
+        var relative = path == null ? "" : path;   // an empty trailing segment is the root, refused below
+        WorkspaceFiles.DeleteOutcome outcome;
+        try {
+            outcome = WorkspaceFiles.deleteWorkspaceEntry(agent.name, relative);
+        } catch (SecurityException _) {
+            forbidden();
+            throw ApiResponses.unreachable();
+        } catch (IOException e) {
+            ApiResponses.error(500, ApiResponses.INTERNAL_ERROR,
+                    "Could not delete the workspace entry: " + e.getMessage());
+            throw ApiResponses.unreachable();
+        }
+        switch (outcome) {
+            case PROTECTED -> ApiResponses.error(403, ApiResponses.FORBIDDEN,
+                    "The workspace root and the Standing Orders files cannot be deleted.");
+            case MISSING -> notFound();
+            case DELETED -> ApiResponses.ok("path", relative);
+        }
+    }
+
+}

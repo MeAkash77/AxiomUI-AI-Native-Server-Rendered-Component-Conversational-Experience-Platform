@@ -1,0 +1,525 @@
+import agents.UsageMetricsBuilder;
+import com.google.gson.JsonParser;
+import llm.LlmProvider;
+import llm.LlmTypes.ModelInfo;
+import llm.LlmTypes.ProviderMetrics;
+import llm.LlmTypes.Usage;
+import llm.TokenUsageEstimator;
+import org.junit.jupiter.api.Test;
+import play.test.UnitTest;
+
+import java.util.Map;
+
+/**
+ * JCLAW-76 — verifies that {@code UsageMetricsBuilder.buildUsageJson} surfaces
+ * token counts summed across every LLM round in a turn, not just the
+ * first round's values. Exercises the pure helper directly against a
+ * {@link LlmProvider.TurnUsage} built up via {@link LlmProvider.TurnUsage#addRound}
+ * so no streaming harness is needed.
+ */
+class AgentRunnerUsageTest extends UnitTest {
+
+    // --- TurnUsage folding ---
+
+    @Test
+    void turnUsageSumsTokensAcrossRounds() {
+        var t = new LlmProvider.TurnUsage();
+        t.addRound(roundWithUsage(new Usage(100, 10, 110, 5, 20, 0)));
+        t.addRound(roundWithUsage(new Usage(200, 50, 250, 15, 30, 2)));
+        t.addRound(roundWithUsage(new Usage(150, 800, 950, 0, 25, 0)));
+
+        assertEquals(450, t.promptTokens());
+        assertEquals(150, t.lastPromptTokens(), "JCLAW-1201: the final round's prompt, not the sum");
+        assertEquals(860, t.completionTokens());
+        assertEquals(1310, t.totalTokens());
+        assertEquals(20, t.reasoningTokens());
+        assertEquals(75, t.cachedTokens());
+        assertEquals(2, t.cacheCreationTokens());
+        assertTrue(t.hasProviderUsage());
+    }
+
+    @Test
+    void turnUsageIsEmptyWhenNoRoundsReportUsage() {
+        var t = new LlmProvider.TurnUsage();
+        t.addRound(roundWithUsage(null));                 // provider returned no usage
+        t.addRound(roundWithUsage(null));
+
+        assertFalse(t.hasProviderUsage());
+        assertEquals(0, t.promptTokens());
+        assertEquals(0, t.completionTokens());
+    }
+
+    @Test
+    void turnUsageTracksJtokkitMeasurementsSeparatelyFromProviderUsage() {
+        var t = new LlmProvider.TurnUsage();
+        var round = LlmProvider.StreamAccumulator.builder()
+                .usage(new Usage(100, 10, 110, 0, 0, 0))
+                .promptTokenEstimate(new TokenUsageEstimator.ChatRequestTokens(
+                        40, 5, 45, "cl100k_base", false))
+                .completionTokenEstimate(new TokenUsageEstimator.TokenCount(
+                        12, "cl100k_base", false))
+                .build();
+
+        t.addRound(round);
+
+        assertTrue(t.hasProviderUsage());
+        assertTrue(t.hasJtokkitUsage());
+        assertEquals(100, t.promptTokens(), "provider usage remains authoritative");
+        assertEquals(45, t.jtokkitPromptTokens());
+        assertEquals(45, t.lastJtokkitPromptTokens());
+        assertEquals(12, t.jtokkitCompletionTokens());
+        assertEquals(57, t.jtokkitTotalTokens());
+    }
+
+    @Test
+    void turnUsageAccumulatesReasoningCharsAndDetectedFlagAcrossRounds() {
+        var t = new LlmProvider.TurnUsage();
+        var round1 = LlmProvider.StreamAccumulator.builder().reasoningDetected(true).build();
+        round1.appendReasoningText("First round reasoning text");    // 26 chars
+        t.addRound(round1);
+
+        var round2 = LlmProvider.StreamAccumulator.builder().reasoningDetected(true).build();
+        round2.appendReasoningText("second round thinking");         // 21 chars
+        t.addRound(round2);
+
+        assertTrue(t.reasoningDetected());
+        assertEquals(47, t.reasoningChars());
+    }
+
+    // --- buildUsageJson output ---
+
+    @Test
+    void buildUsageJsonSumsAllDimensionsAcrossRounds() {
+        // Simulates a two-round tool-using turn on Claude 3.7 Sonnet where
+        // round 1 was the brief "call the tool" thinking and round 2 was
+        // the 800-token synthesis. Pre-JCLAW-76 the emitted JSON reported
+        // only round 1's numbers (10 prompt, 5 reasoning, 10 completion).
+        var turn = new LlmProvider.TurnUsage();
+        turn.addRound(roundWithUsage(new Usage(100, 10, 110, 5, 0, 0)));
+        turn.addRound(roundWithUsage(new Usage(200, 800, 1000, 15, 0, 0)));
+
+        var json = UsageMetricsBuilder.buildUsageJson(turn, null, System.currentTimeMillis(), null, null);
+        var obj = JsonParser.parseString(json).getAsJsonObject();
+
+        assertEquals(300, obj.get("prompt").getAsInt());
+        assertEquals(200, obj.get("lastPrompt").getAsInt(), "JCLAW-1201: the meter's fill is the final call");
+        assertEquals(810, obj.get("completion").getAsInt());
+        assertEquals(1110, obj.get("total").getAsInt());
+        assertEquals(20, obj.get("reasoning").getAsInt());
+    }
+
+    @Test
+    void buildUsageJsonSingleRoundIsUnchangedFromPreFixBehavior() {
+        // AC5 regression guard: a turn with zero tool rounds must produce
+        // byte-equivalent numbers to pre-fix behaviour. Everything lines up
+        // with round 1's numbers because there are no later rounds to fold.
+        var turn = new LlmProvider.TurnUsage();
+        turn.addRound(roundWithUsage(new Usage(500, 300, 800, 50, 100, 0)));
+
+        var json = UsageMetricsBuilder.buildUsageJson(turn, null, System.currentTimeMillis(), null, null);
+        var obj = JsonParser.parseString(json).getAsJsonObject();
+
+        assertEquals(500, obj.get("prompt").getAsInt());
+        assertEquals(300, obj.get("completion").getAsInt());
+        assertEquals(800, obj.get("total").getAsInt());
+        assertEquals(50, obj.get("reasoning").getAsInt());
+        assertEquals(100, obj.get("cached").getAsInt());
+    }
+
+    @Test
+    void buildUsageJsonOmitsTokenFieldsWhenNoProviderUsage() {
+        // When no round returned Usage (e.g. cancelled pre-first-chunk), the
+        // emitted JSON drops to a compact durationMs-only shape so the
+        // frontend stats pills stay in a valid "no usage info" state instead
+        // of misleading zero counts.
+        var turn = new LlmProvider.TurnUsage();
+        turn.addRound(roundWithUsage(null));
+
+        var json = UsageMetricsBuilder.buildUsageJson(turn, null, System.currentTimeMillis(), null, null);
+        assertFalse(json.contains("\"prompt\""), "no prompt field when zero usage: " + json);
+        assertFalse(json.contains("\"completion\""), "no completion field when zero usage: " + json);
+        assertTrue(json.contains("\"durationMs\""), "durationMs always present: " + json);
+    }
+
+    @Test
+    void buildUsageJsonFallsBackToJtokkitWhenProviderUsageMissing() {
+        var round = LlmProvider.StreamAccumulator.builder()
+                .promptTokenEstimate(new TokenUsageEstimator.ChatRequestTokens(
+                        20, 4, 24, "cl100k_base", false))
+                .completionTokenEstimate(new TokenUsageEstimator.TokenCount(
+                        8, "cl100k_base", false))
+                .reasoningTokenEstimate(new TokenUsageEstimator.TokenCount(
+                        3, "cl100k_base", false))
+                .reasoningDetected(true)
+                .build();
+        round.appendReasoningText("reasoning");
+
+        var turn = new LlmProvider.TurnUsage();
+        turn.addRound(round);
+
+        var json = UsageMetricsBuilder.buildUsageJson(turn, null, System.currentTimeMillis(), null, null);
+        var obj = JsonParser.parseString(json).getAsJsonObject();
+
+        assertEquals(24, obj.get("prompt").getAsInt());
+        assertEquals(8, obj.get("completion").getAsInt());
+        assertEquals(32, obj.get("total").getAsInt());
+        assertEquals(3, obj.get("reasoning").getAsInt());
+        assertEquals("jtokkit", obj.get("usageSource").getAsString());
+        assertTrue(obj.get("estimated").getAsBoolean());
+        assertEquals(24, obj.get("jtokkitPrompt").getAsInt());
+        assertEquals("cl100k_base", obj.get("jtokkitEncoding").getAsString());
+    }
+
+    @Test
+    void buildUsageJsonFallsBackToReasoningCharsWhenReasoningTokensZero() {
+        // Several providers (Ollama Cloud on glm-5.1, some OpenRouter routes)
+        // stream reasoning text but omit reasoning_tokens in the usage block.
+        // The helper falls back to a char-count estimate (~4 chars per token)
+        // so the reasoning badge stays truthy. This case also exercises the
+        // cumulative reasoningChars across rounds.
+        var turn = new LlmProvider.TurnUsage();
+
+        var round1 = LlmProvider.StreamAccumulator.builder()
+                .usage(new Usage(100, 10, 110, 0, 0, 0))  // reasoning_tokens = 0
+                .reasoningDetected(true)
+                .build();
+        round1.appendReasoningText("A".repeat(200));
+        turn.addRound(round1);
+
+        var round2 = LlmProvider.StreamAccumulator.builder()
+                .usage(new Usage(150, 400, 550, 0, 0, 0))  // reasoning_tokens = 0
+                .reasoningDetected(true)
+                .build();
+        round2.appendReasoningText("B".repeat(100));
+        turn.addRound(round2);
+
+        var json = UsageMetricsBuilder.buildUsageJson(turn, null, System.currentTimeMillis(), null, null);
+        var obj = JsonParser.parseString(json).getAsJsonObject();
+
+        // 300 chars / 4 chars-per-token, rounded up = 75
+        assertEquals(75, obj.get("reasoning").getAsInt());
+    }
+
+    @Test
+    void reasoningDurationMatchesFrontendLiveSemantics_singleRound() {
+        // The persisted "Thought for X seconds" must equal what the user saw
+        // streaming live — first reasoning chunk → first content chunk of the
+        // turn. For a single-round turn that's just the round's own
+        // appendReasoningText → noteFirstContentChunk span.
+        var round = LlmProvider.StreamAccumulator.builder()
+                .usage(new Usage(100, 10, 110, 5, 0, 0))
+                .build();
+        round.appendReasoningText("thinking");
+        try { Thread.sleep(2); } catch (InterruptedException _) {}
+        round.noteFirstContentChunk();
+
+        var turn = new LlmProvider.TurnUsage();
+        turn.addRound(round);
+
+        var json = UsageMetricsBuilder.buildUsageJson(turn, null, System.currentTimeMillis(), null, null);
+        var obj = JsonParser.parseString(json).getAsJsonObject();
+
+        assertTrue(obj.has("reasoningDurationMs"), "duration field present for single-round turn: " + json);
+        var persisted = obj.get("reasoningDurationMs").getAsLong();
+        assertTrue(persisted >= 1L, "reasoning span must be >= 1ms, got " + persisted);
+    }
+
+    @Test
+    void reasoningDurationSpansToolGapBetweenRounds() {
+        // The actual bug: tool-using turns showed 1.23s persisted vs 9.60s
+        // live because the persisted value was anchored to round 1's
+        // reasoning span only, missing the tool-execution gap and any
+        // subsequent rounds. Now the turn-level measurement runs from the
+        // first reasoning chunk of round 1 to the first content chunk of
+        // whatever round eventually emits content.
+        var round1 = LlmProvider.StreamAccumulator.builder()
+                .usage(new Usage(100, 0, 100, 5, 0, 0))
+                .build();
+        round1.appendReasoningText("planning the search");
+        // round 1 emits no content (only tool calls fire in real flows)
+
+        var turn = new LlmProvider.TurnUsage();
+        turn.addRound(round1);
+        var round1ReasoningEnd = round1.reasoningEndNanos();
+
+        // Simulate tool execution gap — far longer than the in-round
+        // reasoning span, so round-1-anchored timing would massively
+        // underreport the user-perceived wait.
+        try { Thread.sleep(20); } catch (InterruptedException _) {}
+
+        var round2 = LlmProvider.StreamAccumulator.builder()
+                .usage(new Usage(150, 50, 200, 0, 0, 0))
+                .build();
+        round2.noteFirstContentChunk();   // round 2 streams content directly
+        turn.addRound(round2);
+
+        var json = UsageMetricsBuilder.buildUsageJson(turn, null, System.currentTimeMillis(), null, null);
+        var obj = JsonParser.parseString(json).getAsJsonObject();
+
+        assertTrue(obj.has("reasoningDurationMs"), "duration field present: " + json);
+        var persisted = obj.get("reasoningDurationMs").getAsLong();
+        var roundLocal = (round1ReasoningEnd - round1.reasoningStartNanos()) / 1_000_000L;
+        assertTrue(persisted >= 20L,
+                "turn-level duration must include the inter-round gap (>= 20ms), got " + persisted);
+        assertTrue(persisted > roundLocal + 10L,
+                "turn-level duration (" + persisted + "ms) must exceed round-1-only duration ("
+                        + roundLocal + "ms) by at least the gap");
+    }
+
+    @Test
+    void reasoningDurationFallsBackToTurnEndWhenNoContentEverStreams() {
+        // Reasoning-only response (some providers, or tool-only turns where
+        // no content ever streams). Per-frontend convention the timer stops
+        // at stream completion; backend equivalent uses the turnEndNanos
+        // passed by buildUsageJson at end-of-turn.
+        var round = LlmProvider.StreamAccumulator.builder()
+                .usage(new Usage(50, 0, 50, 5, 0, 0))
+                .build();
+        round.appendReasoningText("thought but never emitted content");
+
+        var turn = new LlmProvider.TurnUsage();
+        turn.addRound(round);
+
+        try { Thread.sleep(5); } catch (InterruptedException _) {}
+        var duration = turn.reasoningDurationMs(System.nanoTime());
+
+        assertTrue(duration >= 5L,
+                "reasoning-only turn must use turnEndNanos as fallback; got " + duration);
+    }
+
+    @Test
+    void noteFirstContentChunkIsIdempotentSoEmptyContentChunksDontCollapseDuration() {
+        // Regression for the v0.10.30 bug: OpenAI-compatible providers emit
+        // chunks where the `content` field is always present in the schema
+        // and defaults to "" when the chunk only carries reasoning. The
+        // streaming callback's outer guard now skips empty-content chunks,
+        // but verify here that even if noteFirstContentChunk DID fire on
+        // the same instant as appendReasoningText, the idempotency check
+        // protects subsequent (real) content chunks from re-stamping
+        // firstContentNanos. This ensures the actual "first non-empty
+        // content" instant wins.
+        var acc = new LlmProvider.StreamAccumulator();
+        // Simulate the racy pattern: reasoning chunk and a hypothetical
+        // empty-content stamp landing in the same nanosecond.
+        acc.appendReasoningText("reasoning");
+        acc.noteFirstContentChunk();   // first call records this instant
+        var earlyContentNanos = acc.firstContentNanos();
+
+        try { Thread.sleep(5); } catch (InterruptedException _) {}
+        acc.noteFirstContentChunk();   // second call MUST be idempotent
+
+        assertEquals(earlyContentNanos, acc.firstContentNanos(),
+                "noteFirstContentChunk must record only the first call's instant");
+    }
+
+    @Test
+    void roundLocalReasoningDurationStillUsesLastReasoningChunkForMultiChunk() {
+        // Defensive: the per-round reasoningDurationMs (kept for diagnostic
+        // use) anchors to the last appendReasoningText call. noteFirstContentChunk
+        // must not push reasoningEndNanos forward when reasoning was already
+        // multi-chunk (would over-report by the gap to first content).
+        var acc = new LlmProvider.StreamAccumulator();
+        acc.appendReasoningText("first");
+        try { Thread.sleep(2); } catch (InterruptedException _) {}
+        acc.appendReasoningText("second");
+        var durationBeforeBookend = acc.reasoningDurationMs();
+        assertTrue(durationBeforeBookend >= 1L, "setup sanity: multi-chunk reasoning >= 1ms");
+
+        try { Thread.sleep(5); } catch (InterruptedException _) {}
+        acc.noteFirstContentChunk();
+
+        assertEquals(durationBeforeBookend, acc.reasoningDurationMs(),
+                "bookend must not extend reasoningEndNanos when reasoning was multi-chunk");
+    }
+
+    @Test
+    void buildUsageJsonIncludesModelPricingWhenProvided() {
+        // ModelInfo carries per-token pricing that the frontend multiplies
+        // against token counts to render the $ badge. Pricing fields ride
+        // into the same usage JSON object so the frontend gets everything
+        // it needs in one payload.
+        var turn = new LlmProvider.TurnUsage();
+        turn.addRound(roundWithUsage(new Usage(1000, 500, 1500, 0, 0, 0)));
+
+        var model = new ModelInfo("test-model", "Test", 128000, 4096, false,
+                3.0, 15.0, 0.30, 3.75);
+
+        var json = UsageMetricsBuilder.buildUsageJson(turn, model, System.currentTimeMillis(), null, null);
+        var obj = JsonParser.parseString(json).getAsJsonObject();
+
+        assertEquals(3.0, obj.get("promptPrice").getAsDouble(), 0.001);
+        assertEquals(15.0, obj.get("completionPrice").getAsDouble(), 0.001);
+    }
+
+    @Test
+    void buildUsageJsonPersistsModelIdentityAndContextWindow() {
+        // JCLAW-107: each emitted message carries the agent's modelProvider +
+        // modelId plus the model's contextWindow so JCLAW-108's per-conversation
+        // cost aggregator can attribute every turn's cost to the model that
+        // actually ran it — without re-resolving provider config at read time.
+        var turn = new LlmProvider.TurnUsage();
+        turn.addRound(roundWithUsage(new Usage(1000, 500, 1500, 0, 0, 0)));
+        var model = new ModelInfo("flash-preview", "Google Flash Preview", 128000, 8192, false,
+                0.30, 2.50, 0.08, 0.38);
+
+        var agent = new models.Agent();
+        agent.modelProvider = "openrouter";
+        agent.modelId = "flash-preview";
+
+        var json = UsageMetricsBuilder.buildUsageJson(turn, model, System.currentTimeMillis(), agent, null);
+        var obj = JsonParser.parseString(json).getAsJsonObject();
+
+        assertEquals("openrouter", obj.get("modelProvider").getAsString());
+        assertEquals("flash-preview", obj.get("modelId").getAsString());
+        assertEquals(128000, obj.get("contextWindow").getAsInt());
+        // Pricing fields remain alongside the new identity fields.
+        assertEquals(0.30, obj.get("promptPrice").getAsDouble(), 0.001);
+    }
+
+    @Test
+    void buildUsageJsonWritesResolvedOverrideValuesWhenConversationOverridesSet() {
+        // JCLAW-108: when the conversation has a model override, the emitted
+        // usageJson must attribute the turn to the OVERRIDE's modelProvider +
+        // modelId, not the agent's underlying fields. This is what makes
+        // per-turn cost attribution correct across mid-conversation switches.
+        var turn = new LlmProvider.TurnUsage();
+        turn.addRound(roundWithUsage(new Usage(1000, 500, 1500, 0, 0, 0)));
+        var model = new ModelInfo("override-model", "Override", 100000, 4096, false,
+                1.0, 2.0, 0.1, 0.2);
+
+        var agent = new models.Agent();
+        agent.modelProvider = "agent-provider";
+        agent.modelId = "agent-model";
+
+        var conversation = new models.Conversation();
+        conversation.modelProviderOverride = "override-provider";
+        conversation.modelIdOverride = "override-model";
+
+        var json = UsageMetricsBuilder.buildUsageJson(turn, model, System.currentTimeMillis(), agent, conversation);
+        var obj = JsonParser.parseString(json).getAsJsonObject();
+
+        assertEquals("override-provider", obj.get("modelProvider").getAsString(),
+                "override provider wins over agent's: " + json);
+        assertEquals("override-model", obj.get("modelId").getAsString(),
+                "override model wins over agent's: " + json);
+    }
+
+    @Test
+    void buildUsageJsonFallsBackToAgentWhenOverrideIsHalfSet() {
+        // Defensive: if only one of the two override columns is non-null,
+        // treat it as no-override (writing a half-override is undefined per
+        // ConversationService.setModelOverride). The resolved identity comes
+        // from the agent.
+        var turn = new LlmProvider.TurnUsage();
+        turn.addRound(roundWithUsage(new Usage(100, 50, 150, 0, 0, 0)));
+
+        var agent = new models.Agent();
+        agent.modelProvider = "agent-provider";
+        agent.modelId = "agent-model";
+
+        var conversation = new models.Conversation();
+        conversation.modelProviderOverride = "only-provider-set";
+        // modelIdOverride intentionally null
+
+        var json = UsageMetricsBuilder.buildUsageJson(turn, null, System.currentTimeMillis(), agent, conversation);
+        var obj = JsonParser.parseString(json).getAsJsonObject();
+
+        assertEquals("agent-provider", obj.get("modelProvider").getAsString());
+        assertEquals("agent-model", obj.get("modelId").getAsString());
+    }
+
+    @Test
+    void buildUsageJsonOmitsIdentityFieldsWhenAgentIsNull() {
+        // Defensive: AgentRunner passes a non-null agent in practice, but the
+        // helper must tolerate a null agent (e.g. pure-logic tests) without
+        // NPE. Missing modelProvider/modelId in the output is a clearer
+        // signal than a synthesized default.
+        var turn = new LlmProvider.TurnUsage();
+        turn.addRound(roundWithUsage(new Usage(100, 50, 150, 0, 0, 0)));
+
+        var json = UsageMetricsBuilder.buildUsageJson(turn, null, System.currentTimeMillis(), null, null);
+        var obj = JsonParser.parseString(json).getAsJsonObject();
+
+        assertFalse(obj.has("modelProvider"), "no modelProvider field when agent is null: " + json);
+        assertFalse(obj.has("modelId"), "no modelId field when agent is null: " + json);
+    }
+
+    // --- JCLAW-1147: provider-specific metrics ---
+
+    private static Usage usageWithMetrics(Map<String, Double> metrics) {
+        return new Usage(10, 5, 15, 0, 0, 0, 0d, new ProviderMetrics(metrics));
+    }
+
+    @Test
+    void turnUsageSumsProviderMetricsKeyWise() {
+        // Every field collected is additive per round, which is the premise that lets
+        // the turn total be a plain sum — a tool-using turn runs several rounds.
+        var t = new LlmProvider.TurnUsage();
+        t.addRound(roundWithUsage(usageWithMetrics(Map.of(
+                "cost_details.upstream_inference_cost", 0.0001,
+                "prompt_tokens_details.audio_tokens", 4d))));
+        t.addRound(roundWithUsage(usageWithMetrics(Map.of(
+                "cost_details.upstream_inference_cost", 0.0002))));
+
+        var summed = t.providerMetrics().values();
+        assertEquals(0.0003, summed.get("cost_details.upstream_inference_cost"), 1e-9);
+        assertEquals(4d, summed.get("prompt_tokens_details.audio_tokens"), 1e-9,
+                "a key present in only one round must survive the fold");
+    }
+
+    @Test
+    void turnUsageProviderMetricsStayEmptyWhenNoProviderReportsAny() {
+        var t = new LlmProvider.TurnUsage();
+        t.addRound(roundWithUsage(new Usage(100, 10, 110, 5, 20, 0)));
+        assertTrue(t.providerMetrics().isEmpty(),
+                "a provider that reports nothing extra must not manufacture an empty map entry");
+    }
+
+    @Test
+    void buildUsageJsonNestsProviderMetricsUnderTheirOwnKey() {
+        // Nested rather than flattened: a provider adding a field named like a
+        // first-class usage key must not be able to overwrite it.
+        var t = new LlmProvider.TurnUsage();
+        t.addRound(roundWithUsage(usageWithMetrics(Map.of(
+                "cost_details.upstream_inference_cost", 0.0001705))));
+
+        var obj = JsonParser.parseString(
+                UsageMetricsBuilder.buildUsageJson(t, null, System.currentTimeMillis(), null, null))
+                .getAsJsonObject();
+
+        assertTrue(obj.has("providerMetrics"), "providerMetrics must be emitted: " + obj);
+        assertEquals(0.0001705,
+                obj.getAsJsonObject("providerMetrics").get("cost_details.upstream_inference_cost").getAsDouble(),
+                1e-12);
+    }
+
+    @Test
+    void buildUsageJsonOmitsProviderMetricsWhenThereAreNone() {
+        // Absent, not an empty object — same rule costUsd follows, so a reader can tell
+        // "provider said nothing" from "provider said zero".
+        var t = new LlmProvider.TurnUsage();
+        t.addRound(roundWithUsage(new Usage(100, 10, 110, 5, 20, 0)));
+
+        var obj = JsonParser.parseString(
+                UsageMetricsBuilder.buildUsageJson(t, null, System.currentTimeMillis(), null, null))
+                .getAsJsonObject();
+
+        assertFalse(obj.has("providerMetrics"), "no metrics means no key at all: " + obj);
+    }
+
+    @Test
+    void usageConstructorsWithoutMetricsDefaultToEmpty() {
+        // AC4: the pre-JCLAW-1147 construction sites must keep compiling AND keep
+        // producing a non-null map, so no reader has to null-check.
+        assertTrue(new Usage(1, 2, 3, 0, 0, 0).providerMetrics().isEmpty());
+        assertTrue(new Usage(1, 2, 3, 0, 0, 0, 1.5d).providerMetrics().isEmpty());
+        assertTrue(new Usage(1, 2, 3, 0, 0, 0, 1.5d, null).providerMetrics().isEmpty(),
+                "an explicit null must normalise rather than propagate");
+    }
+
+    // --- Helpers ---
+
+    private static LlmProvider.StreamAccumulator roundWithUsage(Usage u) {
+        return LlmProvider.StreamAccumulator.builder().usage(u).build();
+    }
+}

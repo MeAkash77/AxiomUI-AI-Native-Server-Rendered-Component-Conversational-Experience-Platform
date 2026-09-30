@@ -1,0 +1,111 @@
+package services;
+
+import llm.routing.RoutedTurn;
+import models.Agent;
+import models.Conversation;
+import org.jspecify.annotations.Nullable;
+
+/**
+ * Single source of truth for the (provider, modelId) pair driving a given
+ * turn. The agent carries the default; a {@link Conversation} may carry an
+ * override that takes precedence for its own turns. Two override columns
+ * exist (provider + id) and the resolver treats them as a unit — either
+ * both are set (override active) or both are null (use the agent default).
+ *
+ * <p><b>Precedence.</b> When {@code conversation.modelProviderOverride} and
+ * {@code conversation.modelIdOverride} are both non-null, those values win;
+ * otherwise the resolver falls back to {@code agent.modelProvider} and
+ * {@code agent.modelId}. A half-set override (one column non-null, the
+ * other null) is undefined state — callers should write both via
+ * {@link ConversationService#setModelOverride} and clear both via
+ * {@link ConversationService#clearModelOverride}. The resolver tolerates
+ * such states defensively by treating them as "no override" rather than
+ * fishing values from across the columns.
+ *
+ * <p><b>Why one helper.</b> The same precedence rule appears in JCLAW-108
+ * ({@code /model} slash command, per-conversation override) and in
+ * JCLAW-269 (per-spawn override recorded on the child Conversation).
+ * Centralizing it means the cost-attribution dashboard (JCLAW-28), the
+ * AgentRunner LLM dispatch path, the Telegram model picker, and the slash
+ * command handlers all read the same source — no risk of a fourth call
+ * site rolling its own slightly-different copy.
+ *
+ * <p><b>Routed turns.</b> Inside a turn the model router is serving (JCLAW-1222), the pair is the
+ * model the router chose for that conversation rather than the stored {@code router/auto}, so every
+ * helper of the turn sizes, prompts and records for the model actually on the wire.
+ */
+public final class ModelOverrideResolver {
+
+    private ModelOverrideResolver() {}
+
+    /**
+     * The resolved (provider, modelId) pair for a turn.
+     *
+     * @param provider provider name; {@code null} when neither the
+     *                 conversation override nor the agent default supplies
+     *                 a value (callers surface a
+     *                 "no LLM provider configured" error)
+     * @param modelId  model id; same null semantics as {@code provider}
+     */
+    public record Resolved(@Nullable String provider, @Nullable String modelId) {}
+
+    /**
+     * Resolve the effective provider + model id. Null-safe on both arguments
+     * so legacy callers and test fixtures that don't thread a conversation
+     * (or an agent) keep working.
+     */
+    public static Resolved resolve(@Nullable Conversation conversation, @Nullable Agent agent) {
+        return new Resolved(provider(conversation, agent), modelId(conversation, agent));
+    }
+
+    /** Effective provider name. See {@link #resolve} for precedence. */
+    public static @Nullable String provider(@Nullable Conversation conversation, @Nullable Agent agent) {
+        var routed = RoutedTurn.current(conversation);
+        if (routed != null) return routed.active().provider();
+        if (conversation != null && hasOverride(conversation)) {
+            return conversation.modelProviderOverride;
+        }
+        return agent != null ? agent.modelProvider : null;
+    }
+
+    /**
+     * Effective thinking mode (JCLAW-1196): the conversation's override when set —
+     * {@link Conversation#THINKING_OFF} resolving to {@code null} — else the agent's
+     * default. Callers still intersect the result with the model's advertised levels.
+     */
+    public static @Nullable String thinkingMode(@Nullable Conversation conversation, @Nullable Agent agent) {
+        if (conversation != null && conversation.thinkingModeOverride != null) {
+            return Conversation.THINKING_OFF.equals(conversation.thinkingModeOverride)
+                    ? null : conversation.thinkingModeOverride;
+        }
+        return agent != null ? agent.thinkingMode : null;
+    }
+
+    /** True when the conversation carries a thinking override, including an explicit off. */
+    public static boolean hasThinkingOverride(@Nullable Conversation conversation) {
+        return conversation != null && conversation.thinkingModeOverride != null;
+    }
+
+    /** Effective model id. See {@link #resolve} for precedence. */
+    public static @Nullable String modelId(@Nullable Conversation conversation, @Nullable Agent agent) {
+        var routed = RoutedTurn.current(conversation);
+        if (routed != null) return routed.active().modelId();
+        if (conversation != null && hasOverride(conversation)) {
+            return conversation.modelIdOverride;
+        }
+        return agent != null ? agent.modelId : null;
+    }
+
+    /**
+     * True when the conversation carries a fully-populated override (both
+     * columns non-null). Exposed for UI surfaces (Telegram picker, slash
+     * command status output) that need to distinguish "override active"
+     * from "inheriting from agent" — the resolved values alone don't
+     * reveal which side won.
+     */
+    public static boolean hasOverride(@Nullable Conversation conversation) {
+        return conversation != null
+                && conversation.modelProviderOverride != null
+                && conversation.modelIdOverride != null;
+    }
+}

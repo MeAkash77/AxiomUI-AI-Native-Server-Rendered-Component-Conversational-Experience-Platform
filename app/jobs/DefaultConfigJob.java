@@ -1,0 +1,552 @@
+package jobs;
+
+import agents.AgentRunner;
+import agents.SkillLoader;
+import agents.ToolResultVerifier;
+import models.Agent;
+import models.Config;
+import play.Logger;
+import play.jobs.Job;
+import play.jobs.OnApplicationStart;
+import services.AgentService;
+import services.ConfigService;
+import services.EventLogger;
+import services.FetchSidecarManager;
+import services.InternalApiTokenService;
+import services.SkillPromotionService;
+import services.StealthSidecarManager;
+import services.Tx;
+import services.UvProbe;
+import services.decision.DecisionSettings;
+import services.scanners.ScannerRegistry;
+import services.transcription.AsrModel;
+import services.transcription.FfmpegProbe;
+import services.tts.TtsEngine;
+import services.tts.TtsModel;
+import tools.ShellExecTool;
+import tools.SubagentSpawnTool;
+import tools.SubagentYieldTool;
+import tools.scrape.DataImpulsePlans;
+import tools.scrape.WebScrapeSettings;
+import utils.HttpFactories;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.util.List;
+
+/**
+ * Seeds default runtime configuration and default agent on first startup.
+ * Only writes values that don't already exist.
+ *
+ * <p>Runs near-FIRST among {@code @OnApplicationStart} jobs ({@code priority =
+ * -100}; play1 1.13.27+ runs startup jobs in ascending priority order). Config
+ * is the boot foundation: {@code ToolRegistrationJob}, the Ollama/LM-Studio
+ * probes, and {@code TelegramStreamingRecoveryJob} all read config at startup,
+ * so seeding it before they run makes those previously-implicit ordering
+ * dependencies explicit. (The columns those readers touch are created by
+ * Hibernate's {@code ddl=update} at SessionFactory init, which completes
+ * before any {@code @OnApplicationStart} job runs.)
+ */
+@OnApplicationStart(priority = -100)
+public class DefaultConfigJob extends Job<Void> {
+
+    private static final String EVENT_CATEGORY_AGENT = "agent";
+    private static final String EVENT_CATEGORY_SYSTEM = "system";
+    private static final String CONFIG_VALUE_FALSE = "false";
+
+    @Override
+    public void doJob() {
+        seedProviders();
+        seedToolConfig();
+        seedDefaultAgent();
+        seedJClawApiTooling();
+        seedDispatcherTuning();
+        seedTranscription();
+        seedVideoGen();
+        SkillLoader.syncSkillConfigs();
+        HttpFactories.applyDispatcherConfig();
+        // JCLAW-163: prime the ffmpeg cache so the Settings UI can render a
+        // "ffmpeg missing" banner without paying the probe cost on first
+        // page load. Cheap (~ms when ffmpeg is present, ~tens of ms when not).
+        FfmpegProbe.probe();
+        // JCLAW-226: prime the uv-availability cache so the Settings UI can render
+        // a "uv missing" banner for local image generation without paying the probe
+        // cost on first page load (cheap; same rationale as FfmpegProbe above).
+        UvProbe.probe();
+        EventLogger.info(EVENT_CATEGORY_SYSTEM, "Default configuration seeded");
+    }
+
+    /**
+     * JCLAW-163: seed the local Whisper model selection so the Settings UI
+     * has a defined default to display, and the writer (JCLAW-165) has a
+     * non-null model to ensure-available before the first audio attachment
+     * lands.
+     */
+    private void seedTranscription() {
+        // JCLAW-164: provider defaults to whisper-local; the cloud backends (JCLAW-162) are
+        // switched on via Settings → Transcription once an OpenRouter / OpenAI API key is configured.
+        seedIfAbsent("transcription.provider", "whisper-local");
+        // JCLAW-654: diarization is cloud-only — an audio-capable chat model
+        // chosen in Settings; empty means "not configured" and the diarize
+        // tool explains what to set up.
+        seedIfAbsent("transcription.diarization.provider", "");
+        seedIfAbsent("transcription.diarization.model", "");
+        final String localModelKey = "transcription.localModel";
+        seedIfAbsent(localModelKey, AsrModel.DEFAULT.id());
+        // Coerce a stored selection that's no longer a valid AsrModel — e.g. the
+        // retired English-only base.en/small.en/medium.en — back to the default,
+        // so the Settings dropdown and the runtime don't disagree on a dead id.
+        var storedLocalModel = ConfigService.get(localModelKey);
+        if (storedLocalModel != null && !storedLocalModel.isBlank()
+                && AsrModel.byId(storedLocalModel).isEmpty()) {
+            ConfigService.set(localModelKey, AsrModel.DEFAULT.id());
+        }
+
+        // TTS / read-aloud (JCLAW-789/793). The operator picks the engine in
+        // Settings > Speech and can switch at will; TtsRouter reads these keys
+        // per request. Sidecar (Qwen3-TTS/Kokoro) is the quality-first default;
+        // JVM-native (sherpa-onnx) is the no-sidecar alternative. The sidecar
+        // port is seeded EXPLICITLY so the client and the spawned daemon agree —
+        // ASR omits its port seed and only works because both sides share the
+        // LocalSidecarDaemon default, a latent gap we don't repeat here.
+        seedIfAbsent("tts.engine", TtsEngine.DEFAULT.id());
+        seedIfAbsent("tts.local.port", "9531");
+        seedIfAbsent("tts.sidecar.model", TtsModel.defaultFor(TtsEngine.SIDECAR).id());
+        seedIfAbsent("tts.jvm.model", TtsModel.defaultFor(TtsEngine.JVM).id());
+    }
+
+    /**
+     * JCLAW-230: seed the video-generation job timeout so the Settings UI (JCLAW-236) has a defined
+     * default and {@code jobs.VideoGenerationJobRunner} times jobs out at a known bound. Provider
+     * selection ({@code videogen.provider}) and model stay unset until the operator opts in.
+     */
+    private void seedVideoGen() {
+        seedIfAbsent("videogen.maxJobMinutes", "30");
+    }
+
+    /**
+     * Auto-tune the OkHttp LLM dispatcher caps based on host CPU. The static
+     * defaults in {@link utils.HttpFactories} (64 per host, 128 total) are
+     * a safe floor for any machine; on bigger hosts we want more headroom.
+     * Formula is {@code clamp(8 * cores, 64, 256)} per host with total set
+     * to twice that — 8 in-flight per core is OkHttp's typical sizing for
+     * I/O-bound work, the floor matches the static default so no host
+     * loses capacity, and the ceiling caps socket/buffer footprint.
+     *
+     * <p>Only seeds if the key is absent so an operator override via
+     * Settings persists across restarts.
+     */
+    private void seedDispatcherTuning() {
+        int cores = Runtime.getRuntime().availableProcessors();
+        int defaultPerHost = Math.clamp(8L * cores, 64, 256);
+        int defaultMax = 2 * defaultPerHost;
+        seedIfAbsent("dispatcher.llm.maxRequestsPerHost", String.valueOf(defaultPerHost));
+        seedIfAbsent("dispatcher.llm.maxRequests", String.valueOf(defaultMax));
+    }
+
+    private void seedProviders() {
+        seedIfAbsent("provider.ollama-cloud.baseUrl", "https://ollama.com/v1");
+        seedIfAbsent("provider.ollama-cloud.apiKey", "");
+        seedIfAbsent("provider.ollama-cloud.leaderboardUrl", "");
+        // Ollama's /v1 endpoint accepts reasoning_effort: low|medium|high (plus "none",
+        // which we model on the client side as null). Kimi and Qwen both expose the
+        // full gradient; OpenAI-style providers may add "minimal"/"xhigh" for their
+        // effort-based models (GPT-5, Grok) — seed those per-model when applicable.
+        seedIfAbsent("provider.ollama-cloud.models", """
+                [{"id":"qwen3.5","name":"Qwen 3.5","contextWindow":262144,"maxTokens":65535,"supportsThinking":true,"thinkingLevels":["low","medium","high"]},\
+                {"id":"kimi-k2.5","name":"Kimi K2.5","contextWindow":262144,"maxTokens":65535,"supportsThinking":true,"thinkingLevels":["low","medium","high"]}]""");
+
+        // JCLAW-178: ollama-local routes to OllamaProvider via the substring
+        // match in LlmProvider.forConfig — no new provider class needed. The
+        // apiKey is a non-blank sentinel because ProviderRegistry.refreshInner
+        // skips rows with a blank apiKey, and local Ollama ignores the
+        // Authorization header. models is empty so operators populate it from
+        // the Settings UI's discovery flow against their own pulled models.
+        seedIfAbsent("provider.ollama-local.baseUrl", "http://localhost:11434/v1");
+        seedIfAbsent("provider.ollama-local.apiKey", "ollama-local");
+        seedIfAbsent("provider.ollama-local.models", "[]");
+        // JCLAW-1102: the operator's Remote/Local classification, which ProviderLocality
+        // reads to decide whether memory text may reach a provider. Only the self-hosted
+        // four are seeded true — absent means remote, so cloud rows need no key.
+        seedIfAbsent("provider.ollama-local.local", "true");
+
+        // JCLAW-182: lm-studio falls through to OpenAiProvider via the factory
+        // default — LM Studio speaks OpenAI-compatible /v1/chat/completions on
+        // localhost:1234 and accepts any non-blank Authorization. Same
+        // sentinel-apiKey trick as ollama-local so ProviderRegistry registers
+        // the row out of the box.
+        seedIfAbsent("provider.lm-studio.baseUrl", "http://localhost:1234/v1");
+        seedIfAbsent("provider.lm-studio.apiKey", "lm-studio");
+        seedIfAbsent("provider.lm-studio.models", "[]");
+        seedIfAbsent("provider.lm-studio.local", "true");
+
+        // vLLM (self-hosted): OpenAI-compatible /v1/chat/completions + /v1/models, the same factory
+        // default (OpenAiProvider) and discovery path (OpenAI-compat /v1/models) as lm-studio. Default
+        // serving port is 8000. Same non-blank sentinel apiKey so ProviderRegistry registers the row
+        // (vLLM ignores Authorization unless --api-key was set, in which case the operator overrides
+        // this). Backs the Settings → Video Interpretation "vLLM" backend.
+        seedIfAbsent("provider.vllm.baseUrl", "http://localhost:8000/v1");
+        seedIfAbsent("provider.vllm.apiKey", "vllm");
+        seedIfAbsent("provider.vllm.models", "[]");
+        seedIfAbsent("provider.vllm.local", "true");
+
+        // llama.cpp (self-hosted llama-server): OpenAI-compatible /v1/chat/completions
+        // + /v1/models, same factory default (OpenAiProvider) and discovery path as
+        // lm-studio/vllm. Default serving port is 8080. Unlike Ollama, llama-server's
+        // OpenAI endpoint accepts input_audio content parts (base64 mp3/wav/flac via
+        // libmtmd), so it can back local audio diarization (audio is experimental
+        // upstream). Same non-blank sentinel apiKey so ProviderRegistry registers the
+        // row (llama-server ignores Authorization unless --api-key was set, which the
+        // operator then overrides).
+        seedIfAbsent("provider.llama-cpp.baseUrl", "http://localhost:8080/v1");
+        seedIfAbsent("provider.llama-cpp.apiKey", "llama-cpp");
+        seedIfAbsent("provider.llama-cpp.models", "[]");
+        seedIfAbsent("provider.llama-cpp.local", "true");
+
+        seedIfAbsent("provider.openrouter.baseUrl", "https://openrouter.ai/api/v1");
+        seedIfAbsent("provider.openrouter.apiKey", "");
+        seedIfAbsent("provider.openrouter.leaderboardUrl", "https://openrouter.ai/rankings");
+        seedIfAbsent("provider.openrouter.models", """
+                [{"id":"openai/gpt-4.1","name":"GPT-4.1","contextWindow":1047576,"maxTokens":32768},\
+                {"id":"anthropic/claude-sonnet-4-6","name":"Claude Sonnet 4.6","contextWindow":200000,"maxTokens":131072},\
+                {"id":"google/gemini-3-flash-preview","name":"Gemini 3 Flash","contextWindow":1000000,"maxTokens":65536},\
+                {"id":"deepseek/deepseek-v3.2","name":"DeepSeek V3.2","contextWindow":128000,"maxTokens":32768}]""");
+
+        // JCLAW-160: OpenAI as a first-class provider, on equal footing with
+        // OpenRouter. apiKey is seeded blank so ProviderRegistry.refreshInner
+        // skips the row until an operator pastes a key in Settings; once
+        // keyed the row enables direct-OpenAI chat plus the OpenAI Whisper
+        // transcription backend (JCLAW-162) without proxying through
+        // OpenRouter. No leaderboard or curated model list — the Settings
+        // UI's discovery flow against /v1/models populates the catalog.
+        seedIfAbsent("provider.openai.baseUrl", "https://api.openai.com/v1");
+        seedIfAbsent("provider.openai.apiKey", "");
+
+        // Black Forest Labs (Flux) — IMAGE GENERATION only (JCLAW-225), NOT a chat provider:
+        // ProviderRegistry.IMAGE_ONLY_PROVIDERS skips it for /chat/completions; the
+        // services.imagegen.BflImageGenerationClient reads these keys directly (async submit+poll
+        // with x-key auth). apiKey blank → the Image Generation Settings BFL radio stays disabled
+        // until an operator pastes a key. imagegen.provider stays unseeded (absent = off, opt-in
+        // via Settings), mirroring caption.provider.
+        seedIfAbsent("provider.bfl.baseUrl", "https://api.bfl.ai/v1");
+        seedIfAbsent("provider.bfl.apiKey", "");
+        // Replicate — also IMAGE GENERATION only (hosted models behind an async predictions API,
+        // Bearer auth). Same ProviderRegistry exclusion; ReplicateImageGenerationClient reads these.
+        seedIfAbsent("provider.replicate.baseUrl", "https://api.replicate.com/v1");
+        seedIfAbsent("provider.replicate.apiKey", "");
+        seedIfAbsent("imagegen.imageSize", "1024x1024");
+        seedIfAbsent("imagegen.timeoutSeconds", "60");
+
+        // JCLAW-226: local Flux 2 Klein engine via a Python HTTP sidecar (the shape
+        // chosen in the JCLAW-509 spike). Selection stays on imagegen.provider="flux-local"
+        // (unseeded — absent = off, opt-in via Settings, like the cloud image backends);
+        // these keys configure the sidecar that LocalImageSidecarManager launches on demand.
+        // Default model is klein 4B (Apache-2.0, ~13 GB fp16) — the smallest variant and the
+        // only one whose throughput stays tolerable on Apple Silicon (MPS). idleTimeoutMinutes
+        // lets the daemon self-evict and release the GPU when unused.
+        seedIfAbsent("imagegen.local.model", "black-forest-labs/FLUX.2-klein-4B");
+        seedIfAbsent("imagegen.local.port", "9527");
+        seedIfAbsent("imagegen.local.idleTimeoutMinutes", "15");
+        // Optional Hugging Face token, passed to the sidecar as HF_TOKEN. Blank by default —
+        // klein 4B is Apache-2.0 and downloads anonymously; a token only lifts rate limits,
+        // speeds downloads, and unlocks gated models. Masked (key name contains "token").
+        seedIfAbsent("imagegen.local.hfToken", "");
+
+        // Together AI: OpenAI-shape /v1/chat/completions plus Together's
+        // own {reasoning: {enabled: bool}} thinking knob. Routes through
+        // TogetherAiProvider via the "together" substring match in
+        // LlmProvider.forConfig. apiKey blank → row stays inactive until
+        // an operator pastes a key in Settings. No leaderboard URL
+        // (Together has no public ranking endpoint); empty model list
+        // so operators populate via the Settings UI's /v1/models
+        // discovery flow against their own enabled models.
+        seedIfAbsent("provider.together.baseUrl", "https://api.together.xyz/v1");
+        seedIfAbsent("provider.together.apiKey", "");
+        seedIfAbsent("provider.together.leaderboardUrl", "");
+        seedIfAbsent("provider.together.models", "[]");
+    }
+
+    private void seedToolConfig() {
+        // Chat settings — values reference the source constants to stay in sync
+        seedIfAbsent("chat.maxToolRounds", String.valueOf(AgentRunner.DEFAULT_MAX_TOOL_ROUNDS));
+        // JCLAW-836 stage 1: in-process tool-result checks. Default on because they
+        // cost no model call and no I/O; the skip list is the per-tool-type dial the
+        // story asks for, empty until a check is shown to misfire on some tool.
+        seedIfAbsent(ToolResultVerifier.CFG_ENABLED, "true");
+        seedIfAbsent(ToolResultVerifier.CFG_SKIP_TOOLS, "");
+        seedIfAbsent("chat.maxContextMessages", "50");
+
+        renameMovedKeys();
+
+        // JCLAW-172: playwright.enabled / playwright.headless / shell.enabled are gone (always headless,
+        // both tools register unconditionally, per-agent enable via the Tools page); the shell knobs below stay.
+
+        // OCR backends. The parse-time tunables (languages, timeout, pdf
+        // strategy) stay in conf/application.conf because they're read once
+        // per parse and don't need a UI; the user-facing on/off lives here
+        // so the Settings page OCR section can flip it. The actual binary's
+        // presence is detected at boot by jobs.TesseractProbeJob — when the
+        // probe says missing, the Settings UI grays out the toggle even if
+        // this row is "true", so the stored value tracks user intent rather
+        // than runtime availability.
+        seedIfAbsent("ocr.tesseract.enabled", "true");
+
+        // Shell execution tool — operator-tunable knobs only.
+        seedIfAbsent("shell.allowlist", ShellExecTool.DEFAULT_ALLOWLIST);
+        seedIfAbsent("shell.defaultTimeoutSeconds", "30");
+        seedIfAbsent("shell.maxTimeoutSeconds", "300");
+        seedIfAbsent("shell.maxOutputBytes", "102400");
+
+        // Web search providers — independent engines, first enabled + keyed one is used.
+        // All config lives in the Config DB (editable via Settings UI), not application.conf.
+        // See WebSearchTool.SearchProvider for the read paths that consume these values.
+        //
+        // First-run defaults: every provider is seeded `enabled=false` because each
+        // requires an operator-supplied API key (or, for Ollama, an account/key bound
+        // to the same endpoint as the chat provider). Ordering by priority is
+        // Ollama → Exa → Perplexity → Brave → Tavily → Felo, matching the seed
+        // block below; the operator enables the ones they have keys for via the
+        // Settings UI, and the first enabled+keyed provider in priority order wins.
+        // seedIfAbsent only writes when the key is absent, so this change is a
+        // no-op against existing installations — operator-tuned values are preserved.
+        seedIfAbsent("search.ollama.enabled", CONFIG_VALUE_FALSE);
+        seedIfAbsent("search.ollama.apiKey", "");
+        seedIfAbsent("search.ollama.baseUrl", "https://ollama.com/api/web_search");
+        seedIfAbsent("search.ollama.priority", "0");
+        seedIfAbsent("search.exa.enabled", CONFIG_VALUE_FALSE);
+        seedIfAbsent("search.exa.apiKey", "");
+        seedIfAbsent("search.exa.baseUrl", "https://api.exa.ai/search");
+        seedIfAbsent("search.exa.priority", "1");
+        seedIfAbsent("search.perplexity.enabled", CONFIG_VALUE_FALSE);
+        seedIfAbsent("search.perplexity.apiKey", "");
+        seedIfAbsent("search.perplexity.baseUrl", "https://api.perplexity.ai/search");
+        seedIfAbsent("search.perplexity.priority", "2");
+        // Server-side recency filter for Perplexity's /search endpoint. One of
+        // hour|day|week|month|year, or "none" to disable. Defaults to "month"
+        // so "latest X" queries don't return year-old snippets — the LLM will
+        // not reliably add year/month keywords on its own.
+        seedIfAbsent("search.perplexity.recencyFilter", "month");
+        seedIfAbsent("search.brave.enabled", CONFIG_VALUE_FALSE);
+        seedIfAbsent("search.brave.apiKey", "");
+        seedIfAbsent("search.brave.baseUrl", "https://api.search.brave.com/res/v1/web/search");
+        seedIfAbsent("search.brave.priority", "3");
+        seedIfAbsent("search.tavily.enabled", CONFIG_VALUE_FALSE);
+        seedIfAbsent("search.tavily.apiKey", "");
+        seedIfAbsent("search.tavily.baseUrl", "https://api.tavily.com/search");
+        seedIfAbsent("search.tavily.priority", "4");
+        seedIfAbsent("search.felo.enabled", CONFIG_VALUE_FALSE);
+        seedIfAbsent("search.felo.apiKey", "");
+        seedIfAbsent("search.felo.baseUrl", "https://openapi.felo.ai/v2/chat");
+        seedIfAbsent("search.felo.priority", "5");
+
+        // Malware scanners — independent hash-lookup APIs, composed under OR.
+        // Keys are seeded empty; each scanner is inert until an operator provides its key.
+        // All scanner defaults live in ScannerRegistry so registering a scanner
+        // and seeding its config stay in one place.
+        for (var entry : ScannerRegistry.defaultConfig()) {
+            seedIfAbsent(entry.key(), entry.value());
+        }
+
+        // JCLAW-266: subagent recursion caps, defaulted for a single-operator install —
+        // single level of delegation (top-level agents may spawn one tier of
+        // subagents; grandchildren are refused) and a small fan-out so one
+        // parent can't saturate the executor with concurrent children. Both
+        // keys are editable from the Settings page's Subagents section
+        // (DB-backed so changes take effect without a restart). Read path
+        // lives in tools.SubagentSpawnTool#enforceRecursionLimits.
+        seedIfAbsent(SubagentSpawnTool.DEPTH_LIMIT_KEY,
+                String.valueOf(SubagentSpawnTool.DEFAULT_DEPTH_LIMIT));
+        seedIfAbsent(SubagentSpawnTool.BREADTH_LIMIT_KEY,
+                String.valueOf(SubagentSpawnTool.DEFAULT_BREADTH_LIMIT));
+        // JCLAW-424: absolute wall-clock ceiling on a single subagent run — the
+        // runaway guard the idle budget (an active child never trips it) cannot
+        // provide. Operator-only; 0 disables. Read path lives in
+        // tools.SubagentSpawnTool#awaitFuture.
+        seedIfAbsent(SubagentSpawnTool.MAX_WALLCLOCK_KEY,
+                String.valueOf(SubagentSpawnTool.DEFAULT_MAX_WALLCLOCK_SECONDS));
+        // JCLAW-812: global defaults for the per-call runTimeoutSeconds (spawn) and
+        // timeoutSeconds (yield) args, so operators aren't stuck repeating them on
+        // every call. Call-site values still override. Editable from the Settings
+        // page's Subagents section. Read paths: SubagentSpawnTool#defaultRunTimeoutSeconds
+        // and SubagentYieldTool#defaultYieldTimeoutSeconds.
+        seedIfAbsent(SubagentSpawnTool.DEFAULT_RUN_TIMEOUT_KEY,
+                String.valueOf(SubagentSpawnTool.DEFAULT_TIMEOUT_SECONDS));
+        seedIfAbsent(SubagentYieldTool.DEFAULT_YIELD_TIMEOUT_KEY,
+                String.valueOf(SubagentYieldTool.DEFAULT_TIMEOUT_SECONDS));
+    }
+
+    private void seedDefaultAgent() {
+        if (Agent.findByName("main") == null) {
+            AgentService.create("main", "ollama-cloud", "kimi-k2.5");
+            EventLogger.info(EVENT_CATEGORY_AGENT, "main", null, "Default agent 'main' created");
+        }
+        // Non-destructive workspace fill-in: creates any missing workspace files
+        // from the Java-literal defaults without touching existing content.
+        // Since JCLAW-910 the repository ships NO workspace files — workspace/ is
+        // untracked because everything under it is operator state — so on a fresh
+        // install THIS call is what materializes main's markdown, including the
+        // default agent's shipped SOUL and IDENTITY. It also still covers a file
+        // deleted from disk post-boot. Idempotent by construction: writeFile only
+        // writes when the target is absent.
+        AgentService.createWorkspace("main");
+
+        // Bootstrap the skill-creator capability: the main agent must have
+        // skill-creator installed in its workspace on first boot so it can
+        // promote other skills into the global registry. Idempotent —
+        // copyToAgentWorkspace performs an atomic swap; re-running it is a no-op
+        // when the workspace copy is already up to date.
+        seedSkillCreatorForMain();
+    }
+
+    /**
+     * JCLAW-282: bring up the in-process JClaw API tool. Two steps:
+     * <ol>
+     *   <li>Mint (or recover) the internal bearer token so {@code jclaw_api}
+     *       can authenticate against the same auth filter that gates
+     *       external clients.</li>
+     *   <li>Install the {@code jclaw-api} skill into {@code main}'s
+     *       workspace so it surfaces in main's {@code <available_skills>}
+     *       block. Other agents don't get the skill — its installation
+     *       location <em>is</em> the gating mechanism for which agents
+     *       can use it. {@link services.SkillPromotionService#copyToAgentWorkspace}
+     *       is idempotent.</li>
+     * </ol>
+     */
+    private void seedJClawApiTooling() {
+        InternalApiTokenService.token();
+        seedJClawApiSkillForMain();
+    }
+
+    /** Mirror of {@link #seedSkillCreatorForMain} for the jclaw-api skill.
+     *  Skipped silently if the global registry doesn't ship the skill —
+     *  the tool stays callable for any agent that has it allowlisted,
+     *  but main won't see the curated SKILL.md until an operator drops
+     *  it back in. */
+    private void seedJClawApiSkillForMain() {
+        var skillName = "jclaw-api";
+        var globalSkillMd = SkillLoader.globalSkillsPath()
+                .resolve(skillName).resolve("SKILL.md");
+        if (!Files.exists(globalSkillMd)) {
+            Logger.info("jclaw-api skill not present in global registry — skipping bootstrap");
+            return;
+        }
+        var main = Agent.findByName("main");
+        if (main == null) return;
+        try {
+            SkillPromotionService.copyToAgentWorkspace(main, skillName);
+            EventLogger.info(EVENT_CATEGORY_AGENT, "main", null,
+                    "jclaw-api skill installed for main agent (in-process API access seeded)");
+        } catch (IOException e) {
+            Logger.warn("Failed to bootstrap jclaw-api skill for main: %s", e.getMessage());
+        }
+    }
+
+    /**
+     * Ensure the main agent has {@code skill-creator} installed in its workspace.
+     * Runs on every boot so a clean checkout that ships {@code skills/skill-creator/}
+     * in the global registry can still reach a state where {@code main} can promote
+     * other skills (per {@code SkillPromotionService.SKILL_CREATOR_NAME}).
+     *
+     * <p>Skipped silently when the global registry doesn't ship skill-creator
+     * (e.g. in tests that strip skills) — main is still usable for everything
+     * except promotion, and the capability gate will reject promotion attempts
+     * with an actionable error.
+     */
+    private void seedSkillCreatorForMain() {
+        var skillName = SkillPromotionService.SKILL_CREATOR_NAME;
+        var globalSkillMd = SkillLoader.globalSkillsPath()
+                .resolve(skillName).resolve("SKILL.md");
+        if (!Files.exists(globalSkillMd)) {
+            Logger.info("Skill-creator not present in global registry — skipping bootstrap");
+            return;
+        }
+        var main = Agent.findByName("main");
+        if (main == null) return;
+        try {
+            SkillPromotionService.copyToAgentWorkspace(main, skillName);
+            EventLogger.info(EVENT_CATEGORY_AGENT, "main", null,
+                    "Skill-creator installed for main agent (promotion capability seeded)");
+        } catch (IOException e) {
+            Logger.warn("Failed to bootstrap skill-creator for main: %s", e.getMessage());
+        }
+    }
+
+    private void renameMovedKeys() {
+        // Ollama keep_alive (how long the model + KV cache stays resident) moved from a
+        // global key to per-provider `provider.<name>.keepAlive`, since residency belongs
+        // to the daemon behind a provider rather than to "Ollama" as a whole. Carry the
+        // operator's old value onto ollama-local — the only provider where the setting
+        // does anything (cloud residency is server-side). Not seeded: the 5m default lives
+        // in OllamaProvider.applyCacheDirectives and the Settings row renders that
+        // fallback, so an unset key is the correct resting state.
+        renameKeyIfPresent("ollama.keepAlive", "provider.ollama-local.keepAlive");
+
+        // JCLAW-1302: the TypeSafe key moved to Decision Providers; neither consumer needs it re-entered.
+        renameKeyIfPresent(DecisionSettings.LEGACY_API_KEY, DecisionSettings.API_KEY);
+
+        // The scrape sidecars' keys moved under web_scrape.*, where Settings > Web Scraping edits them.
+        for (var sidecar : List.of("stealth", "impersonate")) {
+            for (var suffix : List.of("enabled", "port", "timeoutSeconds", "idleTimeoutMinutes",
+                    "startupTimeoutSeconds", "hfToken")) {
+                renameKeyIfPresent("scrape.%s.%s".formatted(sidecar, suffix), "web_scrape.%s.%s".formatted(sidecar, suffix));
+            }
+        }
+        renameKeyIfPresent("scrape.stealth.solveTurnstile", StealthSidecarManager.CFG_SOLVE_TURNSTILE);
+        renameKeyIfPresent("scrape.impersonate.profile", FetchSidecarManager.CFG_PROFILE);
+
+        moveDataImpulseCredentialsToAPlan();
+    }
+
+    /**
+     * JCLAW-1334: DataImpulse credentials moved from the generic proxy keys into per-plan keys. The card
+     * was always labelled residential, so a stored login becomes the Residential plan's. A no-op once a
+     * plan is set.
+     */
+    private void moveDataImpulseCredentialsToAPlan() {
+        var url = ConfigService.get(WebScrapeSettings.PROXY_URL, "");
+        var username = ConfigService.get(WebScrapeSettings.PROXY_USERNAME, "");
+        if (!DataImpulsePlans.isGateway(url) || username.isBlank()
+                || !ConfigService.get(WebScrapeSettings.PROXY_DATAIMPULSE_PLAN, "").isBlank()) {
+            return;
+        }
+        var plan = "residential";
+        var parts = DataImpulsePlans.splitUsername(username);
+        var password = ConfigService.get(WebScrapeSettings.PROXY_PASSWORD, "");
+        ConfigService.set(DataImpulsePlans.loginKey(plan), parts[0]);
+        if (!password.isBlank()) ConfigService.set(DataImpulsePlans.passwordKey(plan), password);
+        if (!parts[1].isBlank()) ConfigService.set(WebScrapeSettings.PROXY_DATAIMPULSE_TARGETING, parts[1]);
+        ConfigService.set(WebScrapeSettings.PROXY_DATAIMPULSE_PLAN, plan);
+        ConfigService.delete(WebScrapeSettings.PROXY_USERNAME);
+        ConfigService.delete(WebScrapeSettings.PROXY_PASSWORD);
+        ConfigService.clearCache();
+        EventLogger.info(EVENT_CATEGORY_SYSTEM, "DataImpulse proxy credentials moved to the Residential plan");
+    }
+
+    private void seedIfAbsent(String key, String value) {
+        if (ConfigService.get(key) == null) {
+            ConfigService.set(key, value);
+        }
+    }
+
+    /**
+     * One-shot rename: if the old key exists and the new one does not, copy the value
+     * and delete the old row. Safe to run repeatedly — becomes a no-op once migrated.
+     *
+     * <p>Retained even when no call sites exist: this is the standard utility for
+     * any future Config DB key rename, and {@code AgentSystemTest} exercises it
+     * reflectively so the contract stays covered.
+     */
+    private void renameKeyIfPresent(String oldKey, String newKey) {
+        Tx.run(() -> {
+            var oldRow = Config.findByKey(oldKey);
+            if (oldRow == null) return;
+            var newRow = Config.findByKey(newKey);
+            if (newRow == null) {
+                Config.upsert(newKey, oldRow.value);
+                EventLogger.info(EVENT_CATEGORY_SYSTEM, "Config key migrated: %s → %s".formatted(oldKey, newKey));
+            }
+            oldRow.delete();
+        });
+        ConfigService.clearCache();
+    }
+}

@@ -1,0 +1,417 @@
+package services;
+
+import com.github.kagkarlsson.scheduler.SchedulerClient;
+import com.github.kagkarlsson.scheduler.task.CompletionHandler;
+import com.github.kagkarlsson.scheduler.task.ExecutionOperations;
+import com.github.kagkarlsson.scheduler.task.TaskInstance;
+import com.github.kagkarlsson.scheduler.task.helper.CustomTask;
+import com.github.kagkarlsson.scheduler.task.helper.Tasks;
+import models.Task;
+import org.jspecify.annotations.Nullable;
+
+import java.time.Instant;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.LockSupport;
+import java.util.function.Supplier;
+
+/**
+ * db-scheduler {@link com.github.kagkarlsson.scheduler.task.Task} definition
+ * for JClaw task fires. One registered db-scheduler Task — {@link #TASK_NAME}
+ * — backs every {@link models.Task} regardless of {@link Task.Type}; the
+ * per-fire {@code task_instance} string carries the JClaw Task primary
+ * key, and the handler decodes it back to a row before invoking
+ * {@link TaskExecutor#runTask}.
+ *
+ * <h2>Self-rescheduling for CRON</h2>
+ * IMMEDIATE / SCHEDULED Tasks fire exactly once: db-scheduler's default
+ * {@code OnCompleteRemove} handler drops the {@code scheduled_tasks}
+ * row after the fire returns.
+ *
+ * <p>CRON Tasks use a custom {@link CompletionHandler} that runs
+ * <em>after</em> {@code executeOnce} completes: first
+ * {@code executionOperations.stop()} removes the current row, then a
+ * fresh {@link SchedulerClient#schedule schedule()} call inserts the
+ * next-fire row using the same {@code task_instance} id (so each
+ * JClaw Task occupies at most one row in {@code scheduled_tasks} at
+ * any time). The stop-then-schedule order matters — calling
+ * {@code schedule} while the original row still exists would trip the
+ * unique constraint on {@code (task_name, task_instance)}.
+ *
+ * <h2>Why custom over OnCompleteReschedule</h2>
+ * db-scheduler ships {@link CompletionHandler.OnCompleteReschedule}
+ * which takes a {@link com.github.kagkarlsson.scheduler.task.schedule.Schedule},
+ * and {@link com.github.kagkarlsson.scheduler.task.schedule.CronSchedule}
+ * implements {@code Schedule} for cron strings — but the Schedule has
+ * to be known at task-registration time, not at fire time. Each JClaw
+ * Task carries its own cron expression in
+ * {@link Task#cronExpression}, so we resolve the next fire instant per
+ * Task inside the handler rather than baking one schedule into the
+ * db-scheduler Task registration.
+ *
+ * <h2>Skip semantics</h2>
+ * The handler short-circuits when the JClaw Task is missing
+ * (deleted between scheduling and firing) or
+ * {@link Task.Status#CANCELLED}. {@code TaskExecutor.runTask} owns the
+ * mid-fire failure path — anything thrown out of it propagates to
+ * {@link JClawFailureHandler} which classifies the error
+ * (transient vs permanent), applies the JCLAW-21 backoff schedule on
+ * retry, and marks the Task FAILED when retries are exhausted.
+ *
+ * <p>Part of JCLAW-21's Tasks foundation.
+ */
+public final class TaskExecutionHandler {
+
+    /**
+     * The {@code task_name} column value db-scheduler stores for every
+     * JClaw task fire. Stable identifier — operator-visible in the
+     * scheduled_tasks table for diagnostics, and the lookup key both
+     * scheduling (TaskSchedulingService) and dead-execution recovery
+     * (BootConsistencyCheck) use to find this Task definition.
+     */
+    public static final String TASK_NAME = "jclaw-task-fire";
+
+    /**
+     * Static {@link SchedulerClient} handoff populated by
+     * {@code DbSchedulerBootstrapJob} once the Scheduler is built.
+     * Read by the CRON CompletionHandler when self-rescheduling the
+     * next fire. {@code volatile} because the bootstrap runs on
+     * Play's startup thread while fires run on a virtual thread from
+     * the Scheduler's executorService.
+     */
+    // S3077 targets compound mutation on volatile non-primitives. This
+    // is a pure publish-once-read-many handoff — JMM happens-before via
+    // the volatile read/write is sufficient.
+    @SuppressWarnings("java:S3077")
+    private static volatile @Nullable SchedulerClient schedulerClient;
+
+    private TaskExecutionHandler() {}
+
+    /**
+     * Wire the SchedulerClient reference. Called exactly once from
+     * {@code DbSchedulerBootstrapJob} right after the Scheduler is
+     * built and before {@code scheduler.start()}.
+     */
+    public static void setSchedulerClient(SchedulerClient client) {
+        schedulerClient = client;
+    }
+
+    /**
+     * Build the db-scheduler {@link CustomTask} definition. Returned to
+     * {@code DbSchedulerBootstrapJob} which hands it to
+     * {@code SchedulerBuilder.startTasks(...)}.
+     */
+    public static CustomTask<Void> buildTask() {
+        return Tasks.custom(TASK_NAME, Void.class)
+                .onFailure(new JClawFailureHandler())
+                .execute((inst, _) -> {
+            String instanceId = inst.getId();
+            Long jclawTaskId = parseTaskId(instanceId);
+            if (jclawTaskId == null) {
+                EventLogger.warn("task", null, null,
+                        "TaskExecutionHandler: undecodable task_instance '%s'; skipping fire"
+                                .formatted(instanceId));
+                return defaultCompletion();
+            }
+
+            Task jclawTask = findTaskWithRaceBackoff(jclawTaskId);
+            if (jclawTask == null) {
+                EventLogger.warn("task", null, null,
+                        "TaskExecutionHandler: scheduled fire arrived for missing Task id %d; skipping"
+                                .formatted(jclawTaskId));
+                return defaultCompletion();
+            }
+            if (jclawTask.status == Task.Status.CANCELLED) {
+                EventLogger.info("task",
+                        jclawTask.agent != null ? jclawTask.agent.name : null, null,
+                        "TaskExecutionHandler: Task id %d is CANCELLED; skipping fire"
+                                .formatted(jclawTaskId));
+                return defaultCompletion();
+            }
+            if (jclawTask.paused) {
+                EventLogger.info("task",
+                        jclawTask.agent != null ? jclawTask.agent.name : null, null,
+                        "TaskExecutionHandler: Task id %d is paused; skipping fire body"
+                                .formatted(jclawTaskId));
+                // Recurring Tasks still self-reschedule so the cadence
+                // resumes when {@link Task#paused} clears, without
+                // operator intervention.
+                return jclawTask.type == Task.Type.CRON || jclawTask.type == Task.Type.INTERVAL
+                        ? scheduleNextIfRecurring(jclawTask) : dropThenReArmIfResumed(jclawTask);
+            }
+
+            // JCLAW-803: dedup guard. db-scheduler revives a fire it believes
+            // dead (heartbeat stalled after a restart) and re-fires the row
+            // while the original may still be running on this JVM. Without this
+            // gate every revive opens a fresh concurrent fire, piling up zombie
+            // agent loops. Claim the Task id atomically; if a live fire already
+            // holds it here, skip the body but still re-arm the schedule. A
+            // RUNNING row orphaned by a crashed prior JVM is not claimed here,
+            // so it is still re-fired normally on recovery.
+            if (!TaskRunRegistry.tryClaimTask(jclawTaskId)) {
+                EventLogger.warn("task",
+                        jclawTask.agent != null ? jclawTask.agent.name : null, null,
+                        "TaskExecutionHandler: Task id %d already has a live fire on this node; dropping duplicate revive"
+                                .formatted(jclawTaskId));
+                // JCLAW-1103: NOT defaultCompletion. A Task holds at most one
+                // scheduled_tasks row, so removing "this" row removes the one the
+                // still-live fire is running on, stranding the Task with no schedule.
+                return scheduleNextIfRecurring(jclawTask);
+            }
+            try {
+                // Any RuntimeException propagates to JClawFailureHandler (.onFailure above),
+                // which picks retry-with-backoff vs permanent fail via TransientErrorClassifier.
+                TaskExecutor.runTask(jclawTask);
+
+                return scheduleNextIfRecurring(jclawTask);
+            } finally {
+                TaskRunRegistry.releaseTask(jclawTaskId);
+            }
+        });
+    }
+
+    /**
+     * For INTERVAL and CRON Tasks, build the
+     * {@link CompletionHandler} that drops the current row and
+     * inserts the next-fire row. For one-shot Tasks (IMMEDIATE,
+     * SCHEDULED), return the default {@code OnCompleteRemove}.
+     */
+    private static CompletionHandler<Void> scheduleNextIfRecurring(Task task) {
+        if (task.type == Task.Type.CRON && task.cronExpression != null) {
+            return scheduleCronNextCompletion(task);
+        }
+        if (task.type == Task.Type.INTERVAL && task.intervalSeconds != null && task.intervalSeconds > 0) {
+            return scheduleIntervalNextCompletion(task);
+        }
+        return defaultCompletion();
+    }
+
+    /**
+     * Default attempt budget for {@link #findTaskWithRaceBackoff}.
+     * Visible for tests so a regression test can pin the budget against
+     * the observed sub-millisecond race window without hard-coding it.
+     */
+    static final int FIND_TASK_ATTEMPTS = 5;
+
+    /** Per-attempt sleep in ms — total budget = (attempts - 1) * sleep. */
+    static final int FIND_TASK_BACKOFF_MS = 20;
+
+    /**
+     * Race-tolerant Task lookup. db-scheduler's poll thread can fire a
+     * scheduled row before the controller's INSERT for the Task row has
+     * committed — the schedule row goes into {@code scheduled_tasks} in
+     * the same Tx as the Task INSERT, but the poll reads via a separate
+     * connection / Tx so it can briefly see the schedule before the
+     * Task row. Observed in production at ~1ms separation between
+     * "Scheduled Task '...'" and "missing Task id N; skipping" log
+     * lines; the lost fire never recovers (IMMEDIATE/SCHEDULED Tasks
+     * never retry, INTERVAL/CRON Tasks lose their initial fire AND
+     * their self-reschedule, going invisibly dormant).
+     *
+     * <p>Fix shape: bounded retry-with-backoff on {@code findById}
+     * before giving up. {@link #FIND_TASK_ATTEMPTS} attempts spaced by
+     * {@link #FIND_TASK_BACKOFF_MS} ms — total wall budget ~80 ms —
+     * absorbs the observed window with three orders of magnitude of
+     * headroom. A genuinely-deleted Task (e.g. canceled and
+     * subsequently removed) still falls through to the skip-and-warn
+     * path after the budget elapses.
+     *
+     * <p>Returns {@code null} if the Task is still not found after all
+     * attempts. Visible for tests in the {@code services} package.
+     */
+    static @Nullable Task findTaskWithRaceBackoff(long taskId) {
+        for (int i = 0; i < FIND_TASK_ATTEMPTS; i++) {
+            Task t = Tx.run(() -> (Task) Task.findById(taskId));
+            if (t != null) return t;
+            if (i < FIND_TASK_ATTEMPTS - 1 && !backoffWait()) {
+                return null;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Off-carrier backoff wait of {@link #FIND_TASK_BACKOFF_MS} ms.
+     *
+     * <p>This runs inside the db-scheduler {@code .execute()} body on a
+     * virtual thread, and a burst of newly-scheduled tasks firing
+     * near-simultaneously (the exact INSERT/poll race the retry guards)
+     * parks many VTs here at once. {@link Thread#sleep} would route those
+     * waits through the ForkJoinPool delay-scheduler queue and trip
+     * JDK-8373224's work-queue starvation (multi-second tail latency).
+     * {@link java.util.concurrent.locks.LockSupport#parkNanos} unmounts
+     * the carrier the same way but does NOT use that timer path, so it is
+     * unaffected by the regression — the same reasoning LoadTestHarness
+     * relies on for its untimed park.
+     *
+     * <p>Loops against an absolute deadline because {@code parkNanos} may
+     * return early on a spurious wakeup; this preserves the full
+     * {@link #FIND_TASK_BACKOFF_MS}-ms budget between attempts unchanged.
+     * Returns {@code false} if the thread was interrupted (mirroring the
+     * prior {@code Thread.sleep} catch: re-assert the interrupt and let
+     * the caller bail to {@code null}).
+     */
+    private static boolean backoffWait() {
+        long deadlineNanos = System.nanoTime()
+                + TimeUnit.MILLISECONDS.toNanos(FIND_TASK_BACKOFF_MS);
+        long remaining;
+        while ((remaining = deadlineNanos - System.nanoTime()) > 0) {
+            LockSupport.parkNanos(remaining);
+            if (Thread.interrupted()) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Decode the {@code task_instance} string back to a JClaw Task
+     * primary key. Returns {@code null} for any malformed value so
+     * the caller can skip the fire and log without throwing — a stale
+     * row from a prior schema or hand-tampered DB shouldn't crash the
+     * scheduler thread.
+     */
+    private static @Nullable Long parseTaskId(String instanceId) {
+        if (instanceId == null || instanceId.isBlank()) return null;
+        try {
+            return Long.parseLong(instanceId.trim());
+        } catch (NumberFormatException _) {
+            return null;
+        }
+    }
+
+    /** OnCompleteRemove drops the current scheduled_tasks row. */
+    private static CompletionHandler<Void> defaultCompletion() {
+        return new CompletionHandler.OnCompleteRemove<>();
+    }
+
+    /**
+     * A paused one-shot's completion: drop the row, then re-read the flag. A resume that committed
+     * mid-skip found this row still present and did not re-arm. Dropping before reading, with resume
+     * re-arming after its commit, leaves one of the two re-arming after both; scheduleIfNotExists
+     * admits only one insert.
+     */
+    private static CompletionHandler<Void> dropThenReArmIfResumed(Task task) {
+        return (_, executionOperations) -> {
+            stopCurrentRow(task, executionOperations);
+            var fresh = Tx.run(() -> (Task) Task.findById(task.id));
+            if (fresh != null && !fresh.paused) TaskSchedulingService.reArmOneShotIfDropped(fresh);
+        };
+    }
+
+    /**
+     * INTERVAL counterpart to {@link #scheduleCronNextCompletion} —
+     * same stop-then-schedule shape, but next fire is
+     * {@code now + task.intervalSeconds} rather than parsed from a
+     * cron expression. "Next fire is from-now, not from-completion"
+     * is the conventional INTERVAL semantic (matches Hermes,
+     * matches systemd timers) — if the body took 90 seconds to
+     * complete on a 60-second interval, the next fire is still
+     * 60 seconds out, not "30 seconds ago".
+     */
+    private static CompletionHandler<Void> scheduleIntervalNextCompletion(Task task) {
+        return (_, executionOperations) -> {
+            stopCurrentRow(task, executionOperations);
+            rescheduleNext(task, () -> TaskSchedulingService.nextOccurrence(task),
+                    "INTERVAL", " (every %ds)".formatted(task.intervalSeconds));
+        };
+    }
+
+    /**
+     * Drop the {@code scheduled_tasks} row this fire was picked from, so
+     * {@link #rescheduleNext} can insert the next one under the same
+     * {@code task_instance} without tripping the unique constraint.
+     *
+     * <p>{@code stop()} deletes by {@code (id, version)} and throws when that
+     * matches no row — which a concurrent JCLAW-803 revive causes by bumping the
+     * version. Letting it escape skips the reschedule that follows and ends the
+     * recurrence silently (JCLAW-1103), so fall back to the identity-keyed delete.
+     */
+    private static void stopCurrentRow(Task task, ExecutionOperations<Void> executionOperations) {
+        try {
+            executionOperations.stop();
+        } catch (RuntimeException e) {
+            EventLogger.warn("task",
+                    task.agent != null ? task.agent.name : null, null,
+                    "Task '%s' schedule row was re-picked mid-fire; removing it by identity instead: %s"
+                            .formatted(task.name, e.getMessage()));
+            TaskSchedulingService.forceRemoveStaleRow(task.id);
+        }
+    }
+
+    /**
+     * Shared stop-already-done body for the recurring completion handlers.
+     * Both INTERVAL and CRON callers have already invoked
+     * {@link #stopCurrentRow} on the current row; this computes
+     * the next-fire instant via {@code nextFire}, null-checks the wired
+     * {@link #schedulerClient}, schedules the next row under the same
+     * {@code task_instance}, and emits the symmetric INFO/ERROR logging.
+     * {@code kind} names the recurrence type in the log lines and
+     * {@code detailSuffix} appends a type-specific tail (e.g. the interval
+     * cadence) to the success message. A {@code null} next-fire (malformed
+     * CRON expression) is logged and the self-reschedule is paused — the
+     * current row is already dropped, so the Task picks back up on the next
+     * {@code BootConsistencyCheck} sweep.
+     */
+    private static void rescheduleNext(Task task, Supplier<Instant> nextFire,
+                                       String kind, String detailSuffix) {
+        try {
+            Instant next = nextFire.get();
+            if (next == null) {
+                EventLogger.warn("task",
+                        task.agent != null ? task.agent.name : null, null,
+                        "Task '%s' %s expression yielded no next fire; pausing self-reschedule"
+                                .formatted(task.name, kind));
+                return;
+            }
+            SchedulerClient client = schedulerClient;
+            if (client == null) {
+                EventLogger.warn("task",
+                        task.agent != null ? task.agent.name : null, null,
+                        "SchedulerClient not wired; cannot reschedule Task '%s' next %s fire"
+                                .formatted(task.name, kind));
+                return;
+            }
+            String instanceId = task.id.toString();
+            boolean scheduled = client.scheduleIfNotExists(new TaskInstance<>(TASK_NAME, instanceId), next);
+            if (scheduled) {
+                EventLogger.info("task",
+                        task.agent != null ? task.agent.name : null, null,
+                        "Rescheduled Task '%s' next %s fire for %s%s"
+                                .formatted(task.name, kind, next, detailSuffix));
+            } else {
+                // stopCurrentRow runs first, so a surviving row means it did not clear this fire's.
+                EventLogger.warn("task",
+                        task.agent != null ? task.agent.name : null, null,
+                        "Task '%s' next %s fire was not re-armed: a scheduled row for it still exists"
+                                .formatted(task.name, kind));
+            }
+        } catch (Exception e) {
+            EventLogger.error("task",
+                    task.agent != null ? task.agent.name : null, null,
+                    "Failed to reschedule next %s fire for Task '%s': %s"
+                            .formatted(kind, task.name, e.getMessage()));
+        }
+    }
+
+    /**
+     * Two-step CRON re-schedule: drop the current row via
+     * {@link #stopCurrentRow}, then insert the next-fire
+     * row with the same task_instance id via
+     * {@link SchedulerClient#schedule}. The stop-then-schedule order
+     * is load-bearing for the unique-constraint reasons documented at
+     * the class level.
+     *
+     * <p>If next-fire computation fails (malformed cron) or
+     * {@link #schedulerClient} hasn't been wired (test path, race at
+     * shutdown), the current row is still removed cleanly and the
+     * CRON Task effectively pauses until the next BootConsistencyCheck
+     * sweep reschedules it.
+     */
+    private static CompletionHandler<Void> scheduleCronNextCompletion(Task task) {
+        return (_, executionOperations) -> {
+            stopCurrentRow(task, executionOperations);
+            rescheduleNext(task, () -> TaskSchedulingService.nextOccurrence(task), "CRON", "");
+        };
+    }
+}
