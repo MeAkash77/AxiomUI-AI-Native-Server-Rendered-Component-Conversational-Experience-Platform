@@ -13,17 +13,9 @@
   <img src="https://img.shields.io/badge/JDK-25%2B-orange?style=flat-square" alt="JDK: 25+">
 </p>
 
-> **Licensing at a glance.** JClaw is **source-available**, dual-licensed by
-> [Abundent Sdn Bhd](https://abundent.com): free for noncommercial use under the
-> [PolyForm Noncommercial License 1.0.0](LICENSE.md); **any commercial use requires a
-> [commercial license](COMMERCIAL-LICENSE.md)**. JClaw is not open-source software.
-> Versions through v0.15.4 remain available under their original MIT License.
-
-<br>
-
 ## Quick Install (one-line)
 
-Get JClaw running in one command. The installer downloads the self-contained
+Get AxiomUI running in one command. The installer downloads the self-contained
 `jclaw-bundle.zip` from the latest GitHub Release, verifies Java 25+ (the bundle's
 **only** prerequisite) — offering to download a self-contained Zulu JRE 25
 into `~/.jclaw/jre` when none is found — extracts it to `~/.jclaw`, and starts JClaw on
@@ -101,7 +93,7 @@ curl -fsSL https://raw.githubusercontent.com/tsukhani/jclaw/main/install.sh \
 
 ## Overview
 
-JClaw is Abundent's AI-powered automation platform, built from scratch in **pure Java** on a customized [Play Framework 1.x](https://github.com/tsukhani/play1) foundation. It draws ideas and feature designs from three predecessor projects:
+AxiomUI is Abundent's AI-powered automation platform, built from scratch in **pure Java** on a customized [Play Framework 1.x](https://github.com/tsukhani/play1) foundation. It draws ideas and feature designs from three predecessor projects:
 
 - **[OpenClaw](https://github.com/tsukhani/openclaw)** (Node.js/TypeScript) — agent orchestration, memory system, conversational AI patterns
 - **[JavaClaw](https://github.com/jobrunr/javaclaw)** (Spring Boot) — job scheduling, background task processing, browser automation
@@ -114,7 +106,7 @@ The implementation is entirely original — no code is shared with any of them. 
 ## Screenshot
 
 <p align="center">
-  <img src="jclaw-screenshot.png" width="900" alt="JClaw Chat Interface">
+  <img src="jclaw-screenshot.png" width="900" alt="AxiomUI Chat Interface">
 </p>
 <p align="center"><em>Web chat with memory-aware agents, tool execution, and markdown rendering.</em></p>
 
@@ -236,7 +228,7 @@ languages, then set them under **Settings → Image → OCR**
 (e.g. `eng+fra+jpn`).
 
 **Local Ollama** — required only if you want to bind agents to the
-`ollama-local` LLM provider for self-hosted inference. JClaw seeds
+`ollama-local` LLM provider for self-hosted inference. AxiomUI seeds
 `provider.ollama-local.baseUrl=http://localhost:11434/v1` at first boot,
 so the provider is already listed in Settings without further wiring —
 install Ollama on the host and pull a model to make it usable. A startup
@@ -269,7 +261,7 @@ to `ollama-local` from the Agent Edit page to start chatting against
 your local model.
 
 **LM Studio** — required only if you want to bind agents to the
-`lm-studio` LLM provider. JClaw seeds
+`lm-studio` LLM provider. AxiomUI seeds
 `provider.lm-studio.baseUrl=http://localhost:1234/v1` at first boot
 so the provider is already listed under "Local" in Settings. Same
 boot-time probe as ollama-local: INFO when reachable, WARN with a
@@ -362,11 +354,11 @@ What happens automatically once you click:
 Everything works the same as it would on a native host. The container *is* a Linux dev box with the pre-installed toolchain:
 
 ```bash
-./jclaw.sh --dev start    # dev mode (Play autoreload + Nuxt HMR)
-./jclaw.sh test           # backend + frontend test suites
-./jclaw.sh status         # check what's running
-./jclaw.sh backup         # online backup of the database into data/backups/
-./jclaw.sh stop
+./AxiomUI.sh --dev start    # dev mode (Play autoreload + Nuxt HMR)
+./AxiomUI.sh test           # backend + frontend test suites
+./AxiomUI.sh status         # check what's running
+./AxiomUI.sh backup         # online backup of the database into data/backups/
+./AxiomUI.sh stop
 ```
 
 Ports `9000` (backend) and `3000` (Nuxt) are forwarded to your host automatically. Open `http://localhost:9000` and `http://localhost:3000` in your **host's browser** while the dev server runs inside the container. The Nuxt port is configured to auto-open the browser when it boots; the backend port emits a notification.
@@ -388,7 +380,7 @@ When the toolchain changes (e.g., a new Play version, a JDK bump, a base-image b
 |---|---|
 | **Cursor / VS Code** | <kbd>Cmd</kbd>/<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd> → `Dev Containers: Rebuild Container` |
 | **JetBrains Gateway** | Container settings → `Rebuild` |
-| **CLI fallback** | `docker build -f .devcontainer/Dockerfile -t jclaw-devcontainer:latest .` from the repo root — the build context is the repo, since the Dockerfile copies `.play-version` (manual, you'd then need to update the IDE config to use the rebuilt image) |
+| **CLI fallback** | `docker build -f .devcontainer/Dockerfile -t AxiomUI-devcontainer:latest .` from the repo root — the build context is the repo, since the Dockerfile copies `.play-version` (manual, you'd then need to update the IDE config to use the rebuilt image) |
 
 Most rebuilds reuse cached apt + JDK + Node layers and only re-download what changed (e.g., the Play release zip if `PLAY_VERSION` was bumped). Full cold rebuilds run ~5–10 min.
 
@@ -398,54 +390,54 @@ Most rebuilds reuse cached apt + JDK + Node layers and only re-download what cha
 - **First build hangs on apt-get** — your network is slow or the Ubuntu mirror is rate-limiting. Retry; layers are cached so progress isn't lost.
 - **Postcreate fails on `./jclaw.sh setup`** — read the error; it'll point at the failing prereq. Open `.devcontainer/Dockerfile` to see what's installed; if a tool is missing, file an issue or patch the Dockerfile and rebuild.
 - **Edits in the IDE don't appear on host** — verify you opened the folder via "Reopen in Container," not by mounting a Docker volume. The bind-mount is what makes the edits round-trip.
-- **`docker rmi` to clean up** — `docker rmi jclaw-devcontainer:latest` (or the container image name your IDE assigns) removes the cached image. The next "Reopen in Container" rebuilds from scratch.
+- **`docker rmi` to clean up** — `docker rmi AxiomUI-devcontainer:latest` (or the container image name your IDE assigns) removes the cached image. The next "Reopen in Container" rebuilds from scratch.
 
 ### Development
 
 ```bash
 # Start both backend and frontend in dev mode
-./jclaw.sh --dev start
+./AxiomUI.sh --dev start
 
 # Stop
-./jclaw.sh --dev stop
+./AxiomUI.sh --dev stop
 
 # Check status
-./jclaw.sh --dev status
+./AxiomUI.sh --dev status
 
 # View logs (tails both backend and frontend logs)
-./jclaw.sh --dev logs
+./AxiomUI.sh --dev logs
 
 # Restart only the Play backend, leaving the Nuxt dev server running
-./jclaw.sh --dev restart --backend-only
+./AxiomUI.sh --dev restart --backend-only
 ```
 Default ports: backend on **:9000**, frontend on **:3000**.
 
 ### Production Deployment
 
-For a turnkey production install, use the [Quick Install](#quick-install-one-line) (which downloads the self-contained `jclaw-bundle.zip`) or [Docker](#docker-production). To build that bundle yourself, run `./jclaw.sh bundle` — it produces a self-contained `dist/jclaw-bundle.zip` that runs with only a Java 25 JRE. (`./jclaw.sh dist` builds the lighter `dist/jclaw.zip`, which needs a local Java 25, Gradle and Play fork install to run.) Unzip it wherever you want to install JClaw, then start it in place:
+For a turnkey production install, use the [Quick Install](#quick-install-one-line) (which downloads the self-contained `AxiomUI-bundle.zip`) or [Docker](#docker-production). To build that bundle yourself, run `./AxiomUI.sh bundle` — it produces a self-contained `dist/AxiomUI-bundle.zip` that runs with only a Java 25 JRE. (`./AxiomUI.sh dist` builds the lighter `dist/AxiomUI.zip`, which needs a local Java 25, Gradle and Play fork install to run.) Unzip it wherever you want to install JClaw, then start it in place:
 
 ```bash
 # Start
-./jclaw.sh start
+./AxiomUI.sh start
 
 # Stop
-./jclaw.sh stop
+./AxiomUI.sh stop
 
 # View logs
-./jclaw.sh logs
+./AxiomUI.sh logs
 
 # Database: backup (--list to show them), restore, H2 recovery, health
-./jclaw.sh backup
-./jclaw.sh restore <zip | backup id>   # validated first; a running instance restarts
-./jclaw.sh repair                      # rebuild a damaged database with H2's Recover tool
-./jclaw.sh db-clean                    # delete what the last successful repair left behind
-./jclaw.sh db-status                   # file size, health verdict, last backup
+./AxiomUI.sh backup
+./AxiomUI.sh restore <zip | backup id>   # validated first; a running instance restarts
+./AxiomUI.sh repair                      # rebuild a damaged database with H2's Recover tool
+./AxiomUI.sh db-clean                    # delete what the last successful repair left behind
+./AxiomUI.sh db-status                   # file size, health verdict, last backup
 
 # Admin
-./jclaw.sh secret                      # generate or rotate PLAY_SECRET in certs/.env
-./jclaw.sh reset                       # clear the admin password; the next launch asks for a new one
-./jclaw.sh completion install          # bash + zsh tab completion
-./jclaw.sh shim                        # re-link the `jclaw` command into ~/.local/bin
+./AxiomUI.sh secret                      # generate or rotate PLAY_SECRET in certs/.env
+./AxiomUI.sh reset                       # clear the admin password; the next launch asks for a new one
+./AxiomUI.sh completion install          # bash + zsh tab completion
+./AxiomUI.sh shim                        # re-link the `AxiomUI` command into ~/.local/bin
 ```
 
 ### Docker (Production)
@@ -463,7 +455,7 @@ docker compose logs -f
 docker compose down
 
 # Run on custom ports (defaults: 9000, and 9443 for HTTPS)
-JCLAW_PORT=8080 JCLAW_HTTPS_PORT=8443 docker compose up -d
+JCLAW_PORT=8080 AxiomUI_HTTPS_PORT=8443 docker compose up -d
 ```
 
 That's it — no `.env` setup needed. On first boot the container's entrypoint generates a 64-character `PLAY_SECRET` (used to sign session cookies) and persists it to `./certs/.env`. Subsequent restarts read the same file, so existing user sessions survive across `docker compose down` / `up` cycles. To rotate the secret, delete `./certs/.env` and restart the container — all existing `PLAY_SESSION` cookies become invalid, which is the point.
@@ -476,7 +468,7 @@ The container runs in production mode — the Nuxt SPA is already built into the
 
 ### Telemetry (OpenTelemetry)
 
-JClaw exports traces and metrics over OTLP from inside the process: HTTP server spans named from the route, one `turn` span per agent turn with the model call (GenAI semantic conventions), its HTTP call and every JDBC statement beneath it, plus `gen_ai.client.*`, `jclaw.turn.segment.duration` and `jvm.*` metrics. Nothing leaves the process until you turn it on.
+AxiomUI exports traces and metrics over OTLP from inside the process: HTTP server spans named from the route, one `turn` span per agent turn with the model call (GenAI semantic conventions), its HTTP call and every JDBC statement beneath it, plus `gen_ai.client.*`, `jclaw.turn.segment.duration` and `jvm.*` metrics. Nothing leaves the process until you turn it on.
 
 1. Run a collector, e.g. `docker run --rm -p 4318:4318 otel/opentelemetry-collector-contrib` with an OTLP receiver.
 2. Settings → System → Telemetry: enable, set the endpoint (default `http://localhost:4318`), press **Send test span**. Endpoint, headers, protocol and sampling all change live; no restart.
@@ -664,7 +656,7 @@ A human can bypass it for a one-off push (e.g. urgent hotfix) with `JCLAW_SKIP_T
 
 ## Contributing
 
-JClaw is developed **exclusively by the internal Abundent team**. We do not
+AxiomUI is developed **exclusively by the internal Abundent team**. We do not
 accept external contributions: pull requests from outside the team will be
 closed without review, however good the code. This is a deliberate legal
 choice that keeps the project's chain of title unambiguous under its
@@ -678,7 +670,7 @@ dual-licensing model — see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-JClaw is **source-available** and dual-licensed:
+AxiomUI is **source-available** and dual-licensed:
 
 - **Noncommercial use** — free under the
   [PolyForm Noncommercial License 1.0.0](LICENSE.md). This covers personal,
@@ -689,7 +681,7 @@ JClaw is **source-available** and dual-licensed:
   size affects pricing (small-business, mid-market, and enterprise tiers),
   never the requirement itself.
 
-JClaw is **not open-source software** as defined by the Open Source
+AxiomUI is **not open-source software** as defined by the Open Source
 Definition, because the noncommercial license restricts the field of use.
 The source is public and free to read, study, and use noncommercially.
 
@@ -700,4 +692,4 @@ onward.
 
 ---
 
-*Built with ☕ Java and ❤️ by the Abundent crew.*
+*Built with ☕ Java and ❤️ by Akash.*
